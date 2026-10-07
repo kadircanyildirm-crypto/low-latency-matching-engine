@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kadircanyildirm-crypto/low-latency-matching-engine"
+publish = false
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+# Keep symbols so perf / flamegraphs can attribute samples to source lines.
+debug = "line-tables-only"

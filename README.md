@@ -38,6 +38,9 @@ Risk controls built into the core:
 - **Maximum order size.**
 - **Price protection:** market orders stop a configurable number of ticks beyond the
   opposite best price; limit orders priced further through are rejected.
+- **Price band:** the same, measured from the last trade price instead, so stale orders
+  cannot move it. A measured comparison of both is in
+  [DESIGN.md §6](docs/DESIGN.md#6-risk-controls-in-the-core).
 - **Self-trade prevention:** cancel the resting order, or cancel the incoming one.
 - **Ownership checks:** cancels and modifies of another participant's order are
   rejected, in a way that does not reveal the order exists. Owner ids are dense
@@ -75,7 +78,7 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Differential property test | On random configurations and command sequences, the engine matches a deliberately naive reference book event for event and order for order. |
 | Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. FOK orders fill exactly when the book could fill them; post-only orders never trade; icebergs trade only what they show; no command's work exceeds what the book in front of it allows. |
 | Invariant checker tests | `validate()` itself is tested: every corruption it checks for, from broken queue links to owner lists out of step with the book, must be detected. |
-| Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies. |
+| Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, and a price band. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
 | Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, and computing the digest. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |

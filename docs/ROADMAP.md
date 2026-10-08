@@ -33,6 +33,8 @@ allocates on the hot path.
 - Overflow-free by construction: `max_orders × max_order_qty` must fit in a `u64`.
 - Iceberg orders: only the display quantity shows; each new tranche goes to the back of
   the queue; the number of tranches per order is bounded.
+- Price band around the last trade price, alongside price protection; a committed
+  experiment measures how each behaves under a harsh flow.
 - Snapshots and a state digest: `snapshot()` / `restore()` rebuild an identical book
   without replay, and `digest()` is a platform-independent hash of the complete state.
 - Data structures: a dense price ladder per side with a two-level occupancy bitset,
@@ -145,8 +147,6 @@ primary's.
 
 ## Phase 7 — Extensions (optional)
 
-- Price protection against a reference price (last trade or mid) with dynamic bands,
-  instead of the opposite best price.
 - Market states: trading halts, opening and closing auctions.
 - Per-order self-trade prevention instructions.
 - Multiple instruments (a shard / thread per instrument).

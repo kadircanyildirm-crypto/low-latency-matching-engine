@@ -1,3 +1,8 @@
 /target
 graphify-out/
 mutants.out*/
+# Comparison harness: build output, recorded streams, raw results, downloaded competitors.
+/compare/target
+/compare/data
+/compare/results
+/compare/vendor

@@ -1,0 +1,19 @@
+# Head-to-head comparison with other matching engines (docs/COMPARISON.md).
+#
+# A workspace of its own, so builds, tests and lints of the main workspace never compile
+# the harness or the competitors' dependencies.
+[workspace]
+resolver = "3"
+members = ["harness"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Same release profile as the main workspace, so our engine is built exactly as in its own
+# benchmarks, and every Rust competitor gets the same treatment.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only"

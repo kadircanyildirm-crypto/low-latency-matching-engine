@@ -1,0 +1,11 @@
+[package]
+name = "harness"
+version = "0.1.0"
+description = "Engine-neutral command streams and the replay harness shared by every adapter."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Only the exporter uses it: it records the stream from our engine's workload generator.
+orderbook = { path = "../../crates/orderbook" }

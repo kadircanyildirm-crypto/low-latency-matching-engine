@@ -652,12 +652,7 @@ impl OrderBook {
     fn protection_cap(&self, side: Side) -> Option<u32> {
         let ticks = self.config.price_protection?;
         match side {
-            Side::Buy => {
-                let last = self.asks.levels.len() as u32 - 1;
-                self.asks
-                    .best
-                    .map(|ask| ask.saturating_add(ticks).min(last))
-            }
+            Side::Buy => self.asks.best.map(|ask| ask.saturating_add(ticks)),
             Side::Sell => self.bids.best.map(|bid| bid.saturating_sub(ticks)),
         }
     }

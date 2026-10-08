@@ -159,7 +159,7 @@ lots at one price made the level total wrap to 1 in release builds, and the old
 | `tests/soak.rs` (golden) | A pinned fingerprint of all events. CI runs it on Linux, Windows and macOS, which shows the output is identical across platforms. |
 | `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), and in a deep book. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
-| Mutation testing | `cargo mutants` injects hundreds of small faults into the engine; the test suite must catch them. |
+| Mutation testing | `cargo mutants` injects 316 small faults into the engine. The tests detect every one of the 297 that compile ([results](../README.md#mutation-testing)). |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just

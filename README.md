@@ -72,11 +72,61 @@ owners, prices at bitset word boundaries and band edges, and quantities at `0`,
 
 ### Mutation testing
 
-RESULTS_PLACEHOLDER
+[`cargo-mutants`](https://mutants.rs) makes small changes to the engine, such as `<`
+to `<=`, `+` to `-`, or a function body replaced with a default value. It then runs the
+whole test suite against each changed version. A mutant that leaves every test passing
+points at behaviour the tests do not pin down.
+
+| Outcome | Mutants | Meaning |
+|---|---:|---|
+| Caught | 274 | A test failed. |
+| Timed out | 23 | The mutant made the tests hang, so it was detected too. For example, if `level_emptied` does nothing, an empty level stays the best price and the matching loop never leaves it. |
+| Unviable | 19 | The mutant does not compile. |
+| **Missed** | **0** | |
+
+Every one of the 297 mutants that compile is detected. `src/workload.rs`, the benchmark's
+order-flow generator, is excluded because it is not part of the engine.
+
+The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
+`protection_cap`. The clamp turned out to have no effect: the matcher compares levels
+against the cap, and no level lies beyond the last one. The clamp was removed, and a
+rerun of `protection_cap`'s remaining mutants caught all of them.
 
 ### Performance
 
-PERFORMANCE_PLACEHOLDER
+Service time of `OrderBook::process` per command, on one thread pinned to a core, with
+commands issued back to back. It is measured with the TSC and HdrHistogram. For each
+scenario, a participant-like generator records a command stream, which is then replayed
+into fresh books: 3 runs × 2M measured commands after warm-up.
+
+Numbers from a development laptop (Intel Core i5-12450H, Windows 11, untuned, no core
+isolation). The ~25 ns timer overhead is included. Throughput comes from a separate pass
+without per-command timers.
+
+| Scenario | Book after warm-up | p50 | p90 | p99 | p99.9 | p99.99 | Throughput |
+|---|---|---:|---:|---:|---:|---:|---:|
+| baseline | 7.7k orders, 243 levels | 79 ns | 120 ns | 193 ns | 497 ns | 3.9 µs | 16–18M cmd/s |
+| sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 78 ns | 129 ns | 205 ns | 693 ns | 2.4 µs | 16–17M cmd/s |
+| deep | 1M orders, 10k levels | 343 ns | 794 ns | 2.3 µs | 4.7 µs | 41 µs | 3.0–3.3M cmd/s |
+
+By command, in the baseline scenario:
+
+| Command | p50 | p99 | p99.9 |
+|---|---:|---:|---:|
+| limit | 71 ns | 171 ns | 334 ns |
+| market | 97 ns | 222 ns | 491 ns |
+| cancel | 94 ns | 199 ns | 698 ns |
+| modify | 129 ns | 268 ns | 798 ns |
+
+- **The deep book is slower because it does not fit in cache.** A million 48-byte order
+  nodes take about 48 MB, on top of the id index, against a 12 MB L3. Cancels and
+  modifies touch arbitrary orders and pay for the misses.
+- **The tail is the machine, not the engine.** p99.99 moves between 2.5 and 7 µs from run
+  to run in the baseline scenario, and the maximum reaches tens of milliseconds:
+  preemption by the OS. Measurements on an isolated Linux core are part of Phase 5.
+- **What this does not measure:** network, serialization, journaling or queueing. This
+  is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
+  coordinated-omission correction) arrives with the gateway and pipeline phases.
 
 ## Running
 
@@ -84,7 +134,7 @@ PERFORMANCE_PLACEHOLDER
 cargo test                                # all tests
 cargo bench --bench latency               # latency per scenario; writes target/latency/*.hgrm
 cargo bench --bench throughput            # Criterion before/after comparison (includes generator cost)
-cargo mutants -p orderbook --exclude src/workload.rs   # mutation testing
+cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
 ```
 
 The `.hgrm` files can be plotted with the

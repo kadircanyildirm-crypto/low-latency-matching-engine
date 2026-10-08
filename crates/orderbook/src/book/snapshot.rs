@@ -30,6 +30,11 @@ pub struct SnapshotOrder {
     pub filled: Qty,
     /// Whether the order was entered post-only; it still restricts the order's modifies.
     pub post_only: bool,
+    /// Iceberg display quantity, if the order is an iceberg.
+    pub display: Option<Qty>,
+    /// The part of `leaves` on display: all of it for a plain order, the current tranche's
+    /// remainder for an iceberg.
+    pub visible: Qty,
 }
 
 /// The complete state of a book.
@@ -56,7 +61,10 @@ pub enum SnapshotError {
     /// Two orders share an id.
     DuplicateOrderId(OrderId),
     /// The order's owner is not below `max_owners`, its price is outside the band, its open
-    /// quantity is zero, or its open plus filled quantity exceeds `max_order_qty`.
+    /// quantity is zero, its open plus filled quantity exceeds `max_order_qty`, or what it
+    /// shows does not fit its quantity and display: a plain order shows everything, an
+    /// iceberg between one lot and its display, and `max_iceberg_tranches` of its display
+    /// cover its total.
     InvalidOrder(OrderId),
     /// The best bid is at or above the best ask.
     Crossed,
@@ -124,6 +132,17 @@ impl OrderBook {
                 .checked_add(order.filled)
                 .filter(|&total| order.leaves > 0 && total <= snapshot.config.max_order_qty)
                 .ok_or(invalid)?;
+            let shows_validly = match order.display {
+                None => order.visible == order.leaves,
+                Some(display) => {
+                    order.visible > 0
+                        && order.visible <= display.min(order.leaves)
+                        && book.tranches_cover(display, total)
+                }
+            };
+            if !shows_validly {
+                return Err(invalid);
+            }
             if book.index.contains_key(&order.id) {
                 return Err(SnapshotError::DuplicateOrderId(order.id));
             }
@@ -136,6 +155,9 @@ impl OrderBook {
                 total,
                 order.post_only,
             ));
+            if let Some(display) = order.display {
+                book.pool.make_iceberg(slot, display, order.visible);
+            }
             // Orders arrive in book order, so each owner's list ends up in queue order
             // within every level, which is all that mass cancels depend on.
             book.place(slot);
@@ -173,6 +195,8 @@ impl OrderBook {
                         leaves: order.leaves,
                         filled: order.filled,
                         post_only: order.post_only,
+                        display: order.display,
+                        visible: order.visible,
                     });
                 }
             }
@@ -193,6 +217,7 @@ impl Digest {
         hash.u64(u64::from(config.max_orders));
         hash.u64(u64::from(config.max_owners));
         hash.u64(config.max_order_qty);
+        hash.u64(u64::from(config.max_iceberg_tranches));
         match config.price_protection {
             None => hash.u64(0),
             Some(ticks) => {
@@ -220,6 +245,14 @@ impl Digest {
         self.u64(order.leaves);
         self.u64(order.filled);
         self.u64(u64::from(order.post_only));
+        match order.display {
+            None => self.u64(0),
+            Some(display) => {
+                self.u64(1);
+                self.u64(display);
+            }
+        }
+        self.u64(order.visible);
     }
 
     fn i64(&mut self, value: i64) {

@@ -58,6 +58,8 @@ fn order(id: u64, side: Side, price: i64, leaves: u64, filled: u64) -> SnapshotO
         leaves,
         filled,
         post_only: false,
+        display: None,
+        visible: leaves,
     }
 }
 
@@ -75,7 +77,11 @@ fn sample() -> BookSnapshot {
                 post_only: true,
                 ..order(2, Side::Buy, 50, 7, 0)
             },
-            order(3, Side::Sell, 60, 1, 9),
+            SnapshotOrder {
+                display: Some(4),
+                visible: 2,
+                ..order(3, Side::Sell, 60, 10, 9)
+            },
         ],
     }
 }
@@ -91,7 +97,9 @@ fn a_snapshot_round_trips_through_restore() {
     let queue: Vec<_> = book.queue(Side::Buy, 50).map(|o| o.id).collect();
     assert_eq!(queue, [1, 2]);
     let info = book.order(3).unwrap();
-    assert_eq!((info.leaves, info.filled), (1, 9));
+    assert_eq!((info.leaves, info.filled), (10, 9));
+    assert_eq!((info.display, info.visible), (Some(4), 2));
+    assert_eq!(book.best_ask().map(|level| level.qty), Some(2));
     assert!(book.order(2).unwrap().post_only && !info.post_only);
 }
 
@@ -131,6 +139,11 @@ fn the_digest_covers_every_field() {
     vary("leaves", |s| s.orders[0].leaves += 1);
     vary("filled", |s| s.orders[0].filled += 1);
     vary("post-only", |s| s.orders[0].post_only = true);
+    vary("iceberg display", |s| s.orders[2].display = Some(5));
+    vary("iceberg visible", |s| s.orders[2].visible = 3);
+    vary("plain to iceberg", |s| {
+        s.orders[0].display = Some(5);
+    });
     vary("queue order", |s| s.orders.swap(0, 1));
     vary("missing order", |s| {
         s.orders.pop();
@@ -147,7 +160,7 @@ fn the_digest_of_an_empty_book_is_pinned() {
     let book = OrderBook::new(BookConfig::new(-5, 5, 3));
     assert_eq!(
         book.digest(),
-        0xd2c4_aca9_b478_14fb,
+        0x3e4c_fee2_e1a6_3811,
         "got {:#018x}",
         book.digest()
     );
@@ -186,6 +199,39 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
             vec![SnapshotOrder {
                 owner: cfg.max_owners,
                 ..order(1, Side::Buy, 10, 1, 0)
+            }],
+            SnapshotError::InvalidOrder(1),
+        ),
+        // A plain order shows all it has.
+        (
+            vec![SnapshotOrder {
+                visible: 1,
+                ..order(1, Side::Buy, 10, 2, 0)
+            }],
+            SnapshotError::InvalidOrder(1),
+        ),
+        // An iceberg shows between one lot and its display, and never more than it has.
+        (
+            vec![SnapshotOrder {
+                display: Some(3),
+                visible: 0,
+                ..order(1, Side::Buy, 10, 5, 0)
+            }],
+            SnapshotError::InvalidOrder(1),
+        ),
+        (
+            vec![SnapshotOrder {
+                display: Some(3),
+                visible: 4,
+                ..order(1, Side::Buy, 10, 5, 0)
+            }],
+            SnapshotError::InvalidOrder(1),
+        ),
+        (
+            vec![SnapshotOrder {
+                display: Some(3),
+                visible: 3,
+                ..order(1, Side::Buy, 10, 2, 0)
             }],
             SnapshotError::InvalidOrder(1),
         ),

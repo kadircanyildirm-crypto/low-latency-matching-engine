@@ -34,6 +34,10 @@ pub struct BookConfig {
     /// Largest accepted order quantity. `max_orders * max_order_qty` must fit in a `u64`,
     /// which makes every quantity sum inside the book overflow-free by construction.
     pub max_order_qty: Qty,
+    /// Most tranches an iceberg may be cut into: its display times this must cover its
+    /// total quantity. Each tranche is a separate trade, so this bounds the work and the
+    /// events one command can cause per resting order. Zero disallows icebergs.
+    pub max_iceberg_tranches: u32,
     /// Price protection in ticks, measured from the opposite best price when an order
     /// arrives. Market orders stop trading beyond it; limit orders priced further through
     /// it are rejected. `None` disables protection.
@@ -46,9 +50,13 @@ impl BookConfig {
     /// Owners allowed by [`BookConfig::new`].
     pub const DEFAULT_MAX_OWNERS: u32 = 1_024;
 
+    /// Iceberg tranches allowed by [`BookConfig::new`]: an iceberg shows at least a tenth of
+    /// its quantity, a rule some exchanges use.
+    pub const DEFAULT_MAX_ICEBERG_TRANCHES: u32 = 10;
+
     /// A config with the given band and capacity, [`Self::DEFAULT_MAX_OWNERS`] owners, the
-    /// largest `max_order_qty` the capacity allows, no price protection, and
-    /// `CancelResting` self-trade prevention.
+    /// largest `max_order_qty` the capacity allows, [`Self::DEFAULT_MAX_ICEBERG_TRANCHES`],
+    /// no price protection, and `CancelResting` self-trade prevention.
     pub const fn new(min_price: Price, max_price: Price, max_orders: u32) -> Self {
         let max_orders_nonzero = if max_orders == 0 { 1 } else { max_orders };
         Self {
@@ -57,6 +65,7 @@ impl BookConfig {
             max_orders,
             max_owners: Self::DEFAULT_MAX_OWNERS,
             max_order_qty: u64::MAX / max_orders_nonzero as u64,
+            max_iceberg_tranches: Self::DEFAULT_MAX_ICEBERG_TRANCHES,
             price_protection: None,
             self_trade: SelfTradePolicy::CancelResting,
         }
@@ -68,7 +77,7 @@ impl BookConfig {
 pub struct LevelInfo {
     /// Level price.
     pub price: Price,
-    /// Total open quantity at the level.
+    /// Quantity the level shows. Hidden iceberg quantity is not included.
     pub qty: Qty,
     /// Number of orders at the level.
     pub orders: u32,
@@ -89,6 +98,10 @@ pub struct OrderInfo {
     pub filled: Qty,
     /// Whether the order was entered post-only, which still restricts its modifies.
     pub post_only: bool,
+    /// Iceberg display quantity, if the order is an iceberg.
+    pub display: Option<Qty>,
+    /// The part of `leaves` on display; all of it for a plain order.
+    pub visible: Qty,
 }
 
 /// One order in a level's queue, as yielded by [`OrderBook::queue`].
@@ -104,6 +117,10 @@ pub struct QueuedOrder {
     pub filled: Qty,
     /// Whether the order was entered post-only, which still restricts its modifies.
     pub post_only: bool,
+    /// Iceberg display quantity, if the order is an iceberg.
+    pub display: Option<Qty>,
+    /// The part of `leaves` on display; all of it for a plain order.
+    pub visible: Qty,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +166,24 @@ impl Level {
         owners.unlink(slot, owner);
         pool.free(slot);
     }
+
+    /// Moves the order at the head of the queue to its back, as an iceberg's new tranche
+    /// loses time priority.
+    #[inline]
+    fn requeue_head(&mut self, pool: &mut OrderPool) {
+        let slot = self.head;
+        let next = pool.get(slot).next;
+        if next == NIL {
+            return;
+        }
+        self.head = next;
+        pool.get_mut(next).prev = NIL;
+        pool.get_mut(self.tail).next = slot;
+        let node = pool.get_mut(slot);
+        node.prev = self.tail;
+        node.next = NIL;
+        self.tail = slot;
+    }
 }
 
 /// One side of the book: a dense ladder of price levels indexed by `price - min_price`, each
@@ -175,9 +210,8 @@ impl HalfBook {
     /// Appends the order in `slot` to the back of its level's queue.
     #[inline]
     fn push_back(&mut self, pool: &mut OrderPool, slot: u32) {
-        let OrderNode {
-            level, remaining, ..
-        } = *pool.get(slot);
+        let level = pool.get(slot).level;
+        let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
         let tail = lvl.tail;
         let node = pool.get_mut(slot);
@@ -189,7 +223,7 @@ impl HalfBook {
             pool.get_mut(tail).next = slot;
         }
         lvl.tail = slot;
-        lvl.total_qty += remaining;
+        lvl.total_qty += visible;
         lvl.order_count += 1;
         if lvl.order_count == 1 {
             self.occupied.insert(level as usize);
@@ -206,12 +240,9 @@ impl HalfBook {
     #[inline]
     fn unlink(&mut self, pool: &mut OrderPool, slot: u32) {
         let OrderNode {
-            level,
-            remaining,
-            prev,
-            next,
-            ..
+            level, prev, next, ..
         } = *pool.get(slot);
+        let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
         if prev == NIL {
             lvl.head = next;
@@ -223,7 +254,7 @@ impl HalfBook {
         } else {
             pool.get_mut(next).prev = prev;
         }
-        lvl.total_qty -= remaining;
+        lvl.total_qty -= visible;
         lvl.order_count -= 1;
         if lvl.order_count == 0 {
             self.level_emptied(level);
@@ -343,7 +374,11 @@ impl OrderBook {
                 price,
                 qty,
                 tif,
-            } => (id, self.new_limit(id, owner, side, price, qty, tif, sink)),
+                display,
+            } => (
+                id,
+                self.new_limit(id, owner, side, price, qty, tif, display, sink),
+            ),
             Command::Market {
                 id,
                 owner,
@@ -377,10 +412,17 @@ impl OrderBook {
         price: Price,
         qty: Qty,
         tif: TimeInForce,
+        display: Option<Qty>,
         sink: &mut S,
     ) -> Result<(), RejectReason> {
         self.check_owner(owner)?;
         self.check_qty(qty)?;
+        let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
+        if display.is_some_and(|display| {
+            display == 0 || display >= qty || !may_rest || !self.tranches_cover(display, qty)
+        }) {
+            return Err(RejectReason::InvalidDisplay);
+        }
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
@@ -395,7 +437,6 @@ impl OrderBook {
         // removes a resting order (by filling it or by self-trade prevention), freeing a
         // slot. So only an order that can do nothing but rest is refused when full, and
         // orders that never rest are never refused.
-        let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
         if may_rest && self.pool.is_full() && !self.crosses(side, level) {
             return Err(RejectReason::BookFull);
         }
@@ -403,7 +444,7 @@ impl OrderBook {
         match tif {
             TimeInForce::Gtc | TimeInForce::PostOnly => {
                 let post_only = tif == TimeInForce::PostOnly;
-                self.execute_limit(id, owner, side, level, qty, qty, post_only, sink);
+                self.execute_limit(id, owner, side, level, qty, qty, post_only, display, sink);
             }
             TimeInForce::Fok if !self.can_fill(owner, side, level, qty) => {
                 sink.on_event(Event::Cancelled {
@@ -439,6 +480,12 @@ impl OrderBook {
     /// would, without changing anything. Under `CancelResting` the owner's own orders would
     /// be cancelled rather than traded, so they add nothing; under `CancelIncoming` matching
     /// would stop at the first of them.
+    ///
+    /// Icebergs show one tranche at a time, and each new tranche goes to the back of the
+    /// queue. A taker that clears a level without meeting its own order therefore cycles
+    /// through every tranche and gets the hidden quantity too. But under `CancelIncoming`,
+    /// new tranches land behind the owner's own order, so at a level that holds one, only
+    /// what shows in front of it counts.
     fn can_fill(&self, owner: OwnerId, side: Side, limit: u32, mut qty: Qty) -> bool {
         let resting = self.half(side.opposite());
         let mut next = resting.best;
@@ -451,18 +498,25 @@ impl OrderBook {
                 return false;
             }
             let mut slot = resting.levels[level as usize].head;
+            let mut hidden: Qty = 0;
             while slot != NIL {
                 let node = self.pool.get(slot);
                 if node.owner != owner {
-                    if node.remaining >= qty {
+                    let visible = self.pool.visible(slot);
+                    if visible >= qty {
                         return true;
                     }
-                    qty -= node.remaining;
+                    qty -= visible;
+                    hidden += node.remaining - visible;
                 } else if self.config.self_trade == SelfTradePolicy::CancelIncoming {
                     return false;
                 }
                 slot = node.next;
             }
+            if hidden >= qty {
+                return true;
+            }
+            qty -= hidden;
             next = resting.after(level);
         }
         false
@@ -581,10 +635,8 @@ impl OrderBook {
         if level == node.level && leaves <= node.remaining {
             // Same price, total not increased: shrink in place and keep queue position.
             let (half, pool) = self.half_and_pool(node.side);
-            half.levels[level as usize].total_qty -= node.remaining - leaves;
-            let n = pool.get_mut(slot);
-            n.remaining = leaves;
-            n.total = qty;
+            let shown_less = pool.shrink(slot, leaves, qty);
+            half.levels[level as usize].total_qty -= shown_less;
             sink.on_event(Event::Modified {
                 id,
                 price,
@@ -602,6 +654,10 @@ impl OrderBook {
         if node.post_only && self.crosses(node.side, level) {
             return Err(RejectReason::PostOnlyWouldCross);
         }
+        let display = self.pool.iceberg(slot).map(|part| part.display);
+        if display.is_some_and(|display| !self.tranches_cover(display, qty)) {
+            return Err(RejectReason::InvalidDisplay);
+        }
         self.remove(slot);
         sink.on_event(Event::Modified {
             id,
@@ -609,15 +665,9 @@ impl OrderBook {
             qty,
             leaves,
         });
+        let (side, post_only) = (node.side, node.post_only);
         self.execute_limit(
-            id,
-            owner,
-            node.side,
-            level,
-            leaves,
-            qty,
-            node.post_only,
-            sink,
+            id, owner, side, level, leaves, qty, post_only, display, sink,
         );
         Ok(())
     }
@@ -635,6 +685,7 @@ impl OrderBook {
         open: Qty,
         total: Qty,
         post_only: bool,
+        display: Option<Qty>,
         sink: &mut S,
     ) {
         let (remaining, halt) = self.match_incoming(id, owner, side, open, Some(level), sink);
@@ -652,12 +703,17 @@ impl OrderBook {
         let slot = self.pool.alloc(OrderNode::new(
             id, owner, side, level, remaining, total, post_only,
         ));
+        if let Some(display) = display {
+            self.pool
+                .make_iceberg(slot, display, display.min(remaining));
+        }
         self.place(slot);
         sink.on_event(Event::Rested {
             id,
             side,
             price: self.price_of(level),
             qty: remaining,
+            visible: self.pool.visible(slot),
         });
     }
 
@@ -708,25 +764,24 @@ impl OrderBook {
             let lvl = &mut resting.levels[level as usize];
 
             while qty > 0 && lvl.head != NIL {
-                let maker = pool.get_mut(lvl.head);
+                let head = lvl.head;
+                let maker = *pool.get(head);
                 if maker.owner == owner {
                     // Self-trade prevention.
                     if policy == SelfTradePolicy::CancelIncoming {
                         return (qty, Halt::SelfTrade);
                     }
-                    let (maker_id, maker_leaves) = (maker.id, maker.remaining);
-                    lvl.total_qty -= maker_leaves;
+                    lvl.total_qty -= pool.visible(head);
                     lvl.pop_front(pool, index, owners);
                     sink.on_event(Event::Cancelled {
-                        id: maker_id,
-                        qty: maker_leaves,
+                        id: maker.id,
+                        qty: maker.remaining,
                         reason: CancelReason::SelfTrade,
                     });
                     continue;
                 }
 
-                let fill = qty.min(maker.remaining);
-                maker.remaining -= fill;
+                let (fill, maker_leaves) = pool.fill(head, qty);
                 lvl.total_qty -= fill;
                 qty -= fill;
                 let trade_id = *next_trade_id;
@@ -739,10 +794,25 @@ impl OrderBook {
                     price,
                     qty: fill,
                     taker_leaves: qty,
-                    maker_leaves: maker.remaining,
+                    maker_leaves,
                 });
-                if maker.remaining == 0 {
+                if maker_leaves == 0 {
                     lvl.pop_front(pool, index, owners);
+                } else if pool.visible(head) == 0 {
+                    // An iceberg's tranche is used up: the next one shows at the back of
+                    // the queue, and at the back of the owner's list, which must stay in
+                    // queue order within the level.
+                    let visible = pool.replenish(head);
+                    lvl.total_qty += visible;
+                    lvl.requeue_head(pool);
+                    owners.unlink(head, maker.owner);
+                    owners.link(head, maker.owner);
+                    sink.on_event(Event::Replenished {
+                        id: maker.id,
+                        side: maker.side,
+                        price,
+                        visible,
+                    });
                 }
             }
 
@@ -786,6 +856,12 @@ impl OrderBook {
             Some(&slot) if self.pool.get(slot).owner == owner => Ok(slot),
             _ => Err(RejectReason::UnknownOrder),
         }
+    }
+
+    /// Whether `max_iceberg_tranches` tranches of `display` cover a total of `qty`.
+    #[inline]
+    fn tranches_cover(&self, display: Qty, qty: Qty) -> bool {
+        u128::from(display) * u128::from(self.config.max_iceberg_tranches) >= u128::from(qty)
     }
 
     #[inline]
@@ -907,7 +983,8 @@ impl OrderBook {
 
     /// A resting order, if `id` is on the book.
     pub fn order(&self, id: OrderId) -> Option<OrderInfo> {
-        let node = self.pool.get(*self.index.get(&id)?);
+        let slot = *self.index.get(&id)?;
+        let node = self.pool.get(slot);
         Some(OrderInfo {
             owner: node.owner,
             side: node.side,
@@ -915,6 +992,8 @@ impl OrderBook {
             leaves: node.remaining,
             filled: node.total - node.remaining,
             post_only: node.post_only,
+            display: self.pool.iceberg(slot).map(|part| part.display),
+            visible: self.pool.visible(slot),
         })
     }
 
@@ -940,8 +1019,9 @@ impl OrderBook {
     }
 
     /// Checks the book's internal invariants: queue links, per-order and per-level
-    /// quantities, occupancy bits, best-price pointers, the id index, and that the book is
-    /// not crossed. All arithmetic is checked, so an overflow is reported rather than
+    /// quantities (a level's total counts what its orders show), iceberg tranches,
+    /// occupancy bits, best-price pointers, the id index, owner lists, the free list, and
+    /// that the book is not crossed. All arithmetic is checked, so an overflow is reported rather than
     /// wrapped into a plausible-looking number.
     ///
     /// Walks the occupied levels via the bitset, so it costs `O(occupied levels + orders)`
@@ -998,9 +1078,24 @@ impl OrderBook {
                     if self.index.get(&id) != Some(&cur) {
                         return Err(format!("{side:?} {price}: index disagrees on #{id}"));
                     }
+                    if let Some(part) = self.pool.iceberg(cur) {
+                        let visible = part.visible;
+                        if visible == 0 || visible > node.remaining || visible > part.display {
+                            return Err(format!(
+                                "{side:?} {price}: iceberg #{id} shows {visible} of {} with display {}",
+                                node.remaining, part.display
+                            ));
+                        }
+                        if !self.tranches_cover(part.display, node.total) {
+                            return Err(format!(
+                                "{side:?} {price}: iceberg #{id} needs more than {} tranches",
+                                self.config.max_iceberg_tranches
+                            ));
+                        }
+                    }
                     count += 1;
                     total = total
-                        .checked_add(node.remaining)
+                        .checked_add(self.pool.visible(cur))
                         .ok_or_else(|| format!("{side:?} {price}: level quantity overflows"))?;
                     // No separate cycle check is needed: the first node a cycle revisits is
                     // reached from a different predecessor than the first time, so its back
@@ -1148,7 +1243,8 @@ impl Iterator for Queue<'_> {
         if self.next == NIL {
             return None;
         }
-        let node = self.pool.get(self.next);
+        let slot = self.next;
+        let node = self.pool.get(slot);
         self.next = node.next;
         Some(QueuedOrder {
             id: node.id,
@@ -1156,6 +1252,8 @@ impl Iterator for Queue<'_> {
             leaves: node.remaining,
             filled: node.total - node.remaining,
             post_only: node.post_only,
+            display: self.pool.iceberg(slot).map(|part| part.display),
+            visible: self.pool.visible(slot),
         })
     }
 }
@@ -1189,6 +1287,7 @@ mod validate_tests {
                     price,
                     qty,
                     tif: TimeInForce::Gtc,
+                    display: None,
                 },
                 &mut events,
             );
@@ -1371,6 +1470,66 @@ mod validate_tests {
                 b.place(s);
             },
             "crossed",
+        );
+    }
+
+    /// Adds #9, an iceberg of 10 showing 3, behind the bids at 99 of the healthy fixture.
+    fn add_iceberg(b: &mut OrderBook) -> u32 {
+        let mut events = Vec::new();
+        b.process(
+            Command::Limit {
+                id: 9,
+                owner: 9,
+                side: Buy,
+                price: 99,
+                qty: 10,
+                tif: TimeInForce::Gtc,
+                display: Some(3),
+            },
+            &mut events,
+        );
+        b.validate()
+            .expect("the iceberg fixture must start out healthy");
+        slot(b, 9)
+    }
+
+    #[test]
+    fn impossible_iceberg_tranches() {
+        assert_detects(
+            |b| {
+                add_iceberg(b);
+                b.config.max_iceberg_tranches = 3;
+            },
+            "iceberg #9 needs more than 3 tranches",
+        );
+        assert_detects(
+            |b| {
+                let s = add_iceberg(b);
+                b.pool.iceberg_mut(s).visible = 0;
+            },
+            "iceberg #9 shows 0 of 10 with display 3",
+        );
+        assert_detects(
+            |b| {
+                let s = add_iceberg(b);
+                b.pool.iceberg_mut(s).display = 2;
+            },
+            "iceberg #9 shows 3 of 10 with display 2",
+        );
+        assert_detects(
+            |b| {
+                let s = add_iceberg(b);
+                b.pool.get_mut(s).remaining = 2;
+            },
+            "iceberg #9 shows 3 of 2",
+        );
+        // A level's total is what its orders show, not their hidden quantity.
+        assert_detects(
+            |b| {
+                let s = add_iceberg(b);
+                b.pool.iceberg_mut(s).visible = 2;
+            },
+            "aggregates say 2/4 but queue holds 2/3",
         );
     }
 

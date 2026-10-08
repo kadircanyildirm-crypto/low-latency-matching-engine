@@ -175,6 +175,6 @@ fn output_matches_the_golden_fingerprints() {
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
-const GOLDEN_DEFAULT_DIGEST: u64 = 0x61c7_8078_5268_f126;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x27a8_dff1_4375_a843;
 const GOLDEN_PROTECTED: u64 = 0x28fa_3b96_7123_4f89;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0xc9d0_7f40_abc7_e800;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0x1168_b732_b477_71e3;

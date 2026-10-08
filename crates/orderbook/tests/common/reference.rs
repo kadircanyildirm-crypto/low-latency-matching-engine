@@ -21,6 +21,10 @@ struct Order {
     leaves: Qty,
     total: Qty,
     post_only: bool,
+    /// Iceberg display quantity.
+    display: Option<Qty>,
+    /// What the order shows: `leaves` for a plain order, the tranche left for an iceberg.
+    visible: Qty,
 }
 
 type Ladder = BTreeMap<Price, VecDeque<Order>>;
@@ -75,9 +79,16 @@ impl ReferenceBook {
                 price,
                 qty,
                 tif,
+                display,
             } => {
                 self.check_owner(owner)?;
                 self.check_qty(qty)?;
+                let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
+                if let Some(display) = display {
+                    if display == 0 || display >= qty || !may_rest || !self.covers(display, qty) {
+                        return Err(RejectReason::InvalidDisplay);
+                    }
+                }
                 self.check_band(price)?;
                 if self.orders.contains_key(&id) {
                     return Err(RejectReason::DuplicateOrderId);
@@ -89,7 +100,6 @@ impl ReferenceBook {
                 if tif == TimeInForce::PostOnly && crosses {
                     return Err(RejectReason::PostOnlyWouldCross);
                 }
-                let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
                 if may_rest && self.orders.len() >= self.cfg.max_orders as usize && !crosses {
                     return Err(RejectReason::BookFull);
                 }
@@ -97,7 +107,8 @@ impl ReferenceBook {
                 match tif {
                     TimeInForce::Gtc | TimeInForce::PostOnly => {
                         let post_only = tif == TimeInForce::PostOnly;
-                        self.execute_limit(id, owner, side, price, qty, qty, post_only, out);
+                        let shape = (post_only, display);
+                        self.execute_limit(id, owner, side, price, qty, qty, shape, out);
                     }
                     TimeInForce::Ioc => {
                         let (left, halt) =
@@ -194,6 +205,7 @@ impl ReferenceBook {
                     let order = self.find(id, side, old_price);
                     order.leaves = qty - filled;
                     order.total = qty;
+                    order.visible = order.visible.min(order.leaves);
                     out.push(Event::Modified {
                         id,
                         price,
@@ -207,6 +219,12 @@ impl ReferenceBook {
                     if order.post_only && self.crosses(side, price) {
                         return Err(RejectReason::PostOnlyWouldCross);
                     }
+                    if order
+                        .display
+                        .is_some_and(|display| !self.covers(display, qty))
+                    {
+                        return Err(RejectReason::InvalidDisplay);
+                    }
                     self.take_out(id, side, old_price);
                     out.push(Event::Modified {
                         id,
@@ -215,7 +233,8 @@ impl ReferenceBook {
                         leaves: qty - filled,
                     });
                     let leaves = qty - filled;
-                    self.execute_limit(id, owner, side, price, leaves, qty, order.post_only, out);
+                    let shape = (order.post_only, order.display);
+                    self.execute_limit(id, owner, side, price, leaves, qty, shape, out);
                 }
             }
             Command::CancelAll { owner } => {
@@ -247,6 +266,11 @@ impl ReferenceBook {
             }
         }
         Ok(())
+    }
+
+    /// `max_iceberg_tranches` tranches of `display` cover `qty`.
+    fn covers(&self, display: Qty, qty: Qty) -> bool {
+        u128::from(display) * u128::from(self.cfg.max_iceberg_tranches) >= u128::from(qty)
     }
 
     fn check_owner(&self, owner: OwnerId) -> Result<(), RejectReason> {
@@ -332,7 +356,7 @@ impl ReferenceBook {
         price: Price,
         open: Qty,
         total: Qty,
-        post_only: bool,
+        (post_only, display): (bool, Option<Qty>),
         out: &mut Vec<Event>,
     ) {
         let (left, halt) = self.match_incoming(id, owner, side, open, Some(price), out);
@@ -347,6 +371,7 @@ impl ReferenceBook {
             });
             return;
         }
+        let visible = display.map_or(left, |display| display.min(left));
         self.ladder(side)
             .entry(price)
             .or_default()
@@ -356,6 +381,8 @@ impl ReferenceBook {
                 leaves: left,
                 total,
                 post_only,
+                display,
+                visible,
             });
         self.orders.insert(id, (side, price));
         out.push(Event::Rested {
@@ -363,6 +390,7 @@ impl ReferenceBook {
             side,
             price,
             qty: left,
+            visible,
         });
     }
 
@@ -408,8 +436,9 @@ impl ReferenceBook {
                     });
                     continue;
                 }
-                let fill = qty.min(front.leaves);
+                let fill = qty.min(front.visible);
                 front.leaves -= fill;
+                front.visible -= fill;
                 qty -= fill;
                 self.trades += 1;
                 out.push(Event::Trade {
@@ -425,6 +454,17 @@ impl ReferenceBook {
                 if front.leaves == 0 {
                     let done = queue.pop_front().unwrap();
                     self.orders.remove(&done.id);
+                } else if front.visible == 0 {
+                    // An iceberg's tranche ran out: show the next one at the back.
+                    let mut iceberg = queue.pop_front().unwrap();
+                    iceberg.visible = iceberg.display.unwrap().min(iceberg.leaves);
+                    out.push(Event::Replenished {
+                        id: iceberg.id,
+                        side: side.opposite(),
+                        price: best,
+                        visible: iceberg.visible,
+                    });
+                    queue.push_back(iceberg);
                 }
             }
             if queue.is_empty() {
@@ -480,6 +520,8 @@ impl ReferenceBook {
                     leaves: o.leaves,
                     filled: o.total - o.leaves,
                     post_only: o.post_only,
+                    display: o.display,
+                    visible: o.visible,
                 })
                 .collect();
             (*price, orders)

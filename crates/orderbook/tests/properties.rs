@@ -10,11 +10,12 @@
 //! command did not touch are left exactly as they were; a command is rejected exactly when a
 //! rule requires it, with the reason that rule gives; immediate-or-cancel and fill-or-kill
 //! orders never rest, a fill-or-kill order fills completely exactly when the book could fill
-//! it, and post-only orders never trade.
+//! it, post-only orders never trade, and icebergs trade only what they show and show their
+//! next tranche at the back of the queue.
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, VecDeque};
 
 use common::strategies::scenario;
 use common::{Snapshot, snapshot};
@@ -163,6 +164,17 @@ fn check(
         "order_count disagrees with the book's contents",
     )?;
     let first = *events.first().ok_or("no events")?;
+    // No command may run away: each resting order yields at most a trade and a new tranche
+    // per tranche it is cut into, or one cancel; the incoming order adds at most three.
+    let per_order = 2 * cfg.max_iceberg_tranches.max(1) as usize;
+    ensure(
+        events.len() <= 3 + per_order * before.order_count(),
+        format!(
+            "{} events from a book of {} orders",
+            events.len(),
+            before.order_count()
+        ),
+    )?;
     let required = required_rejection(cfg, before, command);
 
     if let Event::Rejected { id, reason } = first {
@@ -208,6 +220,7 @@ fn check(
             price,
             qty,
             tif,
+            display,
         } => {
             ensure(first == Event::Accepted { id }, "must start with Accepted")?;
             let taker = Taker {
@@ -218,6 +231,7 @@ fn check(
                 cap: None,
                 tif: Some(tif),
                 post_only: tif == TimeInForce::PostOnly,
+                display,
                 qty,
                 filled_before: 0,
             };
@@ -238,6 +252,7 @@ fn check(
                 cap: protection_cap(cfg, before, side),
                 tif: None,
                 post_only: false,
+                display: None,
                 qty,
                 filled_before: 0,
             };
@@ -277,11 +292,12 @@ fn check(
                 for (_, queue) in expected.iter_mut().flatten() {
                     for o in queue.iter_mut().filter(|o| o.id == id) {
                         o.leaves = leaves;
+                        o.visible = o.visible.min(leaves);
                     }
                 }
                 return ensure(
                     after.snapshot == expected,
-                    "an in-place modify must keep queue position and change only leaves",
+                    "an in-place modify must keep queue position and only shrink the order, hidden part first",
                 );
             }
             // Lost priority: the same as a new GTC order for `leaves` arriving at a book
@@ -294,6 +310,7 @@ fn check(
                 cap: None,
                 tif: Some(TimeInForce::Gtc),
                 post_only: order.post_only,
+                display: order.display,
                 qty: leaves,
                 filled_before: order.filled,
             };
@@ -356,11 +373,16 @@ struct Taker {
     tif: Option<TimeInForce>,
     /// A post-only order, or a modify of one: it may not trade, and rests post-only.
     post_only: bool,
+    /// Iceberg display quantity the remainder rests with.
+    display: Option<Qty>,
     /// Quantity to work.
     qty: Qty,
     /// Filled before this command (modifies keep their history).
     filled_before: Qty,
 }
+
+/// One side of the book, best price first, each level's queue in time priority.
+type Levels = Vec<(Price, VecDeque<QueuedOrder>)>;
 
 impl Taker {
     fn may_trade_at(&self, price: Price) -> bool {
@@ -368,29 +390,53 @@ impl Taker {
             && self.cap.is_none_or(|c| within(self.side, price, c))
     }
 
-    /// Whether matching against `line` (the opposite side in priority order) would fill the
-    /// whole quantity. Under `CancelResting` the owner's own orders would be cancelled, not
-    /// traded; under `CancelIncoming` matching would stop at the first of them.
-    fn could_fill(&self, cfg: &BookConfig, line: &[(Price, QueuedOrder)]) -> bool {
-        let mut available = 0u128;
-        for &(price, order) in line {
-            if !self.may_trade_at(price) {
+    /// Whether matching against `levels` (the opposite side) would fill the whole quantity.
+    /// Under `CancelResting` the owner's own orders would be cancelled, not traded; under
+    /// `CancelIncoming` matching would stop at the first of them. An iceberg shows one
+    /// tranche at a time and each new tranche goes to the back of its level, so a level
+    /// cleared without meeting an own order yields its hidden quantity too, but new
+    /// tranches end up behind an own order that would stop the match.
+    fn could_fill(&self, cfg: &BookConfig, levels: &Levels) -> bool {
+        let mut need = u128::from(self.qty);
+        for (price, queue) in levels {
+            if !self.may_trade_at(*price) {
                 break;
             }
-            if order.owner == self.owner {
-                if cfg.self_trade == SelfTradePolicy::CancelIncoming {
-                    break;
+            let mut hidden = 0u128;
+            for order in queue {
+                if order.owner == self.owner {
+                    if cfg.self_trade == SelfTradePolicy::CancelIncoming {
+                        return false;
+                    }
+                    continue;
                 }
-                continue;
+                need = need.saturating_sub(u128::from(order.visible));
+                if need == 0 {
+                    return true;
+                }
+                hidden += u128::from(order.leaves - order.visible);
             }
-            available += u128::from(order.leaves);
+            need = need.saturating_sub(hidden);
+            if need == 0 {
+                return true;
+            }
         }
-        available >= u128::from(self.qty)
+        false
+    }
+
+    /// What the order shows when `leaves` of it rests.
+    fn shows(&self, leaves: Qty) -> Qty {
+        self.display.map_or(leaves, |display| display.min(leaves))
     }
 }
 
 /// Checks the events after `Accepted` / `Modified` of an order that matches and then rests or
 /// is cancelled, and that the resulting book is exactly `before` with those effects applied.
+///
+/// The events are replayed against a copy of the opposite side, each checked against the
+/// rules as it comes: the next order in priority, at its price, within the limit, never the
+/// same owner, as much as it shows. An iceberg whose tranche runs out must show its next one
+/// at once, at the back of its level, which is where the copy moves it too.
 fn check_execution(
     cfg: &BookConfig,
     before: &State,
@@ -398,8 +444,12 @@ fn check_execution(
     taker: Taker,
     events: &[Event],
 ) -> Check {
-    let line = before.priority(taker.side.opposite());
-    if taker.tif == Some(TimeInForce::Fok) && !taker.could_fill(cfg, &line) {
+    let opposite = taker.side.opposite();
+    let mut levels: Levels = before.snapshot[State::side_index(opposite)]
+        .iter()
+        .map(|(price, queue)| (*price, queue.iter().copied().collect()))
+        .collect();
+    if taker.tif == Some(TimeInForce::Fok) && !taker.could_fill(cfg, &levels) {
         ensure(
             events
                 == [Event::Cancelled {
@@ -414,14 +464,22 @@ fn check_execution(
             "a killed fill-or-kill order changed the book",
         );
     }
-    let mut next_in_line = 0usize;
+
     let mut left = taker.qty;
     let mut next_trade_id = before.trade_count + 1;
-    // Resting orders this command reached: new (leaves, filled), or None if removed.
-    let mut touched: HashMap<OrderId, Option<(Qty, Qty)>> = HashMap::new();
-
+    // The level being worked, always one with orders unless the side is exhausted.
+    let mut current = 0usize;
     let mut i = 0;
-    while let Some(&event) = events.get(i) {
+    loop {
+        while levels
+            .get(current)
+            .is_some_and(|(_, queue)| queue.is_empty())
+        {
+            current += 1;
+        }
+        let Some(&event) = events.get(i) else {
+            break;
+        };
         match event {
             Event::Trade {
                 trade_id,
@@ -440,9 +498,10 @@ fn check_execution(
                 ensure(!taker.post_only, "a post-only order traded")?;
                 ensure(trade_id == next_trade_id, "trade ids must be consecutive")?;
                 next_trade_id += 1;
-                let (maker_price, m) = *line
-                    .get(next_in_line)
+                let (maker_price, queue) = levels
+                    .get_mut(current)
                     .ok_or("traded although no resting order was left")?;
+                let m = queue.front_mut().expect("empty levels are skipped");
                 ensure(
                     m.id == maker,
                     format!(
@@ -451,7 +510,7 @@ fn check_execution(
                     ),
                 )?;
                 ensure(
-                    price == maker_price,
+                    price == *maker_price,
                     "trade price must be the maker's price",
                 )?;
                 ensure(m.owner != taker.owner, "self-trade")?;
@@ -460,23 +519,38 @@ fn check_execution(
                     "traded through the limit or protection cap",
                 )?;
                 ensure(
-                    qty > 0 && qty == left.min(m.leaves),
-                    "fill must be as large as possible",
+                    qty > 0 && qty == left.min(m.visible),
+                    "fill must be as large as the maker shows and the taker needs",
                 )?;
                 left -= qty;
+                m.leaves -= qty;
+                m.visible -= qty;
+                m.filled += qty;
                 ensure(taker_leaves == left, "taker_leaves is wrong")?;
-                ensure(maker_leaves == m.leaves - qty, "maker_leaves is wrong")?;
-                touched.insert(
-                    maker,
-                    (maker_leaves > 0).then_some((maker_leaves, m.filled + qty)),
-                );
-                if maker_leaves > 0 {
+                ensure(maker_leaves == m.leaves, "maker_leaves is wrong")?;
+                if m.leaves == 0 {
+                    queue.pop_front();
+                } else if m.visible == 0 {
+                    let display = m.display.ok_or("a plain order showed less than it had")?;
+                    let replenished = Event::Replenished {
+                        id: maker,
+                        side: opposite,
+                        price,
+                        visible: display.min(m.leaves),
+                    };
+                    ensure(
+                        events.get(i + 1) == Some(&replenished),
+                        "an iceberg's used-up tranche must be replenished at once",
+                    )?;
+                    i += 1;
+                    let mut iceberg = queue.pop_front().expect("it was the front");
+                    iceberg.visible = display.min(iceberg.leaves);
+                    queue.push_back(iceberg);
+                } else {
                     ensure(
                         left == 0,
                         "a maker was left partially filled while the taker was not",
                     )?;
-                } else {
-                    next_in_line += 1;
                 }
             }
             Event::Cancelled {
@@ -488,9 +562,10 @@ fn check_execution(
                     cfg.self_trade == SelfTradePolicy::CancelResting,
                     "resting order cancelled under CancelIncoming",
                 )?;
-                let (price, m) = *line
-                    .get(next_in_line)
+                let (price, queue) = levels
+                    .get_mut(current)
                     .ok_or("self-trade cancel with no resting order left")?;
+                let m = queue.front().expect("empty levels are skipped");
                 ensure(m.id == id, "self-trade cancel skipped the queue")?;
                 ensure(
                     m.owner == taker.owner,
@@ -501,11 +576,10 @@ fn check_execution(
                     "self-trade cancel must remove all open quantity",
                 )?;
                 ensure(
-                    taker.may_trade_at(price),
+                    taker.may_trade_at(*price),
                     "self-trade cancel beyond the limit",
                 )?;
-                touched.insert(id, None);
-                next_in_line += 1;
+                queue.pop_front();
             }
             _ => break,
         }
@@ -516,11 +590,12 @@ fn check_execution(
         "trade counter disagrees with the trades emitted",
     )?;
 
-    // The order of the next resting order the taker would reach, if it may trade with it.
-    let next_reachable = line
-        .get(next_in_line)
+    // The next resting order the taker would reach, if it may trade with it.
+    let next_reachable = levels
+        .get(current)
         .filter(|(price, _)| taker.may_trade_at(*price))
-        .map(|(_, o)| *o);
+        .and_then(|(_, queue)| queue.front().copied());
+    let exhausted = current == levels.len();
     let mut rested = None;
     match &events[i..] {
         [] => ensure(left == 0, "unfilled quantity vanished")?,
@@ -530,6 +605,7 @@ fn check_execution(
                 side,
                 price,
                 qty,
+                visible,
             },
         ] => {
             ensure(
@@ -545,10 +621,14 @@ fn check_execution(
                 "rested quantity must be the unfilled quantity",
             )?;
             ensure(
+                *visible == taker.shows(left),
+                "a resting order shows its display quantity, or everything",
+            )?;
+            ensure(
                 next_reachable.is_none(),
                 "rested while it could still trade",
             )?;
-            rested = Some((*price, *qty));
+            rested = Some((*price, *qty, *visible));
         }
         [Event::Cancelled { id, qty, reason }] if *id == taker.id => {
             ensure(
@@ -572,15 +652,12 @@ fn check_execution(
                         taker.limit.is_none(),
                         "only market orders run out of liquidity",
                     )?;
-                    ensure(
-                        next_in_line == line.len(),
-                        "NoLiquidity while orders remain",
-                    )?;
+                    ensure(exhausted, "NoLiquidity while orders remain")?;
                 }
                 PriceProtection => {
                     ensure(taker.cap.is_some(), "PriceProtection without protection")?;
                     ensure(
-                        next_in_line < line.len() && next_reachable.is_none(),
+                        !exhausted && next_reachable.is_none(),
                         "PriceProtection although the next order is within the cap",
                     )?;
                 }
@@ -603,24 +680,15 @@ fn check_execution(
         rest => return Err(format!("unexpected trailing events: {rest:?}")),
     }
 
-    // The book must be exactly `before`, with the reached orders updated and the taker
-    // appended to its level.
+    // The book must be `before` with the opposite side as replayed and the taker appended
+    // to its level.
     let mut books = to_books(&before.snapshot);
-    for book in &mut books {
-        for queue in book.values_mut() {
-            queue.retain_mut(|o| match touched.get(&o.id) {
-                None => true,
-                Some(None) => false,
-                Some(Some((leaves, filled))) => {
-                    o.leaves = *leaves;
-                    o.filled = *filled;
-                    true
-                }
-            });
-        }
-        book.retain(|_, queue| !queue.is_empty());
-    }
-    if let Some((price, qty)) = rested {
+    books[State::side_index(opposite)] = levels
+        .into_iter()
+        .filter(|(_, queue)| !queue.is_empty())
+        .map(|(price, queue)| (price, queue.into_iter().collect()))
+        .collect();
+    if let Some((price, qty, visible)) = rested {
         books[State::side_index(taker.side)]
             .entry(price)
             .or_default()
@@ -630,6 +698,8 @@ fn check_execution(
                 leaves: qty,
                 filled: taker.filled_before + (taker.qty - qty),
                 post_only: taker.post_only,
+                display: taker.display,
+                visible,
             });
     }
     ensure(
@@ -650,6 +720,9 @@ fn check_execution(
 fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Option<RejectReason> {
     use RejectReason::*;
     let owner_invalid = |owner: OwnerId| owner >= cfg.max_owners;
+    let covers = |display: Qty, qty: Qty| {
+        u128::from(display) * u128::from(cfg.max_iceberg_tranches) >= u128::from(qty)
+    };
     let qty_invalid = |qty: Qty| qty == 0 || qty > cfg.max_order_qty;
     let out_of_band = |price: Price| price < cfg.min_price || price > cfg.max_price;
     let owned = |id: OrderId, owner: OwnerId| before.find(id).filter(|(_, _, o)| o.owner == owner);
@@ -679,6 +752,7 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             price,
             qty,
             tif,
+            display,
         } => {
             let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
             let full = before.order_count() == cfg.max_orders as usize;
@@ -686,6 +760,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidOwner)
             } else if qty_invalid(qty) {
                 Some(InvalidQuantity)
+            } else if display.is_some_and(|d| d == 0 || d >= qty || !may_rest || !covers(d, qty)) {
+                Some(InvalidDisplay)
             } else if out_of_band(price) {
                 Some(PriceOutOfRange)
             } else if before.find(id).is_some() {
@@ -738,6 +814,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(PriceOutsideProtection)
             } else if replaces && order.post_only && crosses(side, price) {
                 Some(PostOnlyWouldCross)
+            } else if replaces && order.display.is_some_and(|d| !covers(d, qty)) {
+                Some(InvalidDisplay)
             } else {
                 None
             }

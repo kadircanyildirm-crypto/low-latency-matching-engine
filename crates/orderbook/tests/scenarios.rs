@@ -51,6 +51,36 @@ fn limit_tif(
         price,
         qty,
         tif,
+        display: None,
+    }
+}
+
+/// A GTC iceberg showing `display` of `qty`.
+fn iceberg(
+    owner: OwnerId,
+    id: OrderId,
+    side: Side,
+    price: Price,
+    qty: Qty,
+    display: Qty,
+) -> Command {
+    Command::Limit {
+        id,
+        owner,
+        side,
+        price,
+        qty,
+        tif: TimeInForce::Gtc,
+        display: Some(display),
+    }
+}
+
+fn replenished(id: OrderId, side: Side, price: Price, visible: Qty) -> Event {
+    Replenished {
+        id,
+        side,
+        price,
+        visible,
     }
 }
 
@@ -68,10 +98,11 @@ fn market_by(owner: OwnerId, id: OrderId, side: Side, qty: Qty) -> Command {
 }
 
 fn cancel(id: OrderId) -> Command {
-    Command::Cancel {
-        id,
-        owner: id as OwnerId,
-    }
+    cancel_by(id as OwnerId, id)
+}
+
+fn cancel_by(owner: OwnerId, id: OrderId) -> Command {
+    Command::Cancel { id, owner }
 }
 
 fn modify(id: OrderId, price: Price, qty: Qty) -> Command {
@@ -89,6 +120,7 @@ fn rested(id: OrderId, side: Side, price: Price, qty: Qty) -> Event {
         side,
         price,
         qty,
+        visible: qty,
     }
 }
 
@@ -707,6 +739,218 @@ fn post_only_restriction_survives_modifies() {
     // A plain GTC order may be modified into the market.
     run(&mut b, limit(10, Buy, 97, 1));
     assert_eq!(fills(&run(&mut b, modify(10, 100, 1))), [(1, 100, 1)]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Icebergs
+
+#[test]
+fn an_iceberg_shows_only_its_display() {
+    let mut b = book();
+    assert_eq!(
+        run(&mut b, iceberg(7, 1, Sell, 100, 10, 3)),
+        [
+            Accepted { id: 1 },
+            Rested {
+                id: 1,
+                side: Sell,
+                price: 100,
+                qty: 10,
+                visible: 3
+            }
+        ]
+    );
+    // Market data sees 3; the owner sees all 10.
+    assert_eq!(b.best_ask(), level(100, 3, 1));
+    let info = b.order(1).unwrap();
+    assert_eq!((info.leaves, info.visible, info.display), (10, 3, Some(3)));
+}
+
+#[test]
+fn a_used_up_tranche_is_replenished_at_the_back_of_the_queue() {
+    let mut b = book();
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    run(&mut b, limit(2, Sell, 100, 5));
+    // The taker clears the iceberg's tranche, which then queues behind #2.
+    let events = run(&mut b, limit(3, Buy, 100, 4));
+    assert_eq!(fills(&events), [(1, 100, 3), (2, 100, 1)]);
+    assert_eq!(events[2], replenished(1, Sell, 100, 3));
+    assert_eq!(queue(&b, Sell, 100), [(2, 4), (1, 7)]);
+    assert_eq!(b.best_ask(), level(100, 7, 2));
+}
+
+#[test]
+fn one_taker_can_take_several_tranches() {
+    let mut b = book();
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    let events = run(&mut b, limit(2, Buy, 100, 8));
+    assert_eq!(fills(&events), [(1, 100, 3), (1, 100, 3), (1, 100, 2)]);
+    assert_eq!(events[2], replenished(1, Sell, 100, 3));
+    assert_eq!(events[4], replenished(1, Sell, 100, 3));
+    // The last tranche is partly filled: 1 of it still shows, 2 lots remain in total.
+    let info = b.order(1).unwrap();
+    assert_eq!((info.leaves, info.visible), (2, 1));
+    assert_eq!(b.best_ask(), level(100, 1, 1));
+    // The final tranche shows only what is left.
+    let events = run(&mut b, limit(3, Buy, 100, 1));
+    assert_eq!(events[2], replenished(1, Sell, 100, 1));
+}
+
+#[test]
+fn an_incoming_iceberg_takes_with_its_whole_quantity() {
+    let mut b = ask_ladder();
+    let events = run(&mut b, iceberg(9, 9, Buy, 101, 10, 2));
+    assert_eq!(fills(&events), [(1, 100, 2), (2, 101, 3)]);
+    assert_eq!(
+        events.last(),
+        Some(&Rested {
+            id: 9,
+            side: Buy,
+            price: 101,
+            qty: 5,
+            visible: 2
+        })
+    );
+}
+
+#[test]
+fn fill_or_kill_counts_hidden_quantity_it_can_reach() {
+    let mut b = book();
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    assert_eq!(
+        fills(&run(&mut b, limit_tif(9, 9, Buy, 100, 9, Fok))),
+        [(1, 100, 3), (1, 100, 3), (1, 100, 3)]
+    );
+    // Under CancelIncoming a new tranche lands behind the owner's own order, which stops
+    // the match: only the first tranche is in reach.
+    let mut b = OrderBook::new(BookConfig {
+        self_trade: SelfTradePolicy::CancelIncoming,
+        ..CFG
+    });
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    run(&mut b, limit_by(9, 2, Sell, 100, 5));
+    assert_eq!(
+        run(&mut b, limit_tif(9, 9, Buy, 100, 4, Fok)),
+        [Accepted { id: 9 }, cancelled(9, 4, FillOrKill)]
+    );
+    assert_eq!(
+        fills(&run(&mut b, limit_tif(9, 10, Buy, 100, 3, Fok))),
+        [(1, 100, 3)]
+    );
+}
+
+#[test]
+fn modifying_an_iceberg_cuts_the_hidden_part_first() {
+    let mut b = book();
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    run(&mut b, limit(2, Sell, 100, 1));
+    // Down to 5: the 3 on display stay, priority is kept.
+    assert_eq!(
+        run(
+            &mut b,
+            Command::Modify {
+                id: 1,
+                owner: 7,
+                price: 100,
+                qty: 5
+            }
+        ),
+        [modified(1, 100, 5, 5)]
+    );
+    assert_eq!(queue(&b, Sell, 100), [(1, 5), (2, 1)]);
+    assert_eq!(b.order(1).unwrap().visible, 3);
+    // Down to 2: below the display, so it shows 2.
+    run(
+        &mut b,
+        Command::Modify {
+            id: 1,
+            owner: 7,
+            price: 100,
+            qty: 2,
+        },
+    );
+    assert_eq!(b.order(1).unwrap().visible, 2);
+    // Up to 12 loses priority and re-enters, still an iceberg showing 3.
+    assert_eq!(
+        run(
+            &mut b,
+            Command::Modify {
+                id: 1,
+                owner: 7,
+                price: 100,
+                qty: 12
+            }
+        ),
+        [
+            modified(1, 100, 12, 12),
+            Rested {
+                id: 1,
+                side: Sell,
+                price: 100,
+                qty: 12,
+                visible: 3
+            }
+        ]
+    );
+    assert_eq!(queue(&b, Sell, 100), [(2, 1), (1, 12)]);
+}
+
+#[test]
+fn cancels_remove_the_hidden_part_too() {
+    let mut b = book();
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    assert_eq!(run(&mut b, cancel_by(7, 1)), [cancelled(1, 10, Requested)]);
+    run(&mut b, iceberg(7, 1, Sell, 100, 10, 3));
+    // Self-trade prevention removes the whole iceberg, not just its tranche.
+    let events = run(&mut b, limit_by(7, 2, Buy, 100, 1));
+    assert_eq!(events[1], cancelled(1, 10, SelfTrade));
+    assert!(b.best_ask().is_none());
+}
+
+#[test]
+fn invalid_displays_are_rejected() {
+    let mut b = book();
+    let cases = [
+        iceberg(7, 1, Sell, 100, 10, 0),
+        iceberg(7, 1, Sell, 100, 10, 10),
+        iceberg(7, 1, Sell, 100, 10, 11),
+        Command::Limit {
+            id: 1,
+            owner: 7,
+            side: Sell,
+            price: 100,
+            qty: 10,
+            tif: Ioc,
+            display: Some(3),
+        },
+        Command::Limit {
+            id: 1,
+            owner: 7,
+            side: Sell,
+            price: 100,
+            qty: 10,
+            tif: Fok,
+            display: Some(3),
+        },
+    ];
+    for command in cases {
+        assert_eq!(
+            run(&mut b, command),
+            [rejected(1, InvalidDisplay)],
+            "{command:?}"
+        );
+    }
+    // A post-only iceberg is fine.
+    let post_only_iceberg = Command::Limit {
+        id: 1,
+        owner: 7,
+        side: Sell,
+        price: 100,
+        qty: 10,
+        tif: PostOnly,
+        display: Some(3),
+    };
+    assert_eq!(run(&mut b, post_only_iceberg)[0], Accepted { id: 1 });
 }
 
 // ---------------------------------------------------------------------------------------

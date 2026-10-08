@@ -69,9 +69,17 @@ impl Fnv {
                 side: s,
                 price,
                 qty,
-            } => [3, id, side(s), price as u64, qty]
-                .iter()
-                .for_each(|&v| self.write_u64(v)),
+                visible,
+            } => {
+                [3, id, side(s), price as u64, qty]
+                    .iter()
+                    .for_each(|&v| self.write_u64(v));
+                // Only icebergs show less than they hold; plain orders keep the encoding
+                // the golden values were pinned with.
+                if visible != qty {
+                    self.write_u64(visible);
+                }
+            }
             Cancelled { id, qty, reason } => [4, id, qty, reason as u64]
                 .iter()
                 .for_each(|&v| self.write_u64(v)),
@@ -84,6 +92,14 @@ impl Fnv {
                 .iter()
                 .for_each(|&v| self.write_u64(v)),
             MassCancelled { owner, count } => [6, u64::from(owner), u64::from(count)]
+                .iter()
+                .for_each(|&v| self.write_u64(v)),
+            Replenished {
+                id,
+                side: s,
+                price,
+                visible,
+            } => [7, id, side(s), price as u64, visible]
                 .iter()
                 .for_each(|&v| self.write_u64(v)),
         }

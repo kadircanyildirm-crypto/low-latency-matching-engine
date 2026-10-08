@@ -58,6 +58,11 @@ pub enum Command {
         qty: Qty,
         /// Time in force.
         tif: TimeInForce,
+        /// Iceberg display quantity: while resting, show at most this many lots and keep the
+        /// rest hidden. `None` shows everything. Must be below `qty` and at least
+        /// `qty / max_iceberg_tranches`, and only GTC and post-only orders, which can rest,
+        /// may have one.
+        display: Option<Qty>,
     },
     /// Trades against the opposite side at any price within the book's price protection.
     /// Whatever cannot be filled is cancelled; market orders never rest.
@@ -204,8 +209,22 @@ pub enum Event {
         side: Side,
         /// Its price.
         price: Price,
-        /// Its open quantity.
+        /// Its open quantity, hidden part included.
         qty: Qty,
+        /// The part it shows on the book; less than `qty` only for an iceberg.
+        visible: Qty,
+    },
+    /// An iceberg's visible tranche was used up: its next tranche now shows at the back of
+    /// its price level's queue. It follows the `Trade` that used up the previous one.
+    Replenished {
+        /// The iceberg order.
+        id: OrderId,
+        /// Its side.
+        side: Side,
+        /// Its price.
+        price: Price,
+        /// The quantity it now shows.
+        visible: Qty,
     },
     /// Open quantity left the book without trading. The order is done.
     Cancelled {
@@ -258,6 +277,10 @@ pub enum RejectReason {
     InvalidOwner,
     /// A post-only order, or a modify of one, would have traded with the opposite side.
     PostOnlyWouldCross,
+    /// An iceberg display quantity that is zero, not below the order quantity, too small
+    /// for the book's `max_iceberg_tranches` to cover the quantity, or given to an IOC or
+    /// fill-or-kill order.
+    InvalidDisplay,
 }
 
 /// Why open quantity left the book without trading.

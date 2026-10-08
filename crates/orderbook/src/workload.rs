@@ -93,6 +93,9 @@ pub struct WorkloadConfig {
     pub mix: Mix,
     /// Time in force of limit orders.
     pub tif: TifMix,
+    /// Share of passive limits, in percent, sent as icebergs that show a quarter of their
+    /// size. Zero by default, and no random numbers are drawn then.
+    pub iceberg: u8,
 }
 
 impl Default for WorkloadConfig {
@@ -115,6 +118,7 @@ impl Default for WorkloadConfig {
                 modify: 5,
             },
             tif: TifMix::default(),
+            iceberg: 0,
         }
     }
 }
@@ -129,6 +133,7 @@ impl WorkloadConfig {
             max_orders: self.max_live,
             max_owners: self.owners,
             max_order_qty: 1_000_000,
+            max_iceberg_tranches: BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES,
             price_protection: Some((self.passive_depth * 4) as u32),
             self_trade: SelfTradePolicy::CancelResting,
         }
@@ -189,6 +194,7 @@ impl Workload {
             u16::from(t.ioc) + u16::from(t.fok) <= 100 && t.post_only <= 100,
             "time-in-force shares are percentages"
         );
+        assert!(cfg.iceberg <= 100, "the iceberg share is a percentage");
         assert!(cfg.max_live > 0 && cfg.max_qty > 0 && cfg.owners > 0 && cfg.passive_depth > 0);
         let margin = cfg.passive_depth + 8;
         assert!(
@@ -253,6 +259,7 @@ impl Workload {
                 side,
                 price,
                 qty,
+                ..
             } => {
                 let owner = self.owner_of_new(id);
                 self.position.insert(id, self.live.len() as u32);
@@ -290,7 +297,11 @@ impl Workload {
                     }
                 }
             }
-            Event::Accepted { .. } | Event::Rejected { .. } | Event::MassCancelled { .. } => {}
+            // A new iceberg tranche changes what shows, not what is open.
+            Event::Accepted { .. }
+            | Event::Rejected { .. }
+            | Event::MassCancelled { .. }
+            | Event::Replenished { .. } => {}
         }
     }
 
@@ -377,6 +388,16 @@ impl Workload {
         }
     }
 
+    /// A quarter of the size, for the configured share of passive orders big enough to hide
+    /// something. Draws only when the share is non-zero.
+    fn random_display(&mut self, aggressive: bool, qty: Qty) -> Option<Qty> {
+        let iceberg = !aggressive
+            && self.cfg.iceberg > 0
+            && (self.rng.below(100) as u8) < self.cfg.iceberg
+            && qty >= 2;
+        iceberg.then(|| (qty / 4).max(1))
+    }
+
     fn take_id(&mut self) -> OrderId {
         let id = self.next_id;
         self.next_id += 1;
@@ -393,6 +414,7 @@ impl Workload {
         let qty = self.random_qty();
         let id = self.take_id();
         let tif = self.random_tif(aggressive);
+        let display = self.random_display(aggressive, qty);
         let order = Command::Limit {
             id,
             owner: self.owner_of_new(id),
@@ -400,6 +422,7 @@ impl Workload {
             price,
             qty,
             tif,
+            display,
         };
         if self.live.len() < self.cfg.max_live as usize {
             return order;
@@ -484,6 +507,8 @@ pub struct EventCounts {
     pub ioc_cancels: u64,
     /// Fill-or-kill orders that could not fill.
     pub fok_kills: u64,
+    /// `Replenished` events: new iceberg tranches.
+    pub replenishes: u64,
     /// `Modified` events.
     pub modified: u64,
     /// `MassCancelled` events.
@@ -519,6 +544,7 @@ impl EventSink for EventCounts {
             }
             Event::Modified { .. } => self.modified += 1,
             Event::MassCancelled { .. } => self.mass_cancels += 1,
+            Event::Replenished { .. } => self.replenishes += 1,
         }
     }
 }

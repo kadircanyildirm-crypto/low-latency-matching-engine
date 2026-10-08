@@ -30,10 +30,16 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
     ];
     // Owners are drawn from 0..4, so a table of 3 sometimes sees an owner it cannot hold.
     let max_owners = prop_oneof![Just(3u32), Just(BookConfig::DEFAULT_MAX_OWNERS)];
+    // Small displays against small and huge quantities: some icebergs fit, some would need
+    // too many tranches; zero disallows icebergs altogether.
+    let tranches = prop_oneof![
+        Just(0u32),
+        Just(3),
+        Just(BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES)
+    ];
     (
         band,
-        1u32..=24,
-        max_owners,
+        (1u32..=24, max_owners, tranches),
         any::<bool>(),
         protection,
         policy,
@@ -41,8 +47,7 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
         .prop_map(
             |(
                 (min_price, max_price),
-                max_orders,
-                max_owners,
+                (max_orders, max_owners, max_iceberg_tranches),
                 huge_qty,
                 price_protection,
                 self_trade,
@@ -52,6 +57,7 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
                     max_price,
                     max_orders,
                     max_owners,
+                    max_iceberg_tranches,
                     // Either small, so `max_order_qty + 1` shows up often, or as large as the
                     // capacity allows, so level totals approach `u64::MAX`.
                     max_order_qty: if huge_qty {
@@ -73,8 +79,10 @@ pub fn scenario(max_len: usize) -> impl Strategy<Value = (BookConfig, Vec<Comman
 
 pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
     prop_oneof![
-        6 => (id(), owner(), side(), price(cfg), qty(cfg), tif())
-            .prop_map(|(id, owner, side, price, qty, tif)| Command::Limit { id, owner, side, price, qty, tif }),
+        6 => (id(), owner(), side(), price(cfg), qty(cfg), tif(), display())
+            .prop_map(|(id, owner, side, price, qty, tif, display)| Command::Limit {
+                id, owner, side, price, qty, tif, display,
+            }),
         1 => (id(), owner(), side(), qty(cfg))
             .prop_map(|(id, owner, side, qty)| Command::Market { id, owner, side, qty }),
         2 => (id(), owner())
@@ -92,6 +100,16 @@ fn id() -> impl Strategy<Value = OrderId> {
 
 fn owner() -> impl Strategy<Value = OwnerId> {
     0..4u32
+}
+
+/// Mostly plain orders; icebergs with small displays, so tranches run out and replenish
+/// often; now and then a display of zero.
+fn display() -> impl Strategy<Value = Option<Qty>> {
+    prop_oneof![
+        8 => Just(None),
+        3 => (1..=4u64).prop_map(Some),
+        1 => Just(Some(0)),
+    ]
 }
 
 fn tif() -> impl Strategy<Value = TimeInForce> {

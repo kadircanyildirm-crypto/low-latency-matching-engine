@@ -1,4 +1,5 @@
-//! Fixed-capacity storage for resting orders.
+//! Fixed-capacity storage for resting orders, plus the iceberg part of those that show only
+//! some of their quantity.
 
 use crate::types::{OrderId, OwnerId, Qty, Side};
 
@@ -22,6 +23,17 @@ pub(crate) struct OrderNode {
     /// Post-only orders keep the restriction while they rest: a modify may not make them
     /// trade.
     pub post_only: bool,
+    /// Whether the slot's [`IcebergPart`] is in use. A plain order shows all it has.
+    pub iceberg: bool,
+}
+
+/// What an iceberg order shows: at most `display` lots at a time, of which `visible` are
+/// still on display. Kept beside the node rather than in it, so plain orders do not pay
+/// for it in cache space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IcebergPart {
+    pub display: Qty,
+    pub visible: Qty,
 }
 
 // The node's size is part of the cache budget; growing it should be a deliberate decision.
@@ -49,6 +61,7 @@ impl OrderNode {
             owner,
             side,
             post_only,
+            iceberg: false,
         }
     }
 }
@@ -59,6 +72,8 @@ impl OrderNode {
 /// (the one most likely still in cache) is reused first.
 pub(crate) struct OrderPool {
     nodes: Vec<OrderNode>,
+    /// Iceberg part of each slot; meaningful only while the node's `iceberg` flag is set.
+    icebergs: Vec<IcebergPart>,
     free_head: u32,
     live: usize,
 }
@@ -80,10 +95,16 @@ impl OrderPool {
                 owner: 0,
                 side: Side::Buy,
                 post_only: false,
+                iceberg: false,
             })
             .collect();
+        let unused = IcebergPart {
+            display: 0,
+            visible: 0,
+        };
         Self {
             nodes,
+            icebergs: vec![unused; capacity as usize],
             free_head: if capacity == 0 { NIL } else { 0 },
             live: 0,
         }
@@ -142,5 +163,80 @@ impl OrderPool {
     #[inline]
     pub fn get_mut(&mut self, slot: u32) -> &mut OrderNode {
         &mut self.nodes[slot as usize]
+    }
+
+    /// Turns the order in `slot` into an iceberg showing `visible` of at most `display`.
+    #[inline]
+    pub fn make_iceberg(&mut self, slot: u32, display: Qty, visible: Qty) {
+        self.nodes[slot as usize].iceberg = true;
+        self.icebergs[slot as usize] = IcebergPart { display, visible };
+    }
+
+    /// The iceberg part of the order in `slot`, if it is an iceberg.
+    #[inline]
+    pub fn iceberg(&self, slot: u32) -> Option<IcebergPart> {
+        self.nodes[slot as usize]
+            .iceberg
+            .then(|| self.icebergs[slot as usize])
+    }
+
+    /// Quantity the order in `slot` shows on the book: all of it, unless it is an iceberg.
+    #[inline]
+    pub fn visible(&self, slot: u32) -> Qty {
+        let node = &self.nodes[slot as usize];
+        if node.iceberg {
+            self.icebergs[slot as usize].visible
+        } else {
+            node.remaining
+        }
+    }
+
+    /// Trades up to `qty` against what the order in `slot` shows. Returns the quantity
+    /// traded and the order's open quantity afterwards, hidden part included.
+    #[inline]
+    pub fn fill(&mut self, slot: u32, qty: Qty) -> (Qty, Qty) {
+        let node = &mut self.nodes[slot as usize];
+        let fill = if node.iceberg {
+            let part = &mut self.icebergs[slot as usize];
+            let fill = qty.min(part.visible);
+            part.visible -= fill;
+            fill
+        } else {
+            qty.min(node.remaining)
+        };
+        node.remaining -= fill;
+        (fill, node.remaining)
+    }
+
+    /// Shows the next tranche of an iceberg whose visible part is used up, and returns it.
+    #[inline]
+    pub fn replenish(&mut self, slot: u32) -> Qty {
+        let remaining = self.nodes[slot as usize].remaining;
+        let part = &mut self.icebergs[slot as usize];
+        part.visible = part.display.min(remaining);
+        part.visible
+    }
+
+    /// Lowers the order's open quantity to `leaves` and its total to `total`, taking the
+    /// cut out of the hidden part first. Returns how much less the order now shows.
+    #[inline]
+    pub fn shrink(&mut self, slot: u32, leaves: Qty, total: Qty) -> Qty {
+        let node = &mut self.nodes[slot as usize];
+        let shown_less = if node.iceberg {
+            let part = &mut self.icebergs[slot as usize];
+            let before = part.visible;
+            part.visible = before.min(leaves);
+            before - part.visible
+        } else {
+            node.remaining - leaves
+        };
+        node.remaining = leaves;
+        node.total = total;
+        shown_less
+    }
+
+    #[cfg(test)]
+    pub fn iceberg_mut(&mut self, slot: u32) -> &mut IcebergPart {
+        &mut self.icebergs[slot as usize]
     }
 }

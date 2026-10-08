@@ -68,7 +68,7 @@ fn synthetic_flow_matches_reference() {
 
 /// Few owners for frequent self-trades under `CancelIncoming`, many market orders against
 /// a one-tick protection band for frequent protection stops and rejections, mass cancels,
-/// and every time in force.
+/// every time in force, and icebergs.
 fn protected_config() -> (WorkloadConfig, BookConfig) {
     let cfg = WorkloadConfig {
         owners: 4,
@@ -86,6 +86,7 @@ fn protected_config() -> (WorkloadConfig, BookConfig) {
             fok: 20,
             post_only: 20,
         },
+        iceberg: 20,
         ..config()
     };
     let book_cfg = BookConfig {
@@ -110,6 +111,7 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
         counts.ioc_cancels > 100 && counts.fok_kills > 100,
         "{counts:?}"
     );
+    assert!(counts.replenishes > 100, "{counts:?}");
 }
 
 /// Fingerprint of every event and the final book after 100k commands of synthetic flow,
@@ -176,5 +178,5 @@ fn output_matches_the_golden_fingerprints() {
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
 const GOLDEN_DEFAULT_DIGEST: u64 = 0x27a8_dff1_4375_a843;
-const GOLDEN_PROTECTED: u64 = 0x28fa_3b96_7123_4f89;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0x1168_b732_b477_71e3;
+const GOLDEN_PROTECTED: u64 = 0x0266_f614_e608_4130;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0x1cef_1946_3f85_2456;

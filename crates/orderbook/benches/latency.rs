@@ -71,6 +71,7 @@ fn scenarios() -> Vec<Scenario> {
             fok: 20,
             post_only: 20,
         },
+        iceberg: 20,
         ..WorkloadConfig::default()
     };
     vec![
@@ -112,7 +113,7 @@ fn scenarios() -> Vec<Scenario> {
         // side of the book stays empty for long stretches.
         Scenario {
             name: "protected",
-            about: "2-tick protection, 4 owners, IOC/FOK/post-only; stops, self-trades, rejects",
+            about: "2-tick protection, 4 owners, IOC/FOK/post-only, icebergs; every path",
             workload: protected,
             book: BookConfig {
                 price_protection: Some(2),

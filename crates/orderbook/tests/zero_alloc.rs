@@ -133,21 +133,22 @@ fn mass_cancels_never_allocate() {
     );
 }
 
-/// Fill-or-kill orders walk the book before matching; neither that nor any other time in
-/// force may allocate.
+/// Fill-or-kill orders walk the book before matching, and iceberg tranches move to the
+/// back of their queue; none of it may allocate.
 #[test]
-fn every_time_in_force_never_allocates() {
+fn every_order_type_never_allocates() {
     let cfg = WorkloadConfig {
         tif: TifMix {
             ioc: 30,
             fok: 30,
             post_only: 30,
         },
+        iceberg: 30,
         ..WorkloadConfig::default()
     };
     let counts = assert_no_allocations(cfg, 100_000, 1_000_000);
     assert!(
-        counts.ioc_cancels > 1_000 && counts.fok_kills > 1_000,
+        counts.ioc_cancels > 1_000 && counts.fok_kills > 1_000 && counts.replenishes > 1_000,
         "{counts:?}"
     );
 }

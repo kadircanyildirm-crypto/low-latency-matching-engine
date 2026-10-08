@@ -7,8 +7,8 @@
 //! of the outcome instead: each trade is with the next order in price-time priority, never
 //! through the taker's limit or the protection cap, never between the same owner; fills are
 //! as large as possible; quantity is conserved; rejected commands change nothing; orders the
-//! command did not touch are left exactly as they were; and each rejection reason actually
-//! applies.
+//! command did not touch are left exactly as they were; and a command is rejected exactly
+//! when a rule requires it, with the reason that rule gives.
 
 mod common;
 
@@ -159,6 +159,7 @@ fn check(
         "order_count disagrees with the book's contents",
     )?;
     let first = *events.first().ok_or("no events")?;
+    let required = required_rejection(cfg, before, command);
 
     if let Event::Rejected { id, reason } = first {
         ensure(events.len() == 1, "a rejection must be the only event")?;
@@ -167,7 +168,13 @@ fn check(
             after.snapshot == before.snapshot && after.trade_count == before.trade_count,
             "a rejected command changed the book",
         )?;
-        return check_rejection(cfg, before, command, reason);
+        return ensure(
+            required == Some(reason),
+            format!("rejected as {reason:?}, but the rules require {required:?}"),
+        );
+    }
+    if let Some(reason) = required {
+        return Err(format!("accepted, but the rules require {reason:?}"));
     }
 
     match command {
@@ -530,13 +537,16 @@ fn check_execution(
     )
 }
 
-/// Each rejection reason must actually apply to the command and the book before it.
-fn check_rejection(
-    cfg: &BookConfig,
-    before: &State,
-    command: Command,
-    reason: RejectReason,
-) -> Check {
+/// The rejection the rules require for `command` against the book before it, or `None` if
+/// the command must be accepted. When several rules apply, the first one listed for the
+/// command wins: stateless checks (quantity, price band) before stateful ones (ids,
+/// ownership, protection, capacity).
+///
+/// Checking acceptance as well as rejection matters: a command that should have been
+/// refused but was not can leave a book that looks perfectly healthy, such as a limit order
+/// priced through the protection band that simply trades.
+fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Option<RejectReason> {
+    use RejectReason::*;
     let qty_invalid = |qty: Qty| qty == 0 || qty > cfg.max_order_qty;
     let out_of_band = |price: Price| price < cfg.min_price || price > cfg.max_price;
     let owned = |id: OrderId, owner: OwnerId| before.find(id).filter(|(_, _, o)| o.owner == owner);
@@ -553,91 +563,65 @@ fn check_rejection(
             }
         })
     };
-    let holds = match (command, reason) {
-        (
-            Command::Limit { qty, .. } | Command::Market { qty, .. } | Command::Modify { qty, .. },
-            RejectReason::InvalidQuantity,
-        ) => qty_invalid(qty),
-        (
-            Command::Limit { qty, price, .. } | Command::Modify { qty, price, .. },
-            RejectReason::PriceOutOfRange,
-        ) => !qty_invalid(qty) && out_of_band(price),
-        (Command::Limit { id, qty, price, .. }, RejectReason::DuplicateOrderId) => {
-            !qty_invalid(qty) && !out_of_band(price) && before.find(id).is_some()
-        }
-        (Command::Market { id, qty, .. }, RejectReason::DuplicateOrderId) => {
-            !qty_invalid(qty) && before.find(id).is_some()
-        }
-        (Command::Cancel { id, owner }, RejectReason::UnknownOrder) => owned(id, owner).is_none(),
-        (
-            Command::Modify {
-                id,
-                owner,
-                qty,
-                price,
-            },
-            RejectReason::UnknownOrder,
-        ) => !qty_invalid(qty) && !out_of_band(price) && owned(id, owner).is_none(),
-        (
-            Command::Limit {
-                id,
-                side,
-                price,
-                qty,
-                ..
-            },
-            RejectReason::PriceOutsideProtection,
-        ) => {
-            !qty_invalid(qty)
-                && !out_of_band(price)
-                && before.find(id).is_none()
-                && beyond_protection(side, price)
-        }
-        (
-            Command::Modify {
-                id,
-                owner,
-                price,
-                qty,
-            },
-            RejectReason::PriceOutsideProtection,
-        ) => {
-            match owned(id, owner) {
-                // Only the cancel/replace path is subject to protection.
-                Some((side, old_price, o)) => {
-                    let leaves = qty.saturating_sub(o.filled);
-                    let in_place = price == old_price && leaves <= o.leaves;
-                    let replaces = leaves > 0 && !in_place;
-                    !qty_invalid(qty)
-                        && !out_of_band(price)
-                        && replaces
-                        && beyond_protection(side, price)
-                }
-                None => false,
+    let crosses = |side: Side, price: Price| match side {
+        Side::Buy => before.best(Side::Sell).is_some_and(|ask| price >= ask),
+        Side::Sell => before.best(Side::Buy).is_some_and(|bid| price <= bid),
+    };
+
+    match command {
+        Command::Limit {
+            id,
+            side,
+            price,
+            qty,
+            ..
+        } => {
+            if qty_invalid(qty) {
+                Some(InvalidQuantity)
+            } else if out_of_band(price) {
+                Some(PriceOutOfRange)
+            } else if before.find(id).is_some() {
+                Some(DuplicateOrderId)
+            } else if beyond_protection(side, price) {
+                Some(PriceOutsideProtection)
+            } else if before.order_count() == cfg.max_orders as usize && !crosses(side, price) {
+                // A crossing order frees a slot by its first match, so it is never refused.
+                Some(BookFull)
+            } else {
+                None
             }
         }
-        (
-            Command::Limit {
-                id,
-                side,
-                price,
-                qty,
-                ..
-            },
-            RejectReason::BookFull,
-        ) => {
-            let crosses = match side {
-                Side::Buy => before.best(Side::Sell).is_some_and(|ask| price >= ask),
-                Side::Sell => before.best(Side::Buy).is_some_and(|bid| price <= bid),
-            };
-            !qty_invalid(qty)
-                && !out_of_band(price)
-                && before.find(id).is_none()
-                && !beyond_protection(side, price)
-                && before.order_count() == cfg.max_orders as usize
-                && !crosses
+        Command::Market { id, qty, .. } => {
+            if qty_invalid(qty) {
+                Some(InvalidQuantity)
+            } else if before.find(id).is_some() {
+                Some(DuplicateOrderId)
+            } else {
+                None
+            }
         }
-        _ => false,
-    };
-    ensure(holds, format!("rejection reason {reason:?} does not apply"))
+        Command::Cancel { id, owner } => owned(id, owner).is_none().then_some(UnknownOrder),
+        Command::Modify {
+            id,
+            owner,
+            price,
+            qty,
+        } => {
+            if qty_invalid(qty) {
+                return Some(InvalidQuantity);
+            }
+            if out_of_band(price) {
+                return Some(PriceOutOfRange);
+            }
+            let Some((side, old_price, order)) = owned(id, owner) else {
+                return Some(UnknownOrder);
+            };
+            // Only the cancel/replace path re-enters the book, so only it is subject to
+            // protection; ending the order or shrinking it in place never is.
+            let leaves = qty.saturating_sub(order.filled);
+            let in_place = price == old_price && leaves <= order.leaves;
+            let replaces = leaves > 0 && !in_place;
+            (replaces && beyond_protection(side, price)).then_some(PriceOutsideProtection)
+        }
+    }
 }

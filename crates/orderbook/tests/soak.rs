@@ -6,7 +6,7 @@ mod common;
 use common::reference::ReferenceBook;
 use common::{Fnv, snapshot};
 use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
-use orderbook::{EventSink, OrderBook, SelfTradePolicy};
+use orderbook::{BookConfig, EventSink, OrderBook, SelfTradePolicy};
 
 fn config() -> WorkloadConfig {
     WorkloadConfig {
@@ -18,7 +18,7 @@ fn config() -> WorkloadConfig {
     }
 }
 
-fn soak(cfg: WorkloadConfig, book_cfg: orderbook::BookConfig, steps: usize) -> EventCounts {
+fn soak(cfg: WorkloadConfig, book_cfg: BookConfig, steps: usize) -> EventCounts {
     let mut engine = OrderBook::new(book_cfg);
     let mut reference = ReferenceBook::new(book_cfg);
     let mut workload = Workload::new(cfg);
@@ -57,7 +57,8 @@ fn synthetic_flow_matches_reference() {
     // Participants only cancel and modify orders they know are resting and stay under the
     // order limit, so nothing is rejected...
     assert_eq!(counts.rejected, 0, "{counts:?}");
-    // ...and the run exercised every path, self-trade prevention and protection included.
+    // ...and the run exercised every path, self-trade prevention included. Its protection
+    // band is too wide to stop anything; `protected_config` covers protection.
     assert!(counts.trades > 10_000, "{counts:?}");
     assert!(counts.rested > 10_000, "{counts:?}");
     assert!(counts.cancelled > 10_000, "{counts:?}");
@@ -65,10 +66,9 @@ fn synthetic_flow_matches_reference() {
     assert!(counts.self_trade_cancels > 100, "{counts:?}");
 }
 
-#[test]
-fn synthetic_flow_matches_reference_under_cancel_incoming() {
-    // Few owners for frequent self-trades, many market orders against a tight protection
-    // band for frequent protection stops.
+/// Few owners for frequent self-trades under `CancelIncoming`, and many market orders against
+/// a one-tick protection band for frequent protection stops and rejections.
+fn protected_config() -> (WorkloadConfig, BookConfig) {
     let cfg = WorkloadConfig {
         owners: 4,
         seed: 7,
@@ -81,21 +81,27 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
         },
         ..config()
     };
-    let book_cfg = orderbook::BookConfig {
+    let book_cfg = BookConfig {
         self_trade: SelfTradePolicy::CancelIncoming,
         price_protection: Some(1),
         ..cfg.book_config()
     };
+    (cfg, book_cfg)
+}
+
+#[test]
+fn synthetic_flow_matches_reference_under_cancel_incoming() {
+    let (cfg, book_cfg) = protected_config();
     let counts = soak(cfg, book_cfg, 100_000);
     assert!(counts.self_trade_cancels > 100, "{counts:?}");
     assert!(counts.protection_cancels > 100, "{counts:?}");
+    // Aggressive limits priced more than a tick through the opposite best.
+    assert!(counts.rejected > 100, "{counts:?}");
 }
 
-/// Fingerprint of every event and the final book after 100k commands of the default
-/// synthetic flow.
-fn fingerprint() -> u64 {
-    let cfg = config();
-    let mut book = OrderBook::new(cfg.book_config());
+/// Fingerprint of every event and the final book after 100k commands of synthetic flow.
+fn fingerprint(cfg: WorkloadConfig, book_cfg: BookConfig) -> u64 {
+    let mut book = OrderBook::new(book_cfg);
     let mut workload = Workload::new(cfg);
     let mut events = Vec::new();
     let mut hash = Fnv::new();
@@ -120,15 +126,30 @@ fn fingerprint() -> u64 {
 
 #[test]
 fn same_commands_produce_the_same_events() {
-    assert_eq!(fingerprint(), fingerprint());
+    let cfg = config();
+    assert_eq!(
+        fingerprint(cfg, cfg.book_config()),
+        fingerprint(cfg, cfg.book_config())
+    );
 }
 
-/// Pinned value: CI runs this on Linux, Windows and macOS, so a match proves the engine is
-/// deterministic across platforms, which replay on a standby machine depends on. It also
-/// flags any change in behaviour; if a change is intended, update the constant.
+/// Pinned values: CI runs this on Linux, Windows and macOS, so a match proves the engine is
+/// deterministic across platforms, which replay on a standby machine depends on. Between
+/// them the two runs cover both self-trade policies, protection stops and rejections. They
+/// also flag any change in behaviour; if a change is intended, update the constants.
 #[test]
-fn output_matches_the_golden_fingerprint() {
-    assert_eq!(fingerprint(), GOLDEN, "got {:#018x}", fingerprint());
+fn output_matches_the_golden_fingerprints() {
+    let cfg = config();
+    let default = fingerprint(cfg, cfg.book_config());
+    assert_eq!(default, GOLDEN_DEFAULT, "default flow: got {default:#018x}");
+
+    let (cfg, book_cfg) = protected_config();
+    let protected = fingerprint(cfg, book_cfg);
+    assert_eq!(
+        protected, GOLDEN_PROTECTED,
+        "protected flow: got {protected:#018x}"
+    );
 }
 
-const GOLDEN: u64 = 0xa83b_9f96_80cf_a652;
+const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
+const GOLDEN_PROTECTED: u64 = 0x3c49_10ff_8e00_3caa;

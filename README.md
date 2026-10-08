@@ -16,7 +16,7 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 
 | Property | How |
 |---|---|
-| Deterministic | Single-threaded, no clocks, no randomness. CI checks a pinned fingerprint of the output on Linux, Windows and macOS (ARM). |
+| Deterministic | Single-threaded, no clocks, no randomness. CI checks pinned fingerprints of the output on Linux, Windows and macOS (ARM). |
 | No heap allocation on the hot path | All memory is reserved at construction. A counting global allocator verifies it, including the worst case for the hash index. |
 | No overflow by construction | `max_orders × max_order_qty` must fit in a `u64`, so no quantity sum can wrap. |
 | No `unsafe` | `#![forbid(unsafe_code)]` in the library. |
@@ -60,7 +60,7 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 |---|---|
 | Scenario tests | One rule per test, with the exact expected event sequence. |
 | Differential property test | On random configurations and command sequences, the engine matches a deliberately naive reference book event for event and order for order. |
-| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, untouched orders unchanged, and every rejection justified. |
+| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. |
 | Invariant checker tests | `validate()` itself is tested: each of 11 kinds of corrupted state must be detected. |
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies. |
 | Zero-allocation tests | Normal flow, a permanently full book, and a deep book. |
@@ -108,6 +108,11 @@ without per-command timers.
 | baseline | 7.7k orders, 243 levels | 79 ns | 120 ns | 193 ns | 497 ns | 3.9 µs | 16–18M cmd/s |
 | sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 78 ns | 129 ns | 205 ns | 693 ns | 2.4 µs | 16–17M cmd/s |
 | deep | 1M orders, 10k levels | 343 ns | 794 ns | 2.3 µs | 4.7 µs | 41 µs | 3.0–3.3M cmd/s |
+| protected: 2-tick protection, 4 owners | 2.6k orders, 170 levels | 78 ns | 120 ns | 191 ns | 284 ns | 2.3 µs | 19–20M cmd/s |
+
+The protected scenario runs the paths the others never reach. About 5% of its commands are
+rejected, about a quarter of its market orders stop at the protection band, and
+self-trade prevention removes about 220k resting orders per run.
 
 By command, in the baseline scenario:
 

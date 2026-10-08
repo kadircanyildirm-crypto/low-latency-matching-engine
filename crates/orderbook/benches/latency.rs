@@ -13,7 +13,7 @@
 //!
 //! Run: `cargo bench --bench latency`
 //! Env: `LAT_COMMANDS` measured commands per run (default 2,000,000), `LAT_RUNS` (default 3),
-//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep`.
+//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep,protected`.
 //! Writes merged HdrHistogram percentile files to `target/latency/<scenario>.hgrm`
 //! (plot at https://hdrhistogram.github.io/HdrHistogram/plotFiles.html).
 
@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use hdrhistogram::Histogram;
 use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
-use orderbook::{Command, Event, EventSink, OrderBook, Side};
+use orderbook::{BookConfig, Command, Event, EventSink, OrderBook, Side};
 
 const KINDS: [&str; 5] = ["all", "limit", "market", "cancel", "modify"];
 
@@ -33,31 +33,61 @@ struct Scenario {
     name: &'static str,
     about: &'static str,
     workload: WorkloadConfig,
+    book: BookConfig,
     warmup: usize,
 }
 
+impl Scenario {
+    /// A scenario on the book its workload asks for.
+    fn new(
+        name: &'static str,
+        about: &'static str,
+        workload: WorkloadConfig,
+        warmup: usize,
+    ) -> Self {
+        Self {
+            name,
+            about,
+            workload,
+            book: workload.book_config(),
+            warmup,
+        }
+    }
+}
+
 fn scenarios() -> Vec<Scenario> {
-    vec![
-        Scenario {
-            name: "baseline",
-            about: "~6k resting orders near the touch; fits in cache",
-            workload: WorkloadConfig::default(),
-            warmup: 500_000,
+    let protected = WorkloadConfig {
+        owners: 4,
+        mix: Mix {
+            passive_limit: 50,
+            aggressive_limit: 5,
+            market: 20,
+            cancel: 20,
+            modify: 5,
         },
-        Scenario {
-            name: "deep",
-            about: "~1M resting orders over ~10k levels; working set far exceeds L2",
-            workload: WorkloadConfig {
+        ..WorkloadConfig::default()
+    };
+    vec![
+        Scenario::new(
+            "baseline",
+            "~6k resting orders near the touch; fits in cache",
+            WorkloadConfig::default(),
+            500_000,
+        ),
+        Scenario::new(
+            "deep",
+            "~1M resting orders over ~10k levels; working set far exceeds L2",
+            WorkloadConfig {
                 max_live: 1_000_000,
                 passive_depth: 5_000,
                 ..WorkloadConfig::default()
             },
-            warmup: 4_000_000,
-        },
-        Scenario {
-            name: "sweep",
-            about: "40% aggressive/market flow, sizes up to 1000; multi-level sweeps",
-            workload: WorkloadConfig {
+            4_000_000,
+        ),
+        Scenario::new(
+            "sweep",
+            "40% aggressive/market flow, sizes up to 1000; multi-level sweeps",
+            WorkloadConfig {
                 max_qty: 1_000,
                 mix: Mix {
                     passive_limit: 40,
@@ -67,6 +97,19 @@ fn scenarios() -> Vec<Scenario> {
                     modify: 5,
                 },
                 ..WorkloadConfig::default()
+            },
+            500_000,
+        ),
+        // CancelResting keeps the book two-sided. Under CancelIncoming, stale orders left
+        // behind by the generator's random-walking mid anchor the protection band, and one
+        // side of the book stays empty for long stretches.
+        Scenario {
+            name: "protected",
+            about: "2-tick protection, 4 owners; protection stops, self-trades and rejects",
+            workload: protected,
+            book: BookConfig {
+                price_protection: Some(2),
+                ..protected.book_config()
             },
             warmup: 500_000,
         },
@@ -114,8 +157,8 @@ fn main() {
 }
 
 fn run_scenario(scenario: &Scenario, commands: usize, runs: usize, clock: &Clock, dir: &Path) {
-    let cfg = scenario.workload;
-    let stream = record(cfg, scenario.warmup + commands);
+    let book_cfg = scenario.book;
+    let stream = record(scenario.workload, book_cfg, scenario.warmup + commands);
     let (warm, measured) = stream.split_at(scenario.warmup);
     let mut events: Vec<Event> = Vec::with_capacity(4096);
 
@@ -127,7 +170,7 @@ fn run_scenario(scenario: &Scenario, commands: usize, runs: usize, clock: &Clock
 
     for run in 0..runs {
         // Throughput: no per-command timers.
-        let mut book = OrderBook::new(cfg.book_config());
+        let mut book = OrderBook::new(book_cfg);
         replay(&mut book, warm, &mut events);
         if run == 0 {
             shape = format!(
@@ -150,7 +193,7 @@ fn run_scenario(scenario: &Scenario, commands: usize, runs: usize, clock: &Clock
 
         // Latency: the same commands into a fresh book, each one timed.
         let mut hists: Vec<Histogram<u64>> = KINDS.iter().map(|_| new_histogram()).collect();
-        let mut book = OrderBook::new(cfg.book_config());
+        let mut book = OrderBook::new(book_cfg);
         replay(&mut book, warm, &mut events);
         for &command in measured {
             events.clear();
@@ -237,8 +280,8 @@ fn new_histogram() -> Histogram<u64> {
 
 /// Drives a scratch book with the participant-like generator, feeding every event back to
 /// it, and returns the commands it issued.
-fn record(cfg: WorkloadConfig, n: usize) -> Vec<Command> {
-    let mut book = OrderBook::new(cfg.book_config());
+fn record(cfg: WorkloadConfig, book_cfg: BookConfig, n: usize) -> Vec<Command> {
+    let mut book = OrderBook::new(book_cfg);
     let mut workload = Workload::new(cfg);
     let mut events = Vec::with_capacity(4096);
     let mut stream = Vec::with_capacity(n);

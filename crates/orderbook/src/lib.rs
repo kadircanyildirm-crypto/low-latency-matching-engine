@@ -12,9 +12,9 @@
 //! - **No allocation after construction, no overflow by construction.** Every buffer is
 //!   sized from [`BookConfig`], and `max_orders * max_order_qty` must fit in a `u64`.
 //! - **Exchange semantics.** GTC, IOC, fill-or-kill and post-only limit orders, iceberg
-//!   orders, market orders, owner-checked cancels and modifies, FIX-style modifies on
-//!   total quantity, mass cancel, self-trade prevention, and price protection against
-//!   fat-finger orders.
+//!   orders, market orders, stop and stop-limit orders, owner-checked cancels and
+//!   modifies, FIX-style modifies on total quantity, mass cancel, self-trade prevention,
+//!   and price protection and a price band against fat-finger orders.
 //! - **Determinism.** The event stream is a pure function of the command stream, which is
 //!   the foundation for event sourcing and replay. Snapshots restore an identical book, and
 //!   a platform-independent digest identifies its state.
@@ -53,7 +53,7 @@ pub mod workload;
 
 pub use book::{
     BookConfig, BookSnapshot, Depth, LevelInfo, OrderBook, OrderInfo, Queue, QueuedOrder,
-    SnapshotError, SnapshotOrder,
+    SnapshotError, SnapshotOrder, StopOrder, Stops,
 };
 pub use types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,

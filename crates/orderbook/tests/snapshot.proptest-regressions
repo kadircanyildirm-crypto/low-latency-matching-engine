@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a34363fd321199b87a8ae14248bfd150751a7b6aeeb695e68bcec6fee5ea8e20 # shrinks to (cfg, commands, cut) = (BookConfig { min_price: -5000, max_price: 5000, max_orders: 13, max_owners: 1024, max_order_qty: 50, max_iceberg_tranches: 10, price_protection: None, price_band: Some(12), reference_price: Some(-5000), self_trade: CancelIncoming }, [Stop { id: 0, owner: 0, side: Buy, trigger: -4937, limit: None, qty: 1 }], 1)

@@ -6,7 +6,18 @@ use crate::types::{OrderId, OwnerId, Qty, Side};
 /// Null link for the intrusive lists.
 pub(crate) const NIL: u32 = u32::MAX;
 
-/// A resting order plus its links in the FIFO queue of its price level.
+/// What a node holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrderKind {
+    /// An order resting in a price level's queue.
+    Resting,
+    /// A stop that becomes a market order when it triggers.
+    StopMarket,
+    /// A stop that becomes a GTC limit order at `limit` when it triggers.
+    StopLimit,
+}
+
+/// A resting order, or a pending stop, plus its links in the FIFO queue of its level.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OrderNode {
     pub id: OrderId,
@@ -14,8 +25,11 @@ pub(crate) struct OrderNode {
     pub remaining: Qty,
     /// Total order quantity: filled + open. Kept for FIX-style modifies.
     pub total: Qty,
-    /// Index of the price level within its half-book.
+    /// Index of the price level within its ladder: the limit price of a resting order, the
+    /// trigger price of a pending stop.
     pub level: u32,
+    /// Limit level of a pending stop-limit; `NIL` otherwise.
+    pub limit: u32,
     pub prev: u32,
     pub next: u32,
     pub owner: OwnerId,
@@ -25,6 +39,7 @@ pub(crate) struct OrderNode {
     pub post_only: bool,
     /// Whether the slot's [`IcebergPart`] is in use. A plain order shows all it has.
     pub iceberg: bool,
+    pub kind: OrderKind,
 }
 
 /// What an iceberg order shows: at most `display` lots at a time, of which `visible` are
@@ -56,13 +71,42 @@ impl OrderNode {
             remaining,
             total,
             level,
+            limit: NIL,
             prev: NIL,
             next: NIL,
             owner,
             side,
             post_only,
             iceberg: false,
+            kind: OrderKind::Resting,
         }
+    }
+
+    /// A pending stop, triggering at `trigger` and then working as a market order, or as a
+    /// limit order at `limit`.
+    #[inline]
+    pub fn stop(
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        trigger: u32,
+        limit: Option<u32>,
+        qty: Qty,
+    ) -> Self {
+        Self {
+            limit: limit.unwrap_or(NIL),
+            kind: match limit {
+                None => OrderKind::StopMarket,
+                Some(_) => OrderKind::StopLimit,
+            },
+            ..Self::new(id, owner, side, trigger, qty, qty, false)
+        }
+    }
+
+    /// Whether the node is a stop waiting for its trigger.
+    #[inline]
+    pub fn is_stop(&self) -> bool {
+        self.kind != OrderKind::Resting
     }
 }
 
@@ -90,12 +134,14 @@ impl OrderPool {
                 remaining: 0,
                 total: 0,
                 level: NIL,
+                limit: NIL,
                 prev: NIL,
                 next: if slot + 1 < capacity { slot + 1 } else { NIL },
                 owner: 0,
                 side: Side::Buy,
                 post_only: false,
                 iceberg: false,
+                kind: OrderKind::Resting,
             })
             .collect();
         let unused = IcebergPart {

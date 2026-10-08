@@ -7,6 +7,7 @@ mod common;
 use common::strategies::scenario;
 use orderbook::{
     BookConfig, BookSnapshot, OrderBook, SelfTradePolicy, Side, SnapshotError, SnapshotOrder,
+    StopOrder,
 };
 use proptest::prelude::*;
 
@@ -87,6 +88,22 @@ fn sample() -> BookSnapshot {
                 ..order(3, Side::Sell, 60, 10, 9)
             },
         ],
+        stops: vec![
+            stop(4, Side::Buy, 58, None),
+            stop(5, Side::Buy, 58, Some(59)),
+            stop(6, Side::Sell, 52, None),
+        ],
+    }
+}
+
+fn stop(id: u64, side: Side, trigger: i64, limit: Option<i64>) -> StopOrder {
+    StopOrder {
+        id,
+        owner: id as u32,
+        side,
+        trigger,
+        limit,
+        qty: 3,
     }
 }
 
@@ -99,6 +116,11 @@ fn a_snapshot_round_trips_through_restore() {
     assert_eq!(book.digest(), snapshot.digest());
     assert_eq!(book.trade_count(), 4);
     assert_eq!(book.reference_price(), Some(55));
+    let buy_stops: Vec<u64> = book.stops(Side::Buy).map(|s| s.id).collect();
+    assert_eq!(buy_stops, [4, 5]);
+    assert_eq!(book.stop(5), Some(stop(5, Side::Buy, 58, Some(59))));
+    assert_eq!(book.order(5), None);
+    assert_eq!(book.order_count(), 6);
     let queue: Vec<_> = book.queue(Side::Buy, 50).map(|o| o.id).collect();
     assert_eq!(queue, [1, 2]);
     let info = book.order(3).unwrap();
@@ -149,6 +171,16 @@ fn the_digest_covers_every_field() {
     vary("leaves", |s| s.orders[0].leaves += 1);
     vary("filled", |s| s.orders[0].filled += 1);
     vary("post-only", |s| s.orders[0].post_only = true);
+    vary("stop trigger", |s| s.stops[0].trigger = 57);
+    vary("stop limit", |s| s.stops[1].limit = Some(60));
+    vary("stop-market to stop-limit", |s| s.stops[0].limit = Some(58));
+    vary("stop owner", |s| s.stops[0].owner = 9);
+    vary("stop quantity", |s| s.stops[0].qty = 4);
+    vary("stop side", |s| s.stops[2].side = Side::Buy);
+    vary("stop order", |s| s.stops.swap(0, 1));
+    vary("missing stop", |s| {
+        s.stops.pop();
+    });
     vary("iceberg display", |s| s.orders[2].display = Some(5));
     vary("iceberg visible", |s| s.orders[2].visible = 3);
     vary("plain to iceberg", |s| {
@@ -170,7 +202,7 @@ fn the_digest_of_an_empty_book_is_pinned() {
     let book = OrderBook::new(BookConfig::new(-5, 5, 3));
     assert_eq!(
         book.digest(),
-        0xdd37_5fb5_fb33_c871,
+        0x0e7f_5f37_e51c_8091,
         "got {:#018x}",
         book.digest()
     );
@@ -186,6 +218,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
             trade_count,
             reference_price: None,
             orders,
+            stops: Vec::new(),
         })
         .map(|book| book.order_count())
     };
@@ -290,6 +323,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
             trade_count: 0,
             reference_price: Some(price),
             orders: Vec::new(),
+            stops: Vec::new(),
         };
         assert_eq!(
             OrderBook::restore(&snapshot).err(),
@@ -306,6 +340,53 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
         order(2, Side::Sell, 50, 1, 0),
     ];
     assert_eq!(restore(edge, u64::MAX - 1), Ok(2));
+}
+
+#[test]
+fn stops_the_engine_could_never_hold_are_refused() {
+    // The last trade was at 50: buy stops must trigger above it, sell stops below.
+    let refused = |stop: StopOrder| {
+        let snapshot = BookSnapshot {
+            stops: vec![stop],
+            ..sample()
+        };
+        OrderBook::restore(&snapshot).err()
+    };
+    let invalid = Some(SnapshotError::InvalidOrder(9));
+    assert_eq!(refused(stop(9, Side::Buy, 55, None)), invalid);
+    assert_eq!(refused(stop(9, Side::Sell, 55, None)), invalid);
+    assert_eq!(refused(stop(9, Side::Buy, 101, None)), invalid);
+    assert_eq!(refused(stop(9, Side::Buy, 58, Some(0))), invalid);
+    assert_eq!(
+        refused(StopOrder {
+            qty: 0,
+            ..stop(9, Side::Buy, 58, None)
+        }),
+        invalid
+    );
+    assert_eq!(
+        refused(StopOrder {
+            owner: 5_000,
+            ..stop(9, Side::Buy, 58, None)
+        }),
+        invalid
+    );
+    assert_eq!(
+        refused(stop(1, Side::Buy, 58, None)),
+        Some(SnapshotError::DuplicateOrderId(1))
+    );
+    // Orders and stops share the capacity.
+    let crowded = BookSnapshot {
+        config: BookConfig {
+            max_orders: 5,
+            ..sample().config
+        },
+        ..sample()
+    };
+    assert_eq!(
+        OrderBook::restore(&crowded).err(),
+        Some(SnapshotError::TooManyOrders)
+    );
 }
 
 #[test]

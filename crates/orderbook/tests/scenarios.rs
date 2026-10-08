@@ -955,6 +955,245 @@ fn invalid_displays_are_rejected() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Stops
+
+fn stop(
+    owner: OwnerId,
+    id: OrderId,
+    side: Side,
+    trigger: Price,
+    limit: Option<Price>,
+    qty: Qty,
+) -> Command {
+    Command::Stop {
+        id,
+        owner,
+        side,
+        trigger,
+        limit,
+        qty,
+    }
+}
+
+/// Asks 101 ×1 (#1), 102 ×1 (#2), 103 ×1 (#3), 104 ×5 (#4); bid 95 ×5 (#5); a trade at 100
+/// sets the last price.
+fn stop_book() -> OrderBook {
+    let mut b = book();
+    run(&mut b, limit(90, Sell, 100, 1));
+    run(&mut b, limit(91, Buy, 100, 1));
+    for (id, price, qty) in [(1, 101, 1), (2, 102, 1), (3, 103, 1), (4, 104, 5)] {
+        run(&mut b, limit(id, Sell, price, qty));
+    }
+    run(&mut b, limit(5, Buy, 95, 5));
+    assert_eq!(b.reference_price(), Some(100));
+    b
+}
+
+#[test]
+fn a_stop_waits_off_the_book() {
+    let mut b = stop_book();
+    assert_eq!(
+        run(&mut b, stop(7, 10, Buy, 102, None, 2)),
+        [
+            Accepted { id: 10 },
+            StopPlaced {
+                id: 10,
+                side: Buy,
+                trigger: 102,
+                limit: None,
+                qty: 2
+            }
+        ]
+    );
+    // Invisible to market data, but it holds a slot and its owner can see it.
+    assert_eq!(b.best_bid(), level(95, 5, 1));
+    assert_eq!(b.order(10), None);
+    assert_eq!(b.stop(10).map(|s| s.trigger), Some(102));
+    assert_eq!(b.order_count(), 6);
+}
+
+#[test]
+fn a_stop_triggers_when_a_trade_reaches_it() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, None, 2));
+    // A trade at 101 does not reach 102.
+    assert!(!run(&mut b, limit(20, Buy, 101, 1)).contains(&Triggered { id: 10 }));
+    // A trade at 102 does: the stop becomes a market buy and takes 103 and 104.
+    let events = run(&mut b, limit(21, Buy, 102, 1));
+    let at = events
+        .iter()
+        .position(|e| *e == Triggered { id: 10 })
+        .unwrap();
+    assert_eq!(fills(&events[at..]), [(3, 103, 1), (4, 104, 1)]);
+    assert!(b.stop(10).is_none());
+}
+
+#[test]
+fn any_price_the_command_traded_at_counts_not_just_the_last() {
+    let mut b = stop_book();
+    // With the last trade at 100, a sell stop at 101 is already reached and is refused;
+    // one at 99 waits.
+    assert_eq!(
+        run(&mut b, stop(7, 10, Sell, 101, None, 1)),
+        [rejected(10, StopWouldTrigger)]
+    );
+    run(&mut b, stop(7, 10, Sell, 99, None, 1));
+    // A buy that trades at 99 first and then at 101 ends with the last price above the
+    // trigger, but it did trade at 99, so the sell stop fires.
+    run(&mut b, limit(30, Sell, 99, 1));
+    let events = run(&mut b, limit(31, Buy, 101, 2));
+    let at = events
+        .iter()
+        .position(|e| *e == Triggered { id: 10 })
+        .unwrap();
+    assert_eq!(fills(&events[..at]), [(30, 99, 1), (1, 101, 1)]);
+    // The stop then sells into the bid at 95.
+    assert_eq!(fills(&events[at..]), [(5, 95, 1)]);
+}
+
+#[test]
+fn a_stop_limit_rests_what_it_cannot_fill() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, Some(103), 5));
+    let events = run(&mut b, limit(20, Buy, 102, 2));
+    let at = events
+        .iter()
+        .position(|e| *e == Triggered { id: 10 })
+        .unwrap();
+    assert_eq!(fills(&events[at..]), [(3, 103, 1)]);
+    assert_eq!(events.last(), Some(&rested(10, Buy, 103, 4)));
+    let info = b.order(10).unwrap();
+    assert_eq!((info.leaves, info.filled), (4, 1));
+}
+
+#[test]
+fn released_stops_can_trigger_more_stops() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, None, 1));
+    run(&mut b, stop(8, 11, Buy, 103, None, 1));
+    // The trade at 102 releases #10, which buys 103 and so releases #11, which buys 104.
+    let events = run(&mut b, limit(20, Buy, 102, 2));
+    let triggered: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Triggered { .. }))
+        .collect();
+    assert_eq!(triggered, [&Triggered { id: 10 }, &Triggered { id: 11 }]);
+    assert_eq!(fills(&events).last(), Some(&(4, 104, 1)));
+}
+
+#[test]
+fn stops_release_in_trigger_order_then_time_buy_stops_first() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, None, 1));
+    run(&mut b, stop(8, 11, Buy, 101, None, 1));
+    run(&mut b, stop(9, 12, Buy, 101, None, 1));
+    run(&mut b, stop(6, 13, Sell, 99, None, 1));
+    // One command trades both at 102 and down at 95: every stop above is reached.
+    run(&mut b, limit(40, Sell, 98, 1));
+    let events = run(&mut b, limit(41, Buy, 102, 4));
+    let order: Vec<OrderId> = events
+        .iter()
+        .filter_map(|e| match e {
+            Triggered { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, [11, 12, 10, 13]);
+}
+
+#[test]
+fn a_triggered_stop_limit_outside_protection_is_cancelled() {
+    let mut b = OrderBook::new(BookConfig {
+        price_protection: Some(1),
+        ..CFG
+    });
+    run(&mut b, limit(90, Sell, 100, 1));
+    run(&mut b, limit(91, Buy, 100, 1));
+    run(&mut b, limit(1, Sell, 101, 1));
+    run(&mut b, limit(2, Sell, 102, 1));
+    run(&mut b, stop(7, 10, Buy, 101, Some(110), 1));
+    let events = run(&mut b, limit(20, Buy, 101, 1));
+    // When it triggers, the best ask is 102 and its limit of 110 is 8 ticks through it.
+    assert_eq!(
+        &events[events.len() - 2..],
+        [Triggered { id: 10 }, cancelled(10, 1, PriceProtection)]
+    );
+}
+
+#[test]
+fn pending_stops_can_be_cancelled_but_not_modified() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, Some(103), 2));
+    assert_eq!(
+        run(
+            &mut b,
+            Command::Modify {
+                id: 10,
+                owner: 7,
+                price: 103,
+                qty: 1
+            }
+        ),
+        [rejected(10, PendingStop)]
+    );
+    assert_eq!(
+        run(&mut b, Command::Cancel { id: 10, owner: 8 }),
+        [rejected(10, UnknownOrder)]
+    );
+    assert_eq!(run(&mut b, cancel_by(7, 10)), [cancelled(10, 2, Requested)]);
+    // Ids are shared with resting orders: a pending stop's id is taken.
+    run(&mut b, stop(7, 11, Buy, 102, None, 1));
+    assert_eq!(
+        run(&mut b, limit(11, Buy, 90, 1)),
+        [rejected(11, DuplicateOrderId)]
+    );
+}
+
+#[test]
+fn mass_cancel_takes_pending_stops_after_resting_orders() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Sell, 90, None, 1));
+    run(&mut b, stop(7, 11, Buy, 103, None, 1));
+    run(&mut b, stop(7, 12, Buy, 102, None, 1));
+    run(&mut b, limit_by(7, 13, Buy, 94, 1));
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: 7 }),
+        [
+            cancelled(13, 1, MassCancel),
+            cancelled(12, 1, MassCancel),
+            cancelled(11, 1, MassCancel),
+            cancelled(10, 1, MassCancel),
+            MassCancelled { owner: 7, count: 4 },
+        ]
+    );
+}
+
+#[test]
+fn stops_hold_capacity() {
+    let mut b = OrderBook::new(BookConfig::new(1, 10_000, 2));
+    run(&mut b, stop(7, 1, Buy, 200, None, 1));
+    run(&mut b, stop(7, 2, Sell, 50, None, 1));
+    assert_eq!(
+        run(&mut b, stop(7, 3, Sell, 40, None, 1)),
+        [rejected(3, BookFull)]
+    );
+    assert_eq!(run(&mut b, limit(4, Buy, 90, 1)), [rejected(4, BookFull)]);
+}
+
+#[test]
+fn without_a_last_price_any_trigger_waits() {
+    let mut b = book();
+    assert_eq!(
+        run(&mut b, stop(7, 1, Buy, 1, None, 1))[0],
+        Accepted { id: 1 }
+    );
+    assert_eq!(
+        run(&mut b, stop(7, 2, Sell, 10_000, None, 1))[0],
+        Accepted { id: 2 }
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Mass cancel
 
 #[test]

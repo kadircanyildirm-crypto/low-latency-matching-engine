@@ -52,6 +52,8 @@ pub struct Mix {
     pub cancel: u8,
     /// Mass cancels of a random participant's orders, as on a session disconnect.
     pub mass_cancel: u8,
+    /// Stop and stop-limit orders a few ticks beyond the last trade.
+    pub stop: u8,
     /// Modifies of resting orders.
     pub modify: u8,
 }
@@ -115,6 +117,7 @@ impl Default for WorkloadConfig {
                 market: 5,
                 cancel: 25,
                 mass_cancel: 0,
+                stop: 0,
                 modify: 5,
             },
             tif: TifMix::default(),
@@ -168,6 +171,8 @@ pub struct Workload {
     position: FxHashMap<OrderId, u32>,
     /// Order deferred while the cancel that makes room for it goes out first.
     pending: Option<Command>,
+    /// Last trade price seen, which new stops must lie beyond.
+    last_trade: Option<Price>,
 }
 
 impl Workload {
@@ -185,6 +190,7 @@ impl Workload {
             m.market,
             m.cancel,
             m.mass_cancel,
+            m.stop,
             m.modify,
         ]
         .iter()
@@ -212,6 +218,7 @@ impl Workload {
             live: Vec::with_capacity(cfg.max_live as usize),
             position,
             pending: None,
+            last_trade: None,
             cfg,
         }
     }
@@ -250,6 +257,10 @@ impl Workload {
                 owner: self.rng.below(u64::from(self.cfg.owners)) as OwnerId,
             };
         }
+        roll -= m.mass_cancel;
+        if roll < m.stop {
+            return self.new_stop();
+        }
         self.modify()
     }
 
@@ -276,15 +287,35 @@ impl Workload {
             Event::Trade {
                 maker,
                 maker_leaves,
+                price,
                 ..
             } => {
+                self.last_trade = Some(price);
                 if maker_leaves == 0 {
                     self.forget(maker);
                 } else if let Some(&i) = self.position.get(&maker) {
                     self.live[i as usize].leaves = maker_leaves;
                 }
             }
-            Event::Cancelled { id, .. } => self.forget(id),
+            Event::Cancelled { id, .. } | Event::Triggered { id } => self.forget(id),
+            // A pending stop can be cancelled like a resting order, so it is tracked like one.
+            Event::StopPlaced {
+                id,
+                side,
+                trigger,
+                qty,
+                ..
+            } => {
+                let owner = self.owner_of_new(id);
+                self.position.insert(id, self.live.len() as u32);
+                self.live.push(Resting {
+                    id,
+                    owner,
+                    side,
+                    price: trigger,
+                    leaves: qty,
+                });
+            }
             Event::Modified {
                 id, price, leaves, ..
             } => {
@@ -439,6 +470,30 @@ impl Workload {
         }
     }
 
+    /// A stop 1..=10 ticks beyond the last trade (or the mid before the first one), half of
+    /// them stop-limits with a limit up to 2 ticks further.
+    fn new_stop(&mut self) -> Command {
+        let side = self.random_side();
+        let qty = self.random_qty();
+        let id = self.take_id();
+        let last = self.last_trade.unwrap_or(self.mid);
+        let beyond = 1 + self.rng.below(10) as Price;
+        let slack = self.rng.below(3) as Price;
+        let (trigger, limit) = match side {
+            Side::Buy => (last + beyond, last + beyond + slack),
+            Side::Sell => (last - beyond, last - beyond - slack),
+        };
+        let limit = (self.rng.below(2) == 0).then_some(limit);
+        Command::Stop {
+            id,
+            owner: self.owner_of_new(id),
+            side,
+            trigger,
+            limit,
+            qty,
+        }
+    }
+
     fn new_market(&mut self) -> Command {
         let side = self.random_side();
         let qty = self.random_qty();
@@ -513,6 +568,10 @@ pub struct EventCounts {
     pub fok_kills: u64,
     /// `Replenished` events: new iceberg tranches.
     pub replenishes: u64,
+    /// `StopPlaced` events.
+    pub stops_placed: u64,
+    /// `Triggered` events.
+    pub stops_triggered: u64,
     /// `Modified` events.
     pub modified: u64,
     /// `MassCancelled` events.
@@ -550,6 +609,8 @@ impl EventSink for EventCounts {
             Event::Modified { .. } => self.modified += 1,
             Event::MassCancelled { .. } => self.mass_cancels += 1,
             Event::Replenished { .. } => self.replenishes += 1,
+            Event::StopPlaced { .. } => self.stops_placed += 1,
+            Event::Triggered { .. } => self.stops_triggered += 1,
         }
     }
 }

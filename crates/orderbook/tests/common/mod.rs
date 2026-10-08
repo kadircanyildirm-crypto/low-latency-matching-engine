@@ -102,6 +102,24 @@ impl Fnv {
             } => [7, id, side(s), price as u64, visible]
                 .iter()
                 .for_each(|&v| self.write_u64(v)),
+            StopPlaced {
+                id,
+                side: s,
+                trigger,
+                limit,
+                qty,
+            } => [
+                8,
+                id,
+                side(s),
+                trigger as u64,
+                u64::from(limit.is_some()),
+                limit.unwrap_or(0) as u64,
+                qty,
+            ]
+            .iter()
+            .for_each(|&v| self.write_u64(v)),
+            Triggered { id } => [9, id].iter().for_each(|&v| self.write_u64(v)),
         }
     }
 

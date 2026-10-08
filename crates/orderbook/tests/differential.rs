@@ -7,7 +7,7 @@ mod common;
 use common::reference::ReferenceBook;
 use common::snapshot;
 use common::strategies::scenario;
-use orderbook::OrderBook;
+use orderbook::{OrderBook, Side};
 use proptest::prelude::*;
 
 proptest! {
@@ -27,6 +27,10 @@ proptest! {
             prop_assert_eq!(snapshot(&engine), reference.snapshot(), "books differ at step {}", step);
             prop_assert_eq!(engine.trade_count(), reference.trade_count());
             prop_assert_eq!(engine.reference_price(), reference.reference_price());
+            for side in [Side::Buy, Side::Sell] {
+                let stops: Vec<_> = engine.stops(side).collect();
+                prop_assert_eq!(stops, reference.stops(side), "stops differ at step {}", step);
+            }
             if let Err(violation) = engine.validate() {
                 prop_assert!(false, "invariant broken at step {}: {}", step, violation);
             }

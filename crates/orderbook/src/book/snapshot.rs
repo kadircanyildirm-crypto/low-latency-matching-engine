@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::{BookConfig, OrderBook, OrderNode};
+use super::{BookConfig, OrderBook, OrderNode, StopOrder};
 use crate::types::{OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side};
 
 /// A resting order as recorded in a [`BookSnapshot`].
@@ -53,17 +53,22 @@ pub struct BookSnapshot {
     /// Resting orders: bids best price first, then asks best price first, and within each
     /// price level in time priority.
     pub orders: Vec<SnapshotOrder>,
+    /// Pending stops: buy stops in trigger order, then sell stops in trigger order.
+    pub stops: Vec<StopOrder>,
 }
 
 /// Why a snapshot cannot be restored. Each variant names a state the engine itself can
 /// never reach, so it points at a corrupted or hand-edited snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// More orders than the configuration's `max_orders`.
+    /// More orders and stops than the configuration's `max_orders`.
     TooManyOrders,
     /// Two orders share an id.
     DuplicateOrderId(OrderId),
-    /// The order's owner is not below `max_owners`, its price is outside the band, its open
+    /// A resting order whose owner is not below `max_owners`, whose price is outside the
+    /// band, or whose quantities do not fit; or a pending stop whose owner, prices or
+    /// quantity do not fit, or whose trigger the last trade price has already reached. For a
+    /// resting order: its price is outside the band, its open
     /// quantity is zero, its open plus filled quantity exceeds `max_order_qty`, or what it
     /// shows does not fit its quantity and display: a plain order shows everything, an
     /// iceberg between one lot and its display, and `max_iceberg_tranches` of its display
@@ -103,6 +108,8 @@ impl BookSnapshot {
             self.orders.len(),
         );
         self.orders.iter().for_each(|order| hash.order(order));
+        hash.u64(self.stops.len() as u64);
+        self.stops.iter().for_each(|stop| hash.stop(stop));
         hash.finish()
     }
 }
@@ -117,6 +124,7 @@ impl OrderBook {
             trade_count: self.trade_count(),
             reference_price: self.reference_price(),
             orders,
+            stops: self.all_stops().collect(),
         }
     }
 
@@ -128,7 +136,7 @@ impl OrderBook {
     /// If the snapshot's configuration is invalid; see [`OrderBook::new`].
     pub fn restore(snapshot: &BookSnapshot) -> Result<Self, SnapshotError> {
         let mut book = Self::new(snapshot.config);
-        if snapshot.orders.len() > snapshot.config.max_orders as usize {
+        if snapshot.orders.len() + snapshot.stops.len() > snapshot.config.max_orders as usize {
             return Err(SnapshotError::TooManyOrders);
         }
         book.next_trade_id = snapshot
@@ -181,6 +189,26 @@ impl OrderBook {
             // within every level, which is all that mass cancels depend on.
             book.place(slot);
         }
+        for stop in &snapshot.stops {
+            let invalid = SnapshotError::InvalidOrder(stop.id);
+            book.check_owner(stop.owner).map_err(|_| invalid)?;
+            book.check_qty(stop.qty).map_err(|_| invalid)?;
+            let trigger = book.level_of(stop.trigger).ok_or(invalid)?;
+            let limit = match stop.limit {
+                None => None,
+                Some(price) => Some(book.level_of(price).ok_or(invalid)?),
+            };
+            if book.reached(stop.side, trigger) {
+                return Err(invalid);
+            }
+            if book.index.contains_key(&stop.id) {
+                return Err(SnapshotError::DuplicateOrderId(stop.id));
+            }
+            let slot = book.pool.alloc(OrderNode::stop(
+                stop.id, stop.owner, stop.side, trigger, limit, stop.qty,
+            ));
+            book.place(slot);
+        }
         if let (Some(bid), Some(ask)) = (book.bids.best, book.asks.best) {
             if bid >= ask {
                 return Err(SnapshotError::Crossed);
@@ -196,14 +224,23 @@ impl OrderBook {
     /// divergence between a primary and a replica, or between a live book and its replay;
     /// it is not a cryptographic hash.
     pub fn digest(&self) -> u64 {
+        // `order_count` counts pending stops too; the encoding counts them separately.
+        let stops = self.all_stops().count();
         let mut hash = Digest::new(
             &self.config,
             self.trade_count(),
             self.reference_price(),
-            self.order_count(),
+            self.order_count() - stops,
         );
         self.for_each_order(|order| hash.order(&order));
+        hash.u64(stops as u64);
+        self.all_stops().for_each(|stop| hash.stop(&stop));
         hash.finish()
+    }
+
+    /// Every pending stop in snapshot order.
+    fn all_stops(&self) -> impl Iterator<Item = StopOrder> + '_ {
+        self.stops(Side::Buy).chain(self.stops(Side::Sell))
     }
 
     /// Visits every resting order in snapshot order.
@@ -285,6 +322,18 @@ impl Digest {
             }
         }
         self.u64(order.visible);
+    }
+
+    fn stop(&mut self, stop: &StopOrder) {
+        self.u64(match stop.side {
+            Side::Buy => 0,
+            Side::Sell => 1,
+        });
+        self.i64(stop.trigger);
+        self.u64(stop.id);
+        self.u64(u64::from(stop.owner));
+        self.optional_u64(stop.limit.map(|price| price as u64));
+        self.u64(stop.qty);
     }
 
     fn optional_u64(&mut self, value: Option<u64>) {

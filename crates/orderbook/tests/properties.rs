@@ -10,8 +10,13 @@
 //! command did not touch are left exactly as they were; a command is rejected exactly when a
 //! rule requires it, with the reason that rule gives; immediate-or-cancel and fill-or-kill
 //! orders never rest, a fill-or-kill order fills completely exactly when the book could fill
-//! it, post-only orders never trade, and icebergs trade only what they show and show their
-//! next tranche at the back of the queue.
+//! it, post-only orders never trade, icebergs trade only what they show and show their next
+//! tranche at the back of the queue, and exactly the stops a command's trades reach trigger,
+//! in the order the rules release them.
+//!
+//! The checker works out, from the rules alone, the state each part of a command must leave:
+//! the command's own effect, then each stop it releases, one after the other. The engine's
+//! book must end up in exactly the state at the end of that chain.
 
 mod common;
 
@@ -25,7 +30,7 @@ use orderbook::CancelReason::{
 };
 use orderbook::{
     BookConfig, CancelReason, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder,
-    RejectReason, SelfTradePolicy, Side, TimeInForce,
+    RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
 };
 use proptest::prelude::*;
 
@@ -53,6 +58,9 @@ proptest! {
 
 type Check = Result<(), String>;
 
+/// The state a part of a command leaves, and how many of its events that part accounts for.
+type Effect = Result<(State, usize), String>;
+
 fn ensure(condition: bool, message: impl Into<String>) -> Check {
     if condition {
         Ok(())
@@ -61,9 +69,12 @@ fn ensure(condition: bool, message: impl Into<String>) -> Check {
     }
 }
 
-#[derive(Clone)]
+/// Everything the rules can see of a book.
+#[derive(Clone, Debug, PartialEq)]
 struct State {
     snapshot: Snapshot,
+    /// Pending stops: buy stops in trigger order, then sell stops in trigger order.
+    stops: [Vec<StopOrder>; 2],
     trade_count: u64,
     reference: Option<Price>,
 }
@@ -72,6 +83,10 @@ impl State {
     fn capture(book: &OrderBook) -> Self {
         Self {
             snapshot: snapshot(book),
+            stops: [
+                book.stops(Side::Buy).collect(),
+                book.stops(Side::Sell).collect(),
+            ],
             trade_count: book.trade_count(),
             reference: book.reference_price(),
         }
@@ -90,12 +105,19 @@ impl State {
             .map(|(p, _)| *p)
     }
 
+    /// Resting orders and pending stops: each holds one of `max_orders`.
     fn order_count(&self) -> usize {
-        self.snapshot
+        let resting: usize = self
+            .snapshot
             .iter()
             .flatten()
             .map(|(_, queue)| queue.len())
-            .sum()
+            .sum();
+        resting + self.stops.iter().map(Vec::len).sum::<usize>()
+    }
+
+    fn stop_count(&self) -> usize {
+        self.stops.iter().map(Vec::len).sum()
     }
 
     fn find(&self, id: OrderId) -> Option<(Side, Price, QueuedOrder)> {
@@ -109,6 +131,10 @@ impl State {
         None
     }
 
+    fn find_stop(&self, id: OrderId) -> Option<StopOrder> {
+        self.stops.iter().flatten().find(|s| s.id == id).copied()
+    }
+
     /// Resting orders of `side` in the order an incoming order must reach them: best price
     /// first, then time priority.
     fn priority(&self, side: Side) -> Vec<(Price, QueuedOrder)> {
@@ -118,6 +144,7 @@ impl State {
             .collect()
     }
 
+    /// The state without the resting order or pending stop `id`.
     fn without(&self, id: OrderId) -> State {
         let mut books = to_books(&self.snapshot);
         for book in &mut books {
@@ -126,11 +153,30 @@ impl State {
             }
             book.retain(|_, queue| !queue.is_empty());
         }
+        let mut stops = self.stops.clone();
+        stops
+            .iter_mut()
+            .for_each(|side| side.retain(|s| s.id != id));
         State {
             snapshot: from_books(books),
-            trade_count: self.trade_count,
-            reference: self.reference,
+            stops,
+            ..self.clone()
         }
+    }
+
+    /// The state with `stop` added behind the pending stops with the same trigger.
+    fn with_stop(&self, stop: StopOrder) -> State {
+        let mut state = self.clone();
+        let list = &mut state.stops[Self::side_index(stop.side)];
+        let at = list
+            .iter()
+            .position(|s| match stop.side {
+                Side::Buy => s.trigger > stop.trigger,
+                Side::Sell => s.trigger < stop.trigger,
+            })
+            .unwrap_or(list.len());
+        list.insert(at, stop);
+        state
     }
 }
 
@@ -154,6 +200,81 @@ fn within(side: Side, price: Price, limit: Price) -> bool {
     }
 }
 
+/// Whether a `side` limit at `price` lies more than the protection through the opposite best.
+fn beyond_protection(cfg: &BookConfig, state: &State, side: Side, price: Price) -> bool {
+    cfg.price_protection.is_some_and(|ticks| {
+        let ticks = i128::from(ticks);
+        match side {
+            Side::Buy => state
+                .best(Side::Sell)
+                .is_some_and(|ask| i128::from(price) > i128::from(ask) + ticks),
+            Side::Sell => state
+                .best(Side::Buy)
+                .is_some_and(|bid| i128::from(price) < i128::from(bid) - ticks),
+        }
+    })
+}
+
+/// Whether a `side` limit at `price` lies more than the band through the reference price.
+fn beyond_band(cfg: &BookConfig, state: &State, side: Side, price: Price) -> bool {
+    cfg.price_band
+        .zip(state.reference)
+        .is_some_and(|(ticks, reference)| {
+            let (price, reference, ticks) =
+                (i128::from(price), i128::from(reference), i128::from(ticks));
+            match side {
+                Side::Buy => price > reference + ticks,
+                Side::Sell => price < reference - ticks,
+            }
+        })
+}
+
+fn crosses(state: &State, side: Side, price: Price) -> bool {
+    match side {
+        Side::Buy => state.best(Side::Sell).is_some_and(|ask| price >= ask),
+        Side::Sell => state.best(Side::Buy).is_some_and(|bid| price <= bid),
+    }
+}
+
+/// Whether a trade has already reached a `side` stop's trigger.
+fn reached(state: &State, side: Side, trigger: Price) -> bool {
+    state.reference.is_some_and(|last| match side {
+        Side::Buy => trigger <= last,
+        Side::Sell => trigger >= last,
+    })
+}
+
+/// Lowest and highest trade price among `events`.
+fn trade_range(events: &[Event]) -> Option<(Price, Price)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Trade { price, .. } => Some(*price),
+            _ => None,
+        })
+        .fold(None, |range, price| widen(range, Some((price, price))))
+}
+
+fn widen(a: Option<(Price, Price)>, b: Option<(Price, Price)>) -> Option<(Price, Price)> {
+    match (a, b) {
+        (None, range) | (range, None) => range,
+        (Some((a_low, a_high)), Some((b_low, b_high))) => {
+            Some((a_low.min(b_low), a_high.max(b_high)))
+        }
+    }
+}
+
+/// The stop the rules release next, given the range traded at so far in this command: the
+/// first buy stop if a trade reached its trigger, else the first sell stop if one did.
+fn next_release(state: &State, traded: Option<(Price, Price)>) -> Option<StopOrder> {
+    let (low, high) = traded?;
+    state.stops[0]
+        .first()
+        .filter(|stop| stop.trigger <= high)
+        .or_else(|| state.stops[1].first().filter(|stop| stop.trigger >= low))
+        .copied()
+}
+
 fn check(
     cfg: &BookConfig,
     before: &State,
@@ -168,11 +289,13 @@ fn check(
         "order_count disagrees with the book's contents",
     )?;
     let first = *events.first().ok_or("no events")?;
-    // No command may run away: each resting order yields at most a trade and a new tranche
-    // per tranche it is cut into, or one cancel; the incoming order adds at most three.
+    // No command may run away. Each execution, the command's own and each stop it releases,
+    // yields at most a trade and a new tranche per tranche of every resting order it reaches,
+    // or one cancel, plus a few events of its own.
     let per_order = 2 * cfg.max_iceberg_tranches.max(1) as usize;
+    let executions = 1 + before.stop_count();
     ensure(
-        events.len() <= 3 + per_order * before.order_count(),
+        events.len() <= executions * (4 + per_order * before.order_count()),
         format!(
             "{} events from a book of {} orders",
             events.len(),
@@ -193,10 +316,7 @@ fn check(
     if let Event::Rejected { id, reason } = first {
         ensure(events.len() == 1, "a rejection must be the only event")?;
         ensure(Some(id) == command.id(), "rejection carries the wrong id")?;
-        ensure(
-            after.snapshot == before.snapshot && after.trade_count == before.trade_count,
-            "a rejected command changed the book",
-        )?;
+        ensure(after == *before, "a rejected command changed the book")?;
         return ensure(
             required == Some(reason),
             format!("rejected as {reason:?}, but the rules require {required:?}"),
@@ -206,25 +326,54 @@ fn check(
         return Err(format!("accepted, but the rules require {reason:?}"));
     }
 
+    let (mut state, mut used) = command_effect(cfg, before, command, events)?;
+
+    // Then the stops its trades reached, one at a time, in the order the rules release them.
+    let mut traded = trade_range(&events[..used]);
+    while let Some(stop) = next_release(&state, traded) {
+        ensure(
+            events.get(used) == Some(&Event::Triggered { id: stop.id }),
+            format!("stop #{} must trigger next", stop.id),
+        )?;
+        used += 1;
+        state = state.without(stop.id);
+        let (next, n) = release(cfg, &state, stop, &events[used..])?;
+        traded = widen(traded, trade_range(&events[used..used + n]));
+        state = next;
+        used += n;
+    }
+    ensure(
+        used == events.len(),
+        format!("events the rules do not account for: {:?}", &events[used..]),
+    )?;
+    ensure(after == state, "the book is not what the rules make of it")
+}
+
+/// The effect of the command itself, before any stop it triggers.
+fn command_effect(cfg: &BookConfig, before: &State, command: Command, events: &[Event]) -> Effect {
+    let first = events[0];
     match command {
         Command::Cancel { id, owner } => {
-            let (_, _, order) = before
-                .find(id)
-                .ok_or("cancelled an order that was not resting")?;
-            ensure(order.owner == owner, "cancelled another owner's order")?;
+            let (order_owner, qty) = match before.find(id) {
+                Some((_, _, order)) => (order.owner, order.leaves),
+                None => {
+                    let stop = before
+                        .find_stop(id)
+                        .ok_or("cancelled an order that was not resting")?;
+                    (stop.owner, stop.qty)
+                }
+            };
+            ensure(order_owner == owner, "cancelled another owner's order")?;
             ensure(
-                events
-                    == [Event::Cancelled {
+                first
+                    == Event::Cancelled {
                         id,
-                        qty: order.leaves,
+                        qty,
                         reason: Requested,
-                    }],
-                "cancel must emit exactly Cancelled with the open quantity",
+                    },
+                "cancel must emit Cancelled with the open quantity",
             )?;
-            ensure(
-                after.snapshot == before.without(id).snapshot,
-                "cancel changed more than the cancelled order",
-            )
+            Ok((before.without(id), 1))
         }
         Command::Limit {
             id,
@@ -249,7 +398,8 @@ fn check(
                 qty,
                 filled_before: 0,
             };
-            check_execution(cfg, before, &after, taker, &events[1..])
+            let (state, n) = check_execution(cfg, before, taker, &events[1..])?;
+            Ok((state, n + 1))
         }
         Command::Market {
             id,
@@ -258,21 +408,45 @@ fn check(
             qty,
         } => {
             ensure(first == Event::Accepted { id }, "must start with Accepted")?;
-            let (cap, stop) = market_cap(cfg, before, side);
-            let taker = Taker {
+            let (state, n) = check_execution(
+                cfg,
+                before,
+                market_taker(cfg, before, id, owner, side, qty),
+                &events[1..],
+            )?;
+            Ok((state, n + 1))
+        }
+        Command::Stop {
+            id,
+            owner,
+            side,
+            trigger,
+            limit,
+            qty,
+        } => {
+            let placed = [
+                Event::Accepted { id },
+                Event::StopPlaced {
+                    id,
+                    side,
+                    trigger,
+                    limit,
+                    qty,
+                },
+            ];
+            ensure(
+                events.get(..2) == Some(&placed[..]),
+                "a stop is accepted and placed, and does nothing else",
+            )?;
+            let stop = StopOrder {
                 id,
                 owner,
                 side,
-                limit: None,
-                cap,
-                stop,
-                tif: None,
-                post_only: false,
-                display: None,
+                trigger,
+                limit,
                 qty,
-                filled_before: 0,
             };
-            check_execution(cfg, before, &after, taker, &events[1..])
+            Ok((before.with_stop(stop), 2))
         }
         Command::Modify {
             id,
@@ -296,28 +470,20 @@ fn check(
                 "Modified must report the new total and new total minus filled as leaves",
             )?;
             if leaves == 0 {
-                ensure(events.len() == 1, "a completed order emits nothing else")?;
-                return ensure(
-                    after.snapshot == before.without(id).snapshot,
-                    "an order modified below its filled quantity must disappear",
-                );
+                return Ok((before.without(id), 1));
             }
             if price == old_price && leaves <= order.leaves {
-                ensure(events.len() == 1, "an in-place modify emits nothing else")?;
-                let mut expected = before.snapshot.clone();
-                for (_, queue) in expected.iter_mut().flatten() {
+                let mut state = before.clone();
+                for (_, queue) in state.snapshot.iter_mut().flatten() {
                     for o in queue.iter_mut().filter(|o| o.id == id) {
                         o.leaves = leaves;
                         o.visible = o.visible.min(leaves);
                     }
                 }
-                return ensure(
-                    after.snapshot == expected,
-                    "an in-place modify must keep queue position and only shrink the order, hidden part first",
-                );
+                return Ok((state, 1));
             }
             // Lost priority: the same as a new GTC order for `leaves` arriving at a book
-            // without the old order, keeping its post-only restriction.
+            // without the old order, keeping its post-only restriction and display.
             let taker = Taker {
                 id,
                 owner,
@@ -331,21 +497,31 @@ fn check(
                 qty: leaves,
                 filled_before: order.filled,
             };
-            check_execution(cfg, &before.without(id), &after, taker, &events[1..])
+            let (state, n) = check_execution(cfg, &before.without(id), taker, &events[1..])?;
+            Ok((state, n + 1))
         }
         Command::CancelAll { owner } => {
-            // Exactly the owner's orders, in book order, then the count; nothing else moves.
-            let mine: Vec<QueuedOrder> = [Side::Buy, Side::Sell]
+            // Exactly the owner's orders in book order, then its stops in trigger order, then
+            // the count.
+            let orders = [Side::Buy, Side::Sell]
                 .into_iter()
                 .flat_map(|side| before.priority(side))
-                .map(|(_, order)| order)
-                .filter(|order| order.owner == owner)
+                .map(|(_, order)| (order.id, order.owner, order.leaves));
+            let stops = before
+                .stops
+                .iter()
+                .flatten()
+                .map(|stop| (stop.id, stop.owner, stop.qty));
+            let mine: Vec<(OrderId, Qty)> = orders
+                .chain(stops)
+                .filter(|(_, o, _)| *o == owner)
+                .map(|(id, _, qty)| (id, qty))
                 .collect();
             let mut expected: Vec<Event> = mine
                 .iter()
-                .map(|order| Event::Cancelled {
-                    id: order.id,
-                    qty: order.leaves,
+                .map(|&(id, qty)| Event::Cancelled {
+                    id,
+                    qty,
                     reason: MassCancel,
                 })
                 .collect();
@@ -354,18 +530,87 @@ fn check(
                 count: mine.len() as u32,
             });
             ensure(
-                events == expected,
-                "a mass cancel must cancel exactly the owner's orders, in book order, then report the count",
+                events.get(..expected.len()) == Some(&expected[..]),
+                "a mass cancel must cancel exactly the owner's orders and stops, in book order, then report the count",
             )?;
-            let rest = mine
+            let state = mine
                 .iter()
-                .fold(before.clone(), |state, order| state.without(order.id));
-            ensure(
-                after.snapshot == rest.snapshot,
-                "a mass cancel changed more than the owner's orders",
-            )
+                .fold(before.clone(), |state, &(id, _)| state.without(id));
+            Ok((state, expected.len()))
         }
     }
+}
+
+fn market_taker(
+    cfg: &BookConfig,
+    state: &State,
+    id: OrderId,
+    owner: OwnerId,
+    side: Side,
+    qty: Qty,
+) -> Taker {
+    let (cap, stop) = market_cap(cfg, state, side);
+    Taker {
+        id,
+        owner,
+        side,
+        limit: None,
+        cap,
+        stop,
+        tif: None,
+        post_only: false,
+        display: None,
+        qty,
+        filled_before: 0,
+    }
+}
+
+/// A released stop: it becomes a market order, or a GTC limit order that must first pass
+/// the price controls as they stand now, and is cancelled if it does not.
+fn release(cfg: &BookConfig, state: &State, stop: StopOrder, events: &[Event]) -> Effect {
+    let StopOrder {
+        id,
+        owner,
+        side,
+        qty,
+        ..
+    } = stop;
+    let Some(limit) = stop.limit else {
+        return check_execution(
+            cfg,
+            state,
+            market_taker(cfg, state, id, owner, side, qty),
+            events,
+        );
+    };
+    let refused = if beyond_protection(cfg, state, side, limit) {
+        Some(PriceProtection)
+    } else if beyond_band(cfg, state, side, limit) {
+        Some(PriceBand)
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
+        ensure(
+            events.first() == Some(&Event::Cancelled { id, qty, reason }),
+            "a triggered stop-limit outside the price controls must be cancelled",
+        )?;
+        return Ok((state.clone(), 1));
+    }
+    let taker = Taker {
+        id,
+        owner,
+        side,
+        limit: Some(limit),
+        cap: None,
+        stop: None,
+        tif: Some(TimeInForce::Gtc),
+        post_only: false,
+        display: None,
+        qty,
+        filled_before: 0,
+    };
+    check_execution(cfg, state, taker, events)
 }
 
 /// The furthest price a market order may trade at, and the reason it gives if it stops
@@ -373,7 +618,7 @@ fn check(
 /// the reference price); price protection when they are equal.
 fn market_cap(
     cfg: &BookConfig,
-    before: &State,
+    state: &State,
     side: Side,
 ) -> (Option<Price>, Option<CancelReason>) {
     let through = |from: Price, ticks: u32| match side {
@@ -382,11 +627,11 @@ fn market_cap(
     };
     let protection = cfg
         .price_protection
-        .zip(before.best(side.opposite()))
+        .zip(state.best(side.opposite()))
         .map(|(ticks, best)| through(best, ticks));
     let band = cfg
         .price_band
-        .zip(before.reference)
+        .zip(state.reference)
         .map(|(ticks, reference)| through(reference, ticks));
     match (protection, band) {
         (None, None) => (None, None),
@@ -474,20 +719,14 @@ impl Taker {
     }
 }
 
-/// Checks the events after `Accepted` / `Modified` of an order that matches and then rests or
-/// is cancelled, and that the resulting book is exactly `before` with those effects applied.
+/// Checks the events of one order's execution, from its first trade to its resting or
+/// cancelled remainder, and works out the state it leaves.
 ///
 /// The events are replayed against a copy of the opposite side, each checked against the
 /// rules as it comes: the next order in priority, at its price, within the limit, never the
 /// same owner, as much as it shows. An iceberg whose tranche runs out must show its next one
 /// at once, at the back of its level, which is where the copy moves it too.
-fn check_execution(
-    cfg: &BookConfig,
-    before: &State,
-    after: &State,
-    taker: Taker,
-    events: &[Event],
-) -> Check {
+fn check_execution(cfg: &BookConfig, before: &State, taker: Taker, events: &[Event]) -> Effect {
     let opposite = taker.side.opposite();
     let mut levels: Levels = before.snapshot[State::side_index(opposite)]
         .iter()
@@ -495,22 +734,20 @@ fn check_execution(
         .collect();
     if taker.tif == Some(TimeInForce::Fok) && !taker.could_fill(cfg, &levels) {
         ensure(
-            events
-                == [Event::Cancelled {
+            events.first()
+                == Some(&Event::Cancelled {
                     id: taker.id,
                     qty: taker.qty,
                     reason: FillOrKill,
-                }],
+                }),
             "a fill-or-kill order the book cannot fill must be killed without trading",
         )?;
-        return ensure(
-            after.snapshot == before.snapshot && after.trade_count == before.trade_count,
-            "a killed fill-or-kill order changed the book",
-        );
+        return Ok((before.clone(), 1));
     }
 
     let mut left = taker.qty;
     let mut next_trade_id = before.trade_count + 1;
+    let mut last_price = None;
     // The level being worked, always one with orders unless the side is exhausted.
     let mut current = 0usize;
     let mut i = 0;
@@ -542,6 +779,7 @@ fn check_execution(
                 ensure(!taker.post_only, "a post-only order traded")?;
                 ensure(trade_id == next_trade_id, "trade ids must be consecutive")?;
                 next_trade_id += 1;
+                last_price = Some(price);
                 let (maker_price, queue) = levels
                     .get_mut(current)
                     .ok_or("traded although no resting order was left")?;
@@ -629,10 +867,6 @@ fn check_execution(
         }
         i += 1;
     }
-    ensure(
-        after.trade_count == next_trade_id - 1,
-        "trade counter disagrees with the trades emitted",
-    )?;
 
     // The next resting order the taker would reach, if it may trade with it.
     let next_reachable = levels
@@ -641,42 +875,41 @@ fn check_execution(
         .and_then(|(_, queue)| queue.front().copied());
     let exhausted = current == levels.len();
     let mut rested = None;
-    match &events[i..] {
-        [] => ensure(left == 0, "unfilled quantity vanished")?,
-        [
-            Event::Rested {
-                id,
-                side,
-                price,
-                qty,
-                visible,
-            },
-        ] => {
+    match events.get(i) {
+        Some(&Event::Rested {
+            id,
+            side,
+            price,
+            qty,
+            visible,
+        }) if id == taker.id => {
+            i += 1;
             ensure(
-                *id == taker.id && *side == taker.side && Some(*price) == taker.limit,
-                "rested with the wrong id, side or price",
+                side == taker.side && Some(price) == taker.limit,
+                "rested with the wrong side or price",
             )?;
             ensure(
                 matches!(taker.tif, Some(TimeInForce::Gtc | TimeInForce::PostOnly)),
                 "only GTC and post-only orders rest",
             )?;
             ensure(
-                *qty == left && left > 0,
+                qty == left && left > 0,
                 "rested quantity must be the unfilled quantity",
             )?;
             ensure(
-                *visible == taker.shows(left),
+                visible == taker.shows(left),
                 "a resting order shows its display quantity, or everything",
             )?;
             ensure(
                 next_reachable.is_none(),
                 "rested while it could still trade",
             )?;
-            rested = Some((*price, *qty, *visible));
+            rested = Some((price, qty, visible));
         }
-        [Event::Cancelled { id, qty, reason }] if *id == taker.id => {
+        Some(&Event::Cancelled { id, qty, reason }) if id == taker.id => {
+            i += 1;
             ensure(
-                *qty == left && left > 0,
+                qty == left && left > 0,
                 "cancelled quantity must be the unfilled quantity",
             )?;
             match reason {
@@ -700,7 +933,7 @@ fn check_execution(
                 }
                 PriceProtection | PriceBand => {
                     ensure(
-                        taker.stop == Some(*reason),
+                        taker.stop == Some(reason),
                         "a market order must name the tighter of its caps",
                     )?;
                     ensure(
@@ -724,11 +957,11 @@ fn check_execution(
                 Requested | MassCancel => return Err("a Cancel reason on a new order".into()),
             }
         }
-        rest => return Err(format!("unexpected trailing events: {rest:?}")),
+        _ => ensure(left == 0, "unfilled quantity vanished")?,
     }
 
-    // The book must be `before` with the opposite side as replayed and the taker appended
-    // to its level.
+    // The state: `before` with the opposite side as replayed and the taker appended to its
+    // level.
     let mut books = to_books(&before.snapshot);
     books[State::side_index(opposite)] = levels
         .into_iter()
@@ -749,10 +982,13 @@ fn check_execution(
                 visible,
             });
     }
-    ensure(
-        after.snapshot == from_books(books),
-        "the book changed beyond the effects of this command",
-    )
+    let state = State {
+        snapshot: from_books(books),
+        stops: before.stops.clone(),
+        trade_count: next_trade_id - 1,
+        reference: last_price.or(before.reference),
+    };
+    Ok((state, i))
 }
 
 /// The rejection the rules require for `command` against the book before it, or `None` if
@@ -772,36 +1008,11 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
     };
     let qty_invalid = |qty: Qty| qty == 0 || qty > cfg.max_order_qty;
     let out_of_band = |price: Price| price < cfg.min_price || price > cfg.max_price;
+    let taken = |id: OrderId| before.find(id).is_some() || before.find_stop(id).is_some();
+    let full = before.order_count() == cfg.max_orders as usize;
     let owned = |id: OrderId, owner: OwnerId| before.find(id).filter(|(_, _, o)| o.owner == owner);
-    let beyond_protection = |side: Side, price: Price| {
-        cfg.price_protection.is_some_and(|ticks| {
-            let ticks = i128::from(ticks);
-            match side {
-                Side::Buy => before
-                    .best(Side::Sell)
-                    .is_some_and(|ask| i128::from(price) > i128::from(ask) + ticks),
-                Side::Sell => before
-                    .best(Side::Buy)
-                    .is_some_and(|bid| i128::from(price) < i128::from(bid) - ticks),
-            }
-        })
-    };
-    let beyond_band = |side: Side, price: Price| {
-        cfg.price_band
-            .zip(before.reference)
-            .is_some_and(|(ticks, reference)| {
-                let (price, reference, ticks) =
-                    (i128::from(price), i128::from(reference), i128::from(ticks));
-                match side {
-                    Side::Buy => price > reference + ticks,
-                    Side::Sell => price < reference - ticks,
-                }
-            })
-    };
-    let crosses = |side: Side, price: Price| match side {
-        Side::Buy => before.best(Side::Sell).is_some_and(|ask| price >= ask),
-        Side::Sell => before.best(Side::Buy).is_some_and(|bid| price <= bid),
-    };
+    let owned_stop =
+        |id: OrderId, owner: OwnerId| before.find_stop(id).filter(|s| s.owner == owner);
 
     match command {
         Command::Limit {
@@ -814,7 +1025,6 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             display,
         } => {
             let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
-            let full = before.order_count() == cfg.max_orders as usize;
             if owner_invalid(owner) {
                 Some(InvalidOwner)
             } else if qty_invalid(qty) {
@@ -823,15 +1033,15 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidDisplay)
             } else if out_of_band(price) {
                 Some(PriceOutOfRange)
-            } else if before.find(id).is_some() {
+            } else if taken(id) {
                 Some(DuplicateOrderId)
-            } else if beyond_protection(side, price) {
+            } else if beyond_protection(cfg, before, side, price) {
                 Some(PriceOutsideProtection)
-            } else if beyond_band(side, price) {
+            } else if beyond_band(cfg, before, side, price) {
                 Some(PriceOutsideBand)
-            } else if tif == TimeInForce::PostOnly && crosses(side, price) {
+            } else if tif == TimeInForce::PostOnly && crosses(before, side, price) {
                 Some(PostOnlyWouldCross)
-            } else if may_rest && full && !crosses(side, price) {
+            } else if may_rest && full && !crosses(before, side, price) {
                 // A crossing order frees a slot by its first match, and orders that never
                 // rest need none, so neither is refused.
                 Some(BookFull)
@@ -844,13 +1054,39 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidOwner)
             } else if qty_invalid(qty) {
                 Some(InvalidQuantity)
-            } else if before.find(id).is_some() {
+            } else if taken(id) {
                 Some(DuplicateOrderId)
             } else {
                 None
             }
         }
-        Command::Cancel { id, owner } => owned(id, owner).is_none().then_some(UnknownOrder),
+        Command::Stop {
+            id,
+            owner,
+            side,
+            trigger,
+            limit,
+            qty,
+        } => {
+            if owner_invalid(owner) {
+                Some(InvalidOwner)
+            } else if qty_invalid(qty) {
+                Some(InvalidQuantity)
+            } else if out_of_band(trigger) || limit.is_some_and(out_of_band) {
+                Some(PriceOutOfRange)
+            } else if taken(id) {
+                Some(DuplicateOrderId)
+            } else if reached(before, side, trigger) {
+                Some(StopWouldTrigger)
+            } else if full {
+                Some(BookFull)
+            } else {
+                None
+            }
+        }
+        Command::Cancel { id, owner } => {
+            (owned(id, owner).is_none() && owned_stop(id, owner).is_none()).then_some(UnknownOrder)
+        }
         Command::Modify {
             id,
             owner,
@@ -863,6 +1099,9 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             if out_of_band(price) {
                 return Some(PriceOutOfRange);
             }
+            if owned_stop(id, owner).is_some() {
+                return Some(PendingStop);
+            }
             let Some((side, old_price, order)) = owned(id, owner) else {
                 return Some(UnknownOrder);
             };
@@ -871,11 +1110,11 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             let leaves = qty.saturating_sub(order.filled);
             let in_place = price == old_price && leaves <= order.leaves;
             let replaces = leaves > 0 && !in_place;
-            if replaces && beyond_protection(side, price) {
+            if replaces && beyond_protection(cfg, before, side, price) {
                 Some(PriceOutsideProtection)
-            } else if replaces && beyond_band(side, price) {
+            } else if replaces && beyond_band(cfg, before, side, price) {
                 Some(PriceOutsideBand)
-            } else if replaces && order.post_only && crosses(side, price) {
+            } else if replaces && order.post_only && crosses(before, side, price) {
                 Some(PostOnlyWouldCross)
             } else if replaces && order.display.is_some_and(|d| !covers(d, qty)) {
                 Some(InvalidDisplay)

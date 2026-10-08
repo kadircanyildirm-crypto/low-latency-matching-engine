@@ -30,6 +30,7 @@ fn one_sided_time_under_each_price_control() {
             market: 20,
             cancel: 20,
             mass_cancel: 0,
+            stop: 0,
             modify: 5,
         },
         ..WorkloadConfig::default()

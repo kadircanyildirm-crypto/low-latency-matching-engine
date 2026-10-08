@@ -1,14 +1,16 @@
 //! The limit order book and its matching logic.
 
 mod snapshot;
+mod stops;
 
 pub use snapshot::{BookSnapshot, SnapshotError, SnapshotOrder};
+pub use stops::{StopOrder, Stops};
 
 use rustc_hash::FxHashMap;
 
 use crate::bitset::LevelBitset;
 use crate::owners::Owners;
-use crate::pool::{NIL, OrderNode, OrderPool};
+use crate::pool::{NIL, OrderKind, OrderNode, OrderPool};
 use crate::types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
     SelfTradePolicy, Side, TimeInForce, TradeId,
@@ -25,7 +27,7 @@ pub struct BookConfig {
     /// Highest accepted price in ticks (inclusive). Orders outside the band are rejected,
     /// like an exchange's static price collar.
     pub max_price: Price,
-    /// Maximum number of resting orders.
+    /// Maximum number of resting orders and pending stops together; each holds one slot.
     pub max_orders: u32,
     /// Owner ids run from 0 to `max_owners - 1`. The gateway assigns these dense indices to
     /// participants, so the book can keep per-owner state in plain arrays. New orders from
@@ -198,8 +200,12 @@ impl Level {
 }
 
 /// One side of the book: a dense ladder of price levels indexed by `price - min_price`, each
-/// holding an intrusive FIFO queue of orders.
+/// holding an intrusive FIFO queue of orders. Pending stops use the same structure, keyed by
+/// trigger level.
 struct HalfBook {
+    /// Which way the ladder's priority runs: like bids (highest level first) or like asks
+    /// (lowest first). Buy stops run like asks, since rising prices trigger the lowest first;
+    /// sell stops run like bids.
     side: Side,
     levels: Vec<Level>,
     /// Which levels hold orders; finds the next best level without scanning empty ones.
@@ -321,6 +327,10 @@ pub struct OrderBook {
     config: BookConfig,
     bids: HalfBook,
     asks: HalfBook,
+    /// Pending buy stops by trigger level, lowest trigger first.
+    buy_stops: HalfBook,
+    /// Pending sell stops by trigger level, highest trigger first.
+    sell_stops: HalfBook,
     pool: OrderPool,
     /// Order id -> pool slot. Reserved at twice `max_orders` so that clearing out deleted
     /// entries is always an in-place rehash, never a reallocation.
@@ -332,6 +342,9 @@ pub struct OrderBook {
     next_trade_id: TradeId,
     /// Level of the last trade, or of the configured reference price before the first one.
     reference: Option<u32>,
+    /// Lowest and highest level traded at during the current command; it decides which
+    /// stops trigger.
+    traded: Option<(u32, u32)>,
 }
 
 /// Sort key that puts an owner's orders in book order: side (bids first), price priority,
@@ -377,17 +390,22 @@ impl OrderBook {
             config,
             bids: HalfBook::new(Side::Buy, levels),
             asks: HalfBook::new(Side::Sell, levels),
+            buy_stops: HalfBook::new(Side::Sell, levels),
+            sell_stops: HalfBook::new(Side::Buy, levels),
             pool: OrderPool::with_capacity(config.max_orders),
             index,
             owners: Owners::new(config.max_owners, config.max_orders),
             scratch: Vec::with_capacity(config.max_orders as usize),
             next_trade_id: 1,
             reference,
+            traded: None,
         }
     }
 
-    /// Applies one command, reporting its outcome to `sink`.
+    /// Applies one command, reporting its outcome to `sink`, then releases the stops its
+    /// trades triggered.
     pub fn process<S: EventSink>(&mut self, command: Command, sink: &mut S) {
+        self.traded = None;
         let (id, result) = match command {
             Command::Limit {
                 id,
@@ -407,6 +425,17 @@ impl OrderBook {
                 side,
                 qty,
             } => (id, self.new_market(id, owner, side, qty, sink)),
+            Command::Stop {
+                id,
+                owner,
+                side,
+                trigger,
+                limit,
+                qty,
+            } => (
+                id,
+                self.new_stop(id, owner, side, trigger, limit, qty, sink),
+            ),
             Command::Cancel { id, owner } => (id, self.cancel(id, owner, sink)),
             Command::Modify {
                 id,
@@ -419,6 +448,7 @@ impl OrderBook {
         if let Err(reason) = result {
             sink.on_event(Event::Rejected { id, reason });
         }
+        self.release_stops(sink);
     }
 
     // Each handler validates everything before emitting its first event, so a rejected
@@ -561,6 +591,20 @@ impl OrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
         sink.on_event(Event::Accepted { id });
+        self.execute_market(id, owner, side, qty, sink);
+        Ok(())
+    }
+
+    /// Matches a market order up to its cap and cancels whatever is left.
+    #[inline]
+    fn execute_market<S: EventSink>(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        qty: Qty,
+        sink: &mut S,
+    ) {
         // A market order stops at the tighter of its two caps, and says which one it was.
         let (protection, band) = (self.protection_cap(side), self.band_cap(side));
         let band_is_tighter = match (protection, band) {
@@ -586,7 +630,6 @@ impl OrderBook {
                 reason,
             });
         }
-        Ok(())
     }
 
     fn cancel<S: EventSink>(
@@ -606,9 +649,10 @@ impl OrderBook {
         Ok(())
     }
 
-    /// Cancels all of `owner`'s resting orders in book order. The owner's list holds them in
-    /// the order they started resting; sorting by side, price priority and list position
-    /// turns that into book order, because within one level list order is queue order.
+    /// Cancels all of `owner`'s resting orders in book order, then its pending stops in
+    /// trigger order. The owner's list holds them in the order they joined their queues;
+    /// sorting by ladder, priority and list position turns that into book order, because
+    /// within one level list order is queue order.
     fn cancel_all<S: EventSink>(&mut self, owner: OwnerId, sink: &mut S) {
         let mut keys = std::mem::take(&mut self.scratch);
         keys.clear();
@@ -616,9 +660,11 @@ impl OrderBook {
         let mut position = 0;
         while slot != NIL {
             let node = self.pool.get(slot);
-            let key = match node.side {
-                Side::Buy => (0, u32::MAX - node.level, position, slot),
-                Side::Sell => (1, node.level, position, slot),
+            let key = match (node.is_stop(), node.side) {
+                (false, Side::Buy) => (0, u32::MAX - node.level, position, slot),
+                (false, Side::Sell) => (1, node.level, position, slot),
+                (true, Side::Buy) => (2, node.level, position, slot),
+                (true, Side::Sell) => (3, u32::MAX - node.level, position, slot),
             };
             keys.push(key);
             position += 1;
@@ -653,6 +699,9 @@ impl OrderBook {
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
         let slot = self.owned_slot(id, owner)?;
         let node = *self.pool.get(slot);
+        if node.is_stop() {
+            return Err(RejectReason::PendingStop);
+        }
         let filled = node.total - node.remaining;
 
         if qty <= filled {
@@ -780,6 +829,7 @@ impl OrderBook {
             owners,
             next_trade_id,
             reference,
+            traded,
             ..
         } = self;
         let resting = match taker_side {
@@ -827,6 +877,10 @@ impl OrderBook {
                 let trade_id = *next_trade_id;
                 *next_trade_id += 1;
                 *reference = Some(level);
+                *traded = Some(match *traded {
+                    None => (level, level),
+                    Some((low, high)) => (low.min(level), high.max(level)),
+                });
                 sink.on_event(Event::Trade {
                     trade_id,
                     taker,
@@ -864,30 +918,46 @@ impl OrderBook {
         (0, Halt::Filled)
     }
 
-    /// Puts an allocated order on the book: into the id index, at the back of its level's
-    /// queue, and at the back of its owner's list.
+    /// Puts an allocated order or stop in its place: into the id index, at the back of its
+    /// level's queue in its ladder, and at the back of its owner's list.
     #[inline]
     fn place(&mut self, slot: u32) {
-        let OrderNode {
-            id, owner, side, ..
-        } = *self.pool.get(slot);
+        let OrderNode { id, owner, .. } = *self.pool.get(slot);
         self.index.insert(id, slot);
-        let (half, pool) = self.half_and_pool(side);
-        half.push_back(pool, slot);
+        let (ladder, pool) = self.ladder_and_pool(slot);
+        ladder.push_back(pool, slot);
         self.owners.link(slot, owner);
     }
 
-    /// Unlinks and frees a resting order.
+    /// Unlinks and frees a resting order or pending stop.
     #[inline]
     fn remove(&mut self, slot: u32) {
-        let OrderNode {
-            id, side, owner, ..
-        } = *self.pool.get(slot);
-        let (half, pool) = self.half_and_pool(side);
-        half.unlink(pool, slot);
+        let (ladder, pool) = self.ladder_and_pool(slot);
+        ladder.unlink(pool, slot);
+        self.retire(slot);
+    }
+
+    /// Frees the slot of an order that is in no queue any more: out of the id index, out of
+    /// its owner's list, back to the pool.
+    #[inline]
+    fn retire(&mut self, slot: u32) {
+        let OrderNode { id, owner, .. } = *self.pool.get(slot);
+        self.index.remove(&id);
         self.owners.unlink(slot, owner);
         self.pool.free(slot);
-        self.index.remove(&id);
+    }
+
+    /// The ladder the order or stop in `slot` belongs to, with the pool.
+    #[inline]
+    fn ladder_and_pool(&mut self, slot: u32) -> (&mut HalfBook, &mut OrderPool) {
+        let node = self.pool.get(slot);
+        let ladder = match (node.kind, node.side) {
+            (OrderKind::Resting, Side::Buy) => &mut self.bids,
+            (OrderKind::Resting, Side::Sell) => &mut self.asks,
+            (_, Side::Buy) => &mut self.buy_stops,
+            (_, Side::Sell) => &mut self.sell_stops,
+        };
+        (ladder, &mut self.pool)
     }
 
     /// The slot of `id` if it rests on the book and belongs to `owner`.
@@ -1027,7 +1097,7 @@ impl OrderBook {
         self.config
     }
 
-    /// Number of resting orders.
+    /// Number of resting orders and pending stops: the slots in use out of `max_orders`.
     pub fn order_count(&self) -> usize {
         self.pool.live()
     }
@@ -1053,10 +1123,14 @@ impl OrderBook {
         self.depth(Side::Sell).next()
     }
 
-    /// A resting order, if `id` is on the book.
+    /// A resting order, if `id` is on the book. Pending stops are not on the book until
+    /// they trigger; [`OrderBook::stop`] reports them.
     pub fn order(&self, id: OrderId) -> Option<OrderInfo> {
         let slot = *self.index.get(&id)?;
         let node = self.pool.get(slot);
+        if node.is_stop() {
+            return None;
+        }
         Some(OrderInfo {
             owner: node.owner,
             side: node.side,
@@ -1135,7 +1209,7 @@ impl OrderBook {
                     if node.prev != prev {
                         return Err(format!("{side:?} {price}: broken back link at #{id}"));
                     }
-                    if node.level != level || node.side != side {
+                    if node.level != level || node.side != side || node.is_stop() {
                         return Err(format!("{side:?} {price}: #{id} is misfiled"));
                     }
                     if node.remaining == 0
@@ -1189,9 +1263,11 @@ impl OrderBook {
                 resting += count as usize;
             }
         }
-        if resting != self.pool.live() || resting != self.index.len() {
+        let stops = self.validate_stops()?;
+        let held = resting + stops;
+        if held != self.pool.live() || held != self.index.len() {
             return Err(format!(
-                "{resting} orders in queues, {} in pool, {} in index",
+                "{resting} orders in queues and {stops} stops, {} in pool, {} in index",
                 self.pool.live(),
                 self.index.len()
             ));
@@ -1602,6 +1678,150 @@ mod validate_tests {
                 b.pool.iceberg_mut(s).visible = 2;
             },
             "aggregates say 2/4 but queue holds 2/3",
+        );
+    }
+
+    /// Adds pending stops to the healthy fixture, which has no last price yet: buy stops #20
+    /// (market) and #21 (limit 205) at 200, and a sell stop #22 at 50.
+    fn add_stops(b: &mut OrderBook) {
+        let mut events = Vec::new();
+        for (id, side, trigger, limit) in [
+            (20, Buy, 200, None),
+            (21, Buy, 200, Some(205)),
+            (22, Sell, 50, None),
+        ] {
+            b.process(
+                Command::Stop {
+                    id,
+                    owner: 20,
+                    side,
+                    trigger,
+                    limit,
+                    qty: 2,
+                },
+                &mut events,
+            );
+        }
+        b.validate()
+            .expect("the stop fixture must start out healthy");
+    }
+
+    #[test]
+    fn broken_stop_ladders() {
+        assert_detects(
+            |b| {
+                add_stops(b);
+                b.buy_stops.best = None;
+            },
+            "Buy stops: best is None",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let l = level(b, 50);
+                b.sell_stops.levels[l].head = NIL;
+            },
+            "Sell stops 50: occupied bit on an empty level",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 21);
+                b.pool.get_mut(s).prev = NIL;
+            },
+            "Buy stops 200: broken back link at #21",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let l = level(b, 200);
+                b.buy_stops.levels[l].tail = b.buy_stops.levels[l].head;
+            },
+            "Buy stops 200: tail does not point",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let l = level(b, 200);
+                b.buy_stops.levels[l].order_count += 1;
+            },
+            "Buy stops 200: aggregates say 3/4 but queue holds 2/4",
+        );
+    }
+
+    #[test]
+    fn impossible_stops() {
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 22);
+                b.pool.get_mut(s).side = Buy;
+            },
+            "Sell stops 50: #22 is misfiled",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 22);
+                b.pool.get_mut(s).kind = OrderKind::Resting;
+            },
+            "Sell stops 50: #22 is misfiled",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 20);
+                b.pool.get_mut(s).limit = 0;
+            },
+            "Buy stops 200: #20 has a bad limit level",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 21);
+                b.pool.get_mut(s).limit = 1_000;
+            },
+            "Buy stops 200: #21 has a bad limit level",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 20);
+                b.pool.get_mut(s).remaining = 1;
+            },
+            "Buy stops 200: #20 has quantity 1 of 2",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                b.index.remove(&22);
+            },
+            "Sell stops 50: index disagrees on #22",
+        );
+        // A trade at 200 or above should have released the buy stops at 200.
+        assert_detects(
+            |b| {
+                add_stops(b);
+                b.reference = Some(level(b, 200) as u32);
+            },
+            "Buy stops 200: #20 should have triggered",
+        );
+        assert_detects(
+            |b| {
+                add_stops(b);
+                b.reference = Some(level(b, 50) as u32);
+            },
+            "Sell stops 50: #22 should have triggered",
+        );
+        // A stop that left its ladder but kept its slot.
+        assert_detects(
+            |b| {
+                add_stops(b);
+                let s = slot(b, 22);
+                let (ladder, pool) = b.ladder_and_pool(s);
+                ladder.unlink(pool, s);
+            },
+            "5 orders in queues and 2 stops, 8 in pool",
         );
     }
 

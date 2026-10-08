@@ -101,8 +101,27 @@ pub enum Command {
         /// New total quantity (filled + open), `1..=max_order_qty`.
         qty: Qty,
     },
-    /// Cancels every resting order of `owner`, for example when its session disconnects.
-    /// Costs O(k log k) in the owner's k orders, independent of the rest of the book.
+    /// A stop order. It waits, invisible to the market, until a trade happens at `trigger`
+    /// or beyond: at or above it for a buy stop, at or below it for a sell stop. Then it
+    /// works as a market order, or as a GTC limit order at `limit` if one is given.
+    Stop {
+        /// New order's id; must not belong to a resting order or a pending stop.
+        id: OrderId,
+        /// Participant placing the order.
+        owner: OwnerId,
+        /// Buy or sell.
+        side: Side,
+        /// Trigger price in ticks. It must not already be reached: a buy stop's trigger must
+        /// lie above the last trade price, a sell stop's below it.
+        trigger: Price,
+        /// Limit price of a stop-limit order; `None` for a stop-market order.
+        limit: Option<Price>,
+        /// Order quantity, `1..=max_order_qty`.
+        qty: Qty,
+    },
+    /// Cancels every resting order and pending stop of `owner`, for example when its session
+    /// disconnects. Costs O(k log k) in the owner's k orders, independent of the rest of the
+    /// book.
     CancelAll {
         /// Participant whose orders to cancel.
         owner: OwnerId,
@@ -116,6 +135,7 @@ impl Command {
         match *self {
             Command::Limit { id, .. }
             | Command::Market { id, .. }
+            | Command::Stop { id, .. }
             | Command::Cancel { id, .. }
             | Command::Modify { id, .. } => Some(id),
             Command::CancelAll { .. } => None,
@@ -128,6 +148,7 @@ impl Command {
         match *self {
             Command::Limit { owner, .. }
             | Command::Market { owner, .. }
+            | Command::Stop { owner, .. }
             | Command::Cancel { owner, .. }
             | Command::Modify { owner, .. }
             | Command::CancelAll { owner } => owner,
@@ -161,9 +182,15 @@ pub enum TimeInForce {
 /// - `Cancel`: `Cancelled { reason: Requested }` or `Rejected`.
 /// - `Modify`: `Rejected`, or `Modified`. If the order lost priority, `Modified` is followed
 ///   by the same events a new limit order would produce after `Accepted`.
+/// - `Stop`: `Rejected`, or `Accepted` and `StopPlaced`.
 /// - `CancelAll`: `Cancelled { reason: MassCancel }` for each of the owner's orders in book
 ///   order (bids best price first, then asks best price first, each level in time
-///   priority), then `MassCancelled`. It is never rejected.
+///   priority), then for each of its pending stops (buy stops lowest trigger first, then
+///   sell stops highest trigger first), then `MassCancelled`. It is never rejected.
+///
+/// After any command whose trades reached a pending stop's trigger, the stop is released:
+/// `Triggered`, then the events of the market or limit order it becomes, after `Accepted`.
+/// A released stop's trades can trigger more stops in turn.
 ///
 /// "Leaves" quantity is the open quantity still working on the book; zero means the order
 /// is done.
@@ -247,6 +274,24 @@ pub enum Event {
         /// new total did not exceed what was already filled, and the order is done.
         leaves: Qty,
     },
+    /// A stop order was accepted and waits for its trigger.
+    StopPlaced {
+        /// The stop order.
+        id: OrderId,
+        /// Its side.
+        side: Side,
+        /// Its trigger price.
+        trigger: Price,
+        /// Its limit price, if it is a stop-limit order.
+        limit: Option<Price>,
+        /// Its quantity.
+        qty: Qty,
+    },
+    /// A pending stop's trigger was reached; the events of the order it becomes follow.
+    Triggered {
+        /// The stop order.
+        id: OrderId,
+    },
     /// A mass cancel finished; it follows the `Cancelled` events of the orders it removed.
     MassCancelled {
         /// The owner whose orders were cancelled.
@@ -284,6 +329,11 @@ pub enum RejectReason {
     /// A limit price lies further through the reference price than the book's price band
     /// allows.
     PriceOutsideBand,
+    /// A stop's trigger is already reached: a buy stop at or below the last trade price, a
+    /// sell stop at or above it.
+    StopWouldTrigger,
+    /// A modify of a stop that has not triggered yet; cancel it and send a new one instead.
+    PendingStop,
 }
 
 /// Why open quantity left the book without trading.

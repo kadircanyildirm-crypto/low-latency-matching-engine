@@ -104,6 +104,10 @@ pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
         3 => (id(), owner(), price(cfg), qty(cfg))
             .prop_map(|(id, owner, price, qty)| Command::Modify { id, owner, price, qty }),
         1 => owner().prop_map(|owner| Command::CancelAll { owner }),
+        2 => (id(), owner(), side(), price(cfg), prop::option::of(price(cfg)), qty(cfg))
+            .prop_map(|(id, owner, side, trigger, limit, qty)| Command::Stop {
+                id, owner, side, trigger, limit, qty,
+            }),
     ]
     .boxed()
 }

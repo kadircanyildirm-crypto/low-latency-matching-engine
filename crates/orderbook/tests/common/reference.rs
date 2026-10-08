@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use orderbook::{
     BookConfig, CancelReason, Command, Event, OrderId, OwnerId, Price, Qty, QueuedOrder,
-    RejectReason, SelfTradePolicy, Side, TimeInForce,
+    RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
 };
 
 use super::Snapshot;
@@ -46,6 +46,10 @@ pub struct ReferenceBook {
     trades: u64,
     /// Last trade price, or the configured reference before the first trade.
     reference: Option<Price>,
+    /// Pending stops in arrival order; trigger order is worked out by sorting when needed.
+    pending: Vec<StopOrder>,
+    /// Lowest and highest price traded at during the current command.
+    traded: Option<(Price, Price)>,
 }
 
 impl ReferenceBook {
@@ -57,7 +61,34 @@ impl ReferenceBook {
             orders: HashMap::new(),
             trades: 0,
             reference: cfg.reference_price,
+            pending: Vec::new(),
+            traded: None,
         }
+    }
+
+    /// One side's pending stops in trigger order: buy stops lowest trigger first, sell stops
+    /// highest first; the stable sort keeps arrival order within a trigger.
+    pub fn stops(&self, side: Side) -> Vec<StopOrder> {
+        let mut stops: Vec<StopOrder> = self
+            .pending
+            .iter()
+            .filter(|s| s.side == side)
+            .copied()
+            .collect();
+        stops.sort_by_key(|s| match side {
+            Side::Buy => i128::from(s.trigger),
+            Side::Sell => -i128::from(s.trigger),
+        });
+        stops
+    }
+
+    /// Resting orders and pending stops: each takes one of `max_orders`.
+    fn held(&self) -> usize {
+        self.orders.len() + self.pending.len()
+    }
+
+    fn taken(&self, id: OrderId) -> bool {
+        self.orders.contains_key(&id) || self.pending.iter().any(|s| s.id == id)
     }
 
     pub fn reference_price(&self) -> Option<Price> {
@@ -69,11 +100,60 @@ impl ReferenceBook {
     }
 
     pub fn process(&mut self, command: Command, out: &mut Vec<Event>) {
+        self.traded = None;
         if let Err(reason) = self.apply(command, out) {
             out.push(Event::Rejected {
                 id: command.id().expect("only commands with an id are rejected"),
                 reason,
             });
+        }
+        self.release_stops(out);
+    }
+
+    /// Releases, one at a time, the stops this command's trades reached: the lowest buy
+    /// trigger at or below the highest trade price, else the highest sell trigger at or
+    /// above the lowest trade price. Released stops trade and can reach more.
+    fn release_stops(&mut self, out: &mut Vec<Event>) {
+        while let Some((low, high)) = self.traded {
+            let next = self
+                .stops(Side::Buy)
+                .into_iter()
+                .find(|s| s.trigger <= high)
+                .or_else(|| {
+                    self.stops(Side::Sell)
+                        .into_iter()
+                        .find(|s| s.trigger >= low)
+                });
+            let Some(stop) = next else {
+                return;
+            };
+            self.pending.retain(|s| s.id != stop.id);
+            out.push(Event::Triggered { id: stop.id });
+            let StopOrder {
+                id,
+                owner,
+                side,
+                qty,
+                ..
+            } = stop;
+            match stop.limit {
+                None => self.execute_market(id, owner, side, qty, out),
+                Some(limit) => {
+                    let refused = if self.outside_protection(side, limit) {
+                        Some(CancelReason::PriceProtection)
+                    } else if self.outside_band(side, limit) {
+                        Some(CancelReason::PriceBand)
+                    } else {
+                        None
+                    };
+                    match refused {
+                        Some(reason) => out.push(Event::Cancelled { id, qty, reason }),
+                        None => {
+                            self.execute_limit(id, owner, side, limit, qty, qty, (false, None), out)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -97,7 +177,7 @@ impl ReferenceBook {
                     }
                 }
                 self.check_band(price)?;
-                if self.orders.contains_key(&id) {
+                if self.taken(id) {
                     return Err(RejectReason::DuplicateOrderId);
                 }
                 if self.outside_protection(side, price) {
@@ -110,7 +190,7 @@ impl ReferenceBook {
                 if tif == TimeInForce::PostOnly && crosses {
                     return Err(RejectReason::PostOnlyWouldCross);
                 }
-                if may_rest && self.orders.len() >= self.cfg.max_orders as usize && !crosses {
+                if may_rest && self.held() >= self.cfg.max_orders as usize && !crosses {
                     return Err(RejectReason::BookFull);
                 }
                 out.push(Event::Accepted { id });
@@ -164,42 +244,70 @@ impl ReferenceBook {
             } => {
                 self.check_owner(owner)?;
                 self.check_qty(qty)?;
-                if self.orders.contains_key(&id) {
+                if self.taken(id) {
                     return Err(RejectReason::DuplicateOrderId);
                 }
                 out.push(Event::Accepted { id });
-                // Stop at the tighter cap; on a tie, price protection names the stop.
-                let (protection, band) = (self.protection_cap(side), self.band_cap(side));
-                let (cap, stop) = match (protection, band) {
-                    (p, None) => (p, CancelReason::PriceProtection),
-                    (None, b) => (b, CancelReason::PriceBand),
-                    (Some(p), Some(b)) => {
-                        let band_tighter = match side {
-                            Side::Buy => b < p,
-                            Side::Sell => b > p,
-                        };
-                        if band_tighter {
-                            (Some(b), CancelReason::PriceBand)
-                        } else {
-                            (Some(p), CancelReason::PriceProtection)
-                        }
-                    }
-                };
-                let (unfilled, halt) = self.match_incoming(id, owner, side, qty, cap, out);
-                if unfilled > 0 {
-                    let reason = match halt {
-                        Halt::SelfTrade => CancelReason::SelfTrade,
-                        Halt::Limit => stop,
-                        Halt::Empty | Halt::Filled => CancelReason::NoLiquidity,
-                    };
-                    out.push(Event::Cancelled {
-                        id,
-                        qty: unfilled,
-                        reason,
-                    });
+                self.execute_market(id, owner, side, qty, out);
+            }
+            Command::Stop {
+                id,
+                owner,
+                side,
+                trigger,
+                limit,
+                qty,
+            } => {
+                self.check_owner(owner)?;
+                self.check_qty(qty)?;
+                self.check_band(trigger)?;
+                if let Some(limit) = limit {
+                    self.check_band(limit)?;
                 }
+                if self.taken(id) {
+                    return Err(RejectReason::DuplicateOrderId);
+                }
+                let reached = self.reference.is_some_and(|last| match side {
+                    Side::Buy => trigger <= last,
+                    Side::Sell => trigger >= last,
+                });
+                if reached {
+                    return Err(RejectReason::StopWouldTrigger);
+                }
+                if self.held() >= self.cfg.max_orders as usize {
+                    return Err(RejectReason::BookFull);
+                }
+                out.push(Event::Accepted { id });
+                self.pending.push(StopOrder {
+                    id,
+                    owner,
+                    side,
+                    trigger,
+                    limit,
+                    qty,
+                });
+                out.push(Event::StopPlaced {
+                    id,
+                    side,
+                    trigger,
+                    limit,
+                    qty,
+                });
             }
             Command::Cancel { id, owner } => {
+                if let Some(i) = self
+                    .pending
+                    .iter()
+                    .position(|s| s.id == id && s.owner == owner)
+                {
+                    let stop = self.pending.remove(i);
+                    out.push(Event::Cancelled {
+                        id,
+                        qty: stop.qty,
+                        reason: CancelReason::Requested,
+                    });
+                    return Ok(());
+                }
                 let (side, price) = self.owned(id, owner)?;
                 let order = self.take_out(id, side, price);
                 out.push(Event::Cancelled {
@@ -216,6 +324,9 @@ impl ReferenceBook {
             } => {
                 self.check_qty(qty)?;
                 self.check_band(price)?;
+                if self.pending.iter().any(|s| s.id == id && s.owner == owner) {
+                    return Err(RejectReason::PendingStop);
+                }
                 let (side, old_price) = self.owned(id, owner)?;
                 let order = *self.find(id, side, old_price);
                 let filled = order.total - order.leaves;
@@ -289,6 +400,17 @@ impl ReferenceBook {
                             });
                             count += 1;
                         }
+                    }
+                }
+                for side in [Side::Buy, Side::Sell] {
+                    for stop in self.stops(side).into_iter().filter(|s| s.owner == owner) {
+                        self.pending.retain(|s| s.id != stop.id);
+                        out.push(Event::Cancelled {
+                            id: stop.id,
+                            qty: stop.qty,
+                            reason: CancelReason::MassCancel,
+                        });
+                        count += 1;
                     }
                 }
                 out.push(Event::MassCancelled { owner, count });
@@ -391,6 +513,46 @@ impl ReferenceBook {
         })
     }
 
+    /// A market order: matches up to the tighter of its caps; a tie names price protection.
+    fn execute_market(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        qty: Qty,
+        out: &mut Vec<Event>,
+    ) {
+        let (protection, band) = (self.protection_cap(side), self.band_cap(side));
+        let (cap, stop) = match (protection, band) {
+            (p, None) => (p, CancelReason::PriceProtection),
+            (None, b) => (b, CancelReason::PriceBand),
+            (Some(p), Some(b)) => {
+                let band_tighter = match side {
+                    Side::Buy => b < p,
+                    Side::Sell => b > p,
+                };
+                if band_tighter {
+                    (Some(b), CancelReason::PriceBand)
+                } else {
+                    (Some(p), CancelReason::PriceProtection)
+                }
+            }
+        };
+        let (unfilled, halt) = self.match_incoming(id, owner, side, qty, cap, out);
+        if unfilled > 0 {
+            let reason = match halt {
+                Halt::SelfTrade => CancelReason::SelfTrade,
+                Halt::Limit => stop,
+                Halt::Empty | Halt::Filled => CancelReason::NoLiquidity,
+            };
+            out.push(Event::Cancelled {
+                id,
+                qty: unfilled,
+                reason,
+            });
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_limit(
         &mut self,
@@ -486,6 +648,10 @@ impl ReferenceBook {
                 qty -= fill;
                 self.trades += 1;
                 self.reference = Some(best);
+                self.traded = Some(match self.traded {
+                    None => (best, best),
+                    Some((low, high)) => (low.min(best), high.max(best)),
+                });
                 out.push(Event::Trade {
                     trade_id: self.trades,
                     taker,

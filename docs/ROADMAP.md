@@ -31,6 +31,8 @@ allocates on the hot path.
   self-trade prevention (`CancelResting` / `CancelIncoming`), owner checks on cancel and
   modify, and a capacity limit that never refuses an order that can trade.
 - Overflow-free by construction: `max_orders × max_order_qty` must fit in a `u64`.
+- Stop and stop-limit orders: triggered by any price a command traded at, released in a
+  fixed order, cascading; stop-limits rest in the slot the stop held.
 - Iceberg orders: only the display quantity shows; each new tranche goes to the back of
   the queue; the number of tranches per order is bounded.
 - Price band around the last trade price, alongside price protection; a committed

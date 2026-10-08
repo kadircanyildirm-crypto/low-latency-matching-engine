@@ -27,6 +27,7 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 |---|---|
 | `Limit` | Trades at the limit price or better, at each resting order's price. Time in force decides the rest: **GTC** rests the remainder, **IOC** cancels it, **FOK** fills completely or not at all (self-trade prevention included), and **post-only** never takes liquidity, not even after a modify. |
 | Iceberg | A limit order with a display quantity rests showing only that much. Each used-up tranche is replenished at the back of the queue, losing time priority; market data never sees the hidden part. |
+| `Stop` | Waits off the book until a trade reaches its trigger, then becomes a market order or, with a limit price, a GTC limit order. Any price the command traded at counts, and released stops can trigger more in a fixed, documented order. |
 | `Market` | Trades at any price within price protection; the remainder is cancelled. Never rests. |
 | `Cancel` | Removes a resting order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity, so a modify that races a fill can never over-fill. Shrinking at the same price keeps queue priority; anything else re-enters at the back. Only the owner may modify. |
@@ -76,11 +77,11 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 |---|---|
 | Scenario tests | One rule per test, with the exact expected event sequence. |
 | Differential property test | On random configurations and command sequences, the engine matches a deliberately naive reference book event for event and order for order. |
-| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. FOK orders fill exactly when the book could fill them; post-only orders never trade; icebergs trade only what they show; no command's work exceeds what the book in front of it allows. |
+| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. FOK orders fill exactly when the book could fill them; post-only orders never trade; icebergs trade only what they show; exactly the stops a command reaches trigger, in the right order; no command's work exceeds what the book in front of it allows. |
 | Invariant checker tests | `validate()` itself is tested: every corruption it checks for, from broken queue links to owner lists out of step with the book, must be detected. |
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, and a price band. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
-| Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, and computing the digest. |
+| Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, and computing the digest. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared

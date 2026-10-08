@@ -31,6 +31,8 @@ allocates on the hot path.
   self-trade prevention (`CancelResting` / `CancelIncoming`), owner checks on cancel and
   modify, and a capacity limit that never refuses an order that can trade.
 - Overflow-free by construction: `max_orders × max_order_qty` must fit in a `u64`.
+- Iceberg orders: only the display quantity shows; each new tranche goes to the back of
+  the queue; the number of tranches per order is bounded.
 - Snapshots and a state digest: `snapshot()` / `restore()` rebuild an identical book
   without replay, and `digest()` is a platform-independent hash of the complete state.
 - Data structures: a dense price ladder per side with a two-level occupancy bitset,

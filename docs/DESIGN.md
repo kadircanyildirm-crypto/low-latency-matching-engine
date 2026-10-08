@@ -129,7 +129,7 @@ The engine itself has no notion of time or transport.
 | `Limit`, FOK | Trades its whole quantity up to its price, or nothing at all (`FillOrKill`). Never rests. |
 | `Limit`, post-only | Rests without trading. Refused (`PostOnlyWouldCross`) if it would trade on arrival, and so is any later modify that would make it trade. |
 | `Limit` with a display quantity | An iceberg: GTC or post-only, resting with only `display` lots on show. See below. |
-| `Market` | Trades at any price within price protection. The remainder is cancelled with `NoLiquidity`, `PriceProtection` or `SelfTrade`. Never rests. |
+| `Market` | Trades at any price within price protection and the price band. The remainder is cancelled with `NoLiquidity`, `PriceProtection`, `PriceBand` or `SelfTrade`. Never rests. |
 | `Cancel` | Removes the order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
 | `CancelAll` | Removes every resting order of one owner, as on a session disconnect. |
@@ -191,9 +191,33 @@ random sequence.
 | Static price band | Prices outside `[min_price, max_price]` are rejected (`PriceOutOfRange`). |
 | Maximum order size | `qty` must be in `1..=max_order_qty` (`InvalidQuantity`). |
 | Price protection | Measured from the opposite best price when the order arrives. A market order stops trading `price_protection` ticks beyond it (`Cancelled{PriceProtection}`). A limit or modify priced further through is rejected (`PriceOutsideProtection`). If the opposite side is empty, there is nothing to protect against. |
+| Price band | Measured from the reference price: the last trade, or the configured `reference_price` (a previous close, say) before the first one. A limit or modify priced more than `price_band` ticks through it is rejected (`PriceOutsideBand`), and a market order stops there (`Cancelled{PriceBand}`). With both controls on, a market order stops at the tighter cap and names it; a tie names price protection. The reference is part of the state, in snapshots and the digest. |
 | Self-trade prevention | Two orders of the same owner never trade. `CancelResting` removes the resting order and keeps matching. `CancelIncoming` cancels the rest of the incoming order and leaves the book untouched. |
 | Owner ids | A new order must come from an owner id below `max_owners` (`InvalidOwner`). This is the first check, before quantity and price. |
 | Ownership | Cancels and modifies of someone else's order are rejected as `UnknownOrder`, exactly like a missing order, so others' order ids do not leak. |
+
+**What each price control is good for, measured.** Price protection guards against fat
+fingers relative to the book as it stands. But a stale order far from the market anchors
+it: orders priced at the market are then rejected as if they were mistakes. A price band
+relative to the last trade cannot be moved by stale orders, but it has the opposite
+weakness. Once the market drifts more than the band away from the last trade without
+trading, every order priced at the new market falls outside the band, nothing trades, and
+the reference never moves again. `tests/market_health.rs` measures both under a harsh flow,
+whose participants price off a fair value that drifts on its own, with four owners under
+`CancelIncoming`, which leaves stale orders behind:
+
+| Control | Time one-sided | Trades |
+|---|---:|---:|
+| none | 0% | 199,807 |
+| protection 1 / 2 / 4 ticks | 22% / 25% / 24% | 105k / 106k / 113k |
+| band 1 / 2 / 4 / 8 / 50 ticks | 70% / 90% / 83% / 62% / 46% | 216 / 621 / 9k / 34k / 96k |
+
+Pulling the band's reference into the current spread barely helped (72-85% one-sided at
+1-4 ticks), and it let a stale quote above the last trade move the reference, the very
+weakness the band is meant to avoid, so it was dropped. Exchanges re-anchor a band
+differently: a breach halts trading, and a reopening auction sets a new reference.
+Halts and auctions are the next step on the roadmap. Until then, a band suits flows that
+trade within it, and the banded soak flow uses a 10-tick band for that reason.
 
 ## 7. Capacity and admission
 
@@ -259,7 +283,8 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 | `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
 | `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
-| `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for two flows that between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
+| `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for three flows that between them cover both self-trade policies, protection and band stops, and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
+| `tests/market_health.rs` | An ignored experiment, run by hand: how long each price control leaves one side of the book empty under a harsh flow (see §6). |
 | `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |
 | `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), in a deep book, and under frequent mass cancels, and none when computing the digest. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
@@ -278,7 +303,7 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
-| Price protection is measured from the opposite best at arrival, not from a reference or last-trade price, so a stale order far from the market anchors the band, and orders priced at the market can be rejected as fat-finger orders. There are no dynamic bands for limit orders resting away from the market | Phase 7: reference price and dynamic bands |
+| A price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6) | Next: trading halts and a reopening auction that sets a new reference |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | No market states: trading halts, opening and closing auctions | Phase 7 |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |

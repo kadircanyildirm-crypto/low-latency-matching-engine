@@ -114,6 +114,39 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
     assert!(counts.replenishes > 100, "{counts:?}");
 }
 
+/// A tight price band around the last trade and no price protection, so the band does all
+/// the stopping and rejecting.
+fn banded_config() -> (WorkloadConfig, BookConfig) {
+    let cfg = WorkloadConfig {
+        seed: 11,
+        mix: Mix {
+            passive_limit: 50,
+            aggressive_limit: 10,
+            market: 15,
+            cancel: 20,
+            mass_cancel: 0,
+            modify: 5,
+        },
+        ..config()
+    };
+    let book_cfg = BookConfig {
+        price_protection: None,
+        price_band: Some(10),
+        reference_price: Some(cfg.initial_mid),
+        ..cfg.book_config()
+    };
+    (cfg, book_cfg)
+}
+
+#[test]
+fn synthetic_flow_matches_reference_under_a_price_band() {
+    let (cfg, book_cfg) = banded_config();
+    let counts = soak(cfg, book_cfg, 100_000);
+    assert!(counts.band_cancels > 100, "{counts:?}");
+    assert!(counts.rejected > 100, "{counts:?}");
+    assert!(counts.trades > 1_000, "{counts:?}");
+}
+
 /// Fingerprint of every event and the final book after 100k commands of synthetic flow,
 /// and the final book's [`OrderBook::digest`].
 fn fingerprint(cfg: WorkloadConfig, book_cfg: BookConfig) -> (u64, u64) {
@@ -151,8 +184,8 @@ fn same_commands_produce_the_same_events() {
 
 /// Pinned values: CI runs this on Linux, Windows and macOS, so a match proves the engine and
 /// its state digest are deterministic across platforms, which replay on a standby machine
-/// depends on. Between them the two runs cover both self-trade policies, protection stops
-/// and rejections. They also flag any change in behaviour; if a change is
+/// depends on. Between them the three runs cover both self-trade policies, protection and
+/// band stops, and rejections. They also flag any change in behaviour; if a change is
 /// intended, update the constants.
 #[test]
 fn output_matches_the_golden_fingerprints() {
@@ -174,9 +207,18 @@ fn output_matches_the_golden_fingerprints() {
         digest, GOLDEN_PROTECTED_DIGEST,
         "protected flow digest: got {digest:#018x}"
     );
+    let (cfg, book_cfg) = banded_config();
+    let (events, digest) = fingerprint(cfg, book_cfg);
+    assert_eq!(events, GOLDEN_BANDED, "banded flow: got {events:#018x}");
+    assert_eq!(
+        digest, GOLDEN_BANDED_DIGEST,
+        "banded flow digest: got {digest:#018x}"
+    );
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
 const GOLDEN_DEFAULT_DIGEST: u64 = 0x8644_8cf9_1149_88fb;
 const GOLDEN_PROTECTED: u64 = 0x0266_f614_e608_4130;
 const GOLDEN_PROTECTED_DIGEST: u64 = 0xaf20_bd4d_cdac_6296;
+const GOLDEN_BANDED: u64 = 0xdbe4_19eb_3a15_01ed;
+const GOLDEN_BANDED_DIGEST: u64 = 0x5a0b_ea06_815e_9572;

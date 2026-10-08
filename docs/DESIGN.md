@@ -40,6 +40,8 @@ The [verification](#10-verification) section says which one.
 
  occupancy bitset: 1 bit per level + 1 summary bit per 64 words
  id index: FxHashMap<OrderId, slot>, reserved at 2x capacity
+ iceberg parts: (display, visible) per slot, beside the slab; a level's total counts
+                what its orders show
  owner lists: one list per owner, head/tail in a table indexed by owner id,
               prev/next in a links array indexed by order slot
 ```
@@ -107,7 +109,7 @@ does not need to record it.
 
 | Command | Events |
 |---|---|
-| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only |
+| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention, and `Replenished` right after a trade that uses up an iceberg's tranche), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only |
 | `Cancel` | `Cancelled{Requested}` or `Rejected` |
 | `Modify` | `Rejected`, or `Modified` followed, if priority is lost, by the events of a new limit order |
 | `CancelAll` | `Cancelled{MassCancel}` for each of the owner's orders in book order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing resting |
@@ -126,6 +128,7 @@ The engine itself has no notion of time or transport.
 | `Limit`, IOC | Trades up to its price; the remainder is cancelled (`ImmediateOrCancel`, or `SelfTrade` under `CancelIncoming`). Never rests. |
 | `Limit`, FOK | Trades its whole quantity up to its price, or nothing at all (`FillOrKill`). Never rests. |
 | `Limit`, post-only | Rests without trading. Refused (`PostOnlyWouldCross`) if it would trade on arrival, and so is any later modify that would make it trade. |
+| `Limit` with a display quantity | An iceberg: GTC or post-only, resting with only `display` lots on show. See below. |
 | `Market` | Trades at any price within price protection. The remainder is cancelled with `NoLiquidity`, `PriceProtection` or `SelfTrade`. Never rests. |
 | `Cancel` | Removes the order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
@@ -146,6 +149,24 @@ The cases:
 | same price, `qty <= current total` | Open quantity shrinks in place; **queue priority is kept** |
 | anything else | Cancel/replace: back of the queue at the new price; may trade |
 
+**Icebergs show one tranche at a time.** A resting iceberg shows at most `display` lots;
+market data (`depth`, `best_bid`, `Rested{visible}`) sees only those, while its owner sees
+the whole open quantity. A trade takes at most what the order shows. When a tranche is used
+up, the next one, `min(display, leaves)`, goes to the **back** of the level's queue and
+loses time priority, and `Replenished` reports it. A taker that keeps going therefore meets
+the other orders at that price before it meets the iceberg again. An incoming iceberg
+trades with its whole quantity; only the part that rests is hidden. Modifies cut the hidden
+part first, so shrinking an iceberg keeps its tranche on show and its priority.
+
+**An iceberg may be cut into at most `max_iceberg_tranches` tranches** (default 10): its
+display times that must cover its total quantity. The rule exists because the random tests
+found what happens without it. An iceberg showing 3 lots of 2 × 10¹⁸, met by an equally
+large taker, made one command produce a trade and a new tranche for every 3 lots. In
+practice it never finished. Exchanges bound this with a minimum display quantity. A ratio
+bound also holds when `max_order_qty` is huge, and it makes the work of any command
+proportional to the orders it reaches. The specification checker now enforces exactly
+that for every command.
+
 A modify that re-enters the book works like a GTC order. A post-only order keeps its
 restriction, though: the flag is stored with the resting order and its snapshot, so a
 market maker's order can never take liquidity, whatever it is modified to.
@@ -155,7 +176,9 @@ self-trade prevention too. Under `CancelResting`, the owner's own orders in the 
 be cancelled, not traded, so they contribute nothing. Under `CancelIncoming`, matching
 would stop at the first of them, so nothing behind it counts. So the engine walks the
 opposite side in matching order, without changing anything, and sums what the order could
-really take. If that is enough it matches normally, otherwise it is killed and the book is
+really take. Icebergs add a twist: at a level without an own order, a taker cycles through
+every tranche and gets the hidden quantity too. Under `CancelIncoming`, though, new
+tranches land behind the owner's order that stops the match, so they are out of reach. If that is enough it matches normally, otherwise it is killed and the book is
 untouched. The walk stops as soon as the quantity is covered, so it costs no more than the
 match it precedes. The reference book does not reimplement this rule: it runs the match on
 a copy of itself and keeps the copy only if every lot traded. The two must agree on every
@@ -234,7 +257,7 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 |---|---|
 | `tests/scenarios.rs` | One rule per test, with the exact expected event sequence. |
 | `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
-| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; and a command is rejected exactly when a rule requires it, with that rule's reason. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
+| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
 | `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for two flows that between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
 | `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |

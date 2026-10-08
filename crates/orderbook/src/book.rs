@@ -1,5 +1,9 @@
 //! The limit order book and its matching logic.
 
+mod snapshot;
+
+pub use snapshot::{BookSnapshot, SnapshotError, SnapshotOrder};
+
 use rustc_hash::FxHashMap;
 
 use crate::bitset::LevelBitset;

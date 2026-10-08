@@ -99,8 +99,9 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
     assert!(counts.rejected > 100, "{counts:?}");
 }
 
-/// Fingerprint of every event and the final book after 100k commands of synthetic flow.
-fn fingerprint(cfg: WorkloadConfig, book_cfg: BookConfig) -> u64 {
+/// Fingerprint of every event and the final book after 100k commands of synthetic flow,
+/// and the final book's [`OrderBook::digest`].
+fn fingerprint(cfg: WorkloadConfig, book_cfg: BookConfig) -> (u64, u64) {
     let mut book = OrderBook::new(book_cfg);
     let mut workload = Workload::new(cfg);
     let mut events = Vec::new();
@@ -121,7 +122,7 @@ fn fingerprint(cfg: WorkloadConfig, book_cfg: BookConfig) -> u64 {
                 .for_each(|&v| hash.write_u64(v));
         }
     }
-    hash.finish()
+    (hash.finish(), book.digest())
 }
 
 #[test]
@@ -133,23 +134,34 @@ fn same_commands_produce_the_same_events() {
     );
 }
 
-/// Pinned values: CI runs this on Linux, Windows and macOS, so a match proves the engine is
-/// deterministic across platforms, which replay on a standby machine depends on. Between
-/// them the two runs cover both self-trade policies, protection stops and rejections. They
-/// also flag any change in behaviour; if a change is intended, update the constants.
+/// Pinned values: CI runs this on Linux, Windows and macOS, so a match proves the engine and
+/// its state digest are deterministic across platforms, which replay on a standby machine
+/// depends on. Between them the two runs cover both self-trade policies, protection stops
+/// and rejections. They also flag any change in behaviour; if a change is intended, update
+/// the constants.
 #[test]
 fn output_matches_the_golden_fingerprints() {
     let cfg = config();
-    let default = fingerprint(cfg, cfg.book_config());
-    assert_eq!(default, GOLDEN_DEFAULT, "default flow: got {default:#018x}");
+    let (events, digest) = fingerprint(cfg, cfg.book_config());
+    assert_eq!(events, GOLDEN_DEFAULT, "default flow: got {events:#018x}");
+    assert_eq!(
+        digest, GOLDEN_DEFAULT_DIGEST,
+        "default flow digest: got {digest:#018x}"
+    );
 
     let (cfg, book_cfg) = protected_config();
-    let protected = fingerprint(cfg, book_cfg);
+    let (events, digest) = fingerprint(cfg, book_cfg);
     assert_eq!(
-        protected, GOLDEN_PROTECTED,
-        "protected flow: got {protected:#018x}"
+        events, GOLDEN_PROTECTED,
+        "protected flow: got {events:#018x}"
+    );
+    assert_eq!(
+        digest, GOLDEN_PROTECTED_DIGEST,
+        "protected flow digest: got {digest:#018x}"
     );
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x81af_9e3f_bb93_84c6;
 const GOLDEN_PROTECTED: u64 = 0x3c49_10ff_8e00_3caa;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0xc0c3_b878_27a9_adc9;

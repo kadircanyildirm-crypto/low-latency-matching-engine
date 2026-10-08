@@ -78,8 +78,13 @@ fn assert_no_allocations(cfg: WorkloadConfig, warmup: usize, measured: usize) ->
         step(&mut counts);
     }
     let allocated = allocations() - before;
-
     assert_eq!(allocated, 0, "hot path allocated {allocated} times");
+
+    // A replica compares digests often, so computing one must not allocate either.
+    let before = allocations();
+    std::hint::black_box(book.digest());
+    assert_eq!(allocations(), before, "digest allocated");
+
     assert!(
         counts.trades > 0
             && counts.cancelled > 0

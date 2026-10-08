@@ -2,7 +2,7 @@
 
 This document explains what the order book in `crates/orderbook` does, how, and why. It
 also says what it deliberately does not do yet. Every claim here is backed by a test.
-The [verification](#9-verification) section says which one.
+The [verification](#10-verification) section says which one.
 
 ## 1. Goals
 
@@ -148,7 +148,37 @@ This rule exists because an earlier version had no limit. Two orders of `u64::MA
 lots at one price made the level total wrap to 1 in release builds, and the old
 `validate()` wrapped the same way and reported success.
 
-## 9. Verification
+## 9. Snapshots and state digest
+
+`snapshot()` returns the book's complete state:
+- its configuration;
+- the trade counter;
+- every resting order with its owner, price, and open and filled quantity.
+
+Orders come in canonical order: bids best price first, then asks best price first, and
+each level in time priority. `restore()` rebuilds a book from a snapshot directly,
+without replaying commands. It refuses snapshots the engine could never have produced:
+too many orders, duplicate ids, orders that could not rest, a crossed book, or an
+exhausted trade counter.
+
+Two properties make snapshots safe to build on:
+
+- **Complete.** A property test takes a snapshot at a random point of a random command
+  sequence, restores it, and feeds the rest of the sequence to both books. Their events
+  must be identical. Any state the snapshot left out (the trade counter, a fill history, a
+  queue position) would sooner or later make them drift apart.
+- **Canonical.** Two books are in the same state exactly when their snapshots are equal.
+
+`digest()` is a 64-bit FNV-1a hash over a fixed little-endian encoding of the same state,
+computed without allocating. A replica or a replay compares digests instead of shipping
+whole snapshots. The encoding names every enum value explicitly, so reordering a
+declaration cannot change it by accident. One test changes each field in turn and requires
+the digest to change. Digests pinned in the golden tests are checked on Linux, Windows and
+macOS. The digest detects accidental divergence; it is not a cryptographic hash.
+
+Snapshots are plain data. Writing them to disk, and deciding when, belongs to Phase 2.
+
+## 10. Verification
 
 | Layer | What it shows |
 |---|---|
@@ -156,21 +186,21 @@ lots at one price made the level total wrap to 1 in release builds, and the old
 | `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
 | `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; and a command is rejected exactly when a rule requires it, with that rule's reason. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
-| `tests/soak.rs` (golden) | Pinned fingerprints of all events for two flows, which between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
-| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), and in a deep book. |
+| `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for two flows that between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
+| `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |
+| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), and in a deep book, and none when computing the digest. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
-| Mutation testing | `cargo mutants` injects 316 small faults into the engine. The tests detect every one of the 297 that compile ([results](../README.md#mutation-testing)). |
+| Mutation testing | `cargo mutants` injects 340 small faults into the engine. The tests detect every one of the 319 that compile ([results](../README.md#mutation-testing)). |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just
 outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, with
 `max_order_qty` itself either small or at the overflow limit.
 
-## 10. Known limitations and deliberate deferrals
+## 11. Known limitations and deliberate deferrals
 
 | Limitation | Plan |
 |---|---|
-| No way to restore a book from a snapshot (orders with their fill history, the trade counter), and no public digest of the book's state | Phase 2: needed to start from a snapshot instead of replaying from the beginning, and to show that a replay reproduces the live state |
 | No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
 | No mass cancel: the book keeps no list of each owner's orders, so pulling all of them takes one `Cancel` per order | Phase 3: cancel-on-disconnect needs it |
 | The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |

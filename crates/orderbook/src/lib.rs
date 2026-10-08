@@ -46,7 +46,10 @@ mod pool;
 mod types;
 pub mod workload;
 
-pub use book::{BookConfig, Depth, LevelInfo, OrderBook, OrderInfo, Queue, QueuedOrder};
+pub use book::{
+    BookConfig, BookSnapshot, Depth, LevelInfo, OrderBook, OrderInfo, Queue, QueuedOrder,
+    SnapshotError, SnapshotOrder,
+};
 pub use types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
     SelfTradePolicy, Side, TradeId,

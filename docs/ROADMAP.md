@@ -29,6 +29,8 @@ allocates on the hot path.
   self-trade prevention (`CancelResting` / `CancelIncoming`), owner checks on cancel and
   modify, and a capacity limit that never refuses an order that can trade.
 - Overflow-free by construction: `max_orders × max_order_qty` must fit in a `u64`.
+- Snapshots and a state digest: `snapshot()` / `restore()` rebuild an identical book
+  without replay, and `digest()` is a platform-independent hash of the complete state.
 - Data structures: a dense price ladder per side with a two-level occupancy bitset,
   intrusive FIFO queues in a preallocated slab, and an `FxHashMap` id index reserved at
   twice the capacity.
@@ -59,10 +61,9 @@ path, latency report in the README. All met.
 - An append-only journal file: a fixed header plus length and CRC32 for each record.
 - Crash recovery: detect a half-written final record and truncate it.
 - Snapshots: write the book's state at intervals; on startup, load the snapshot and replay
-  the tail of the log. The order book needs a restore API for this: resting orders with
-  their fill history, and the trade counter.
-- State hash: a public, platform-independent digest of the book. After a replay it must
-  equal the hash from the live run.
+  the tail of the log. The book already provides `snapshot()` / `restore()`; this phase
+  adds the on-disk format and the schedule.
+- State hash: after a replay, the book's `digest()` must equal the live run's.
 - `fsync` policies (every command / group commit / leave it to the OS) and a benchmark of
   each one's effect on latency.
 

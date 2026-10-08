@@ -43,6 +43,16 @@ Risk controls built into the core:
 Every trade carries a gap-free trade id and both sides' remaining open quantity, so
 participants can track their orders from events alone.
 
+### Snapshots and state digest
+
+`snapshot()` captures the book's complete state, and `restore()` rebuilds an identical
+book from it without replaying commands. A property test takes a snapshot at a random
+point, restores it, and requires the copy to emit exactly the original's events from then
+on, so nothing the book depends on can be left out. `digest()` hashes the same state into
+64 bits that are identical on every platform, without allocating. A replica or a replay
+can compare it against the live book. Details are in
+[DESIGN.md §9](docs/DESIGN.md#9-snapshots-and-state-digest).
+
 ### Data structures
 
 - **Price ladder:** each side is a dense array of levels indexed by
@@ -63,7 +73,8 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. |
 | Invariant checker tests | `validate()` itself is tested: each of 11 kinds of corrupted state must be detected. |
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies. |
-| Zero-allocation tests | Normal flow, a permanently full book, and a deep book. |
+| Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
+| Zero-allocation tests | Normal flow, a permanently full book, a deep book, and computing the digest. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
@@ -79,13 +90,15 @@ points at behaviour the tests do not pin down.
 
 | Outcome | Mutants | Meaning |
 |---|---:|---|
-| Caught | 274 | A test failed. |
+| Caught | 296 | A test failed. |
 | Timed out | 23 | The mutant made the tests hang, so it was detected too. For example, if `level_emptied` does nothing, an empty level stays the best price and the matching loop never leaves it. |
-| Unviable | 19 | The mutant does not compile. |
+| Unviable | 21 | The mutant does not compile. |
 | **Missed** | **0** | |
 
-Every one of the 297 mutants that compile is detected. `src/workload.rs`, the benchmark's
-order-flow generator, is excluded because it is not part of the engine.
+Every one of the 319 mutants that compile is detected. `src/workload.rs`, the benchmark's
+order-flow generator, is excluded because it is not part of the engine. A new module gets
+its own run when it lands (`cargo mutants -f <file>`), and the totals above include those
+runs.
 
 The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
 `protection_cap`. The clamp turned out to have no effect: the matcher compares levels

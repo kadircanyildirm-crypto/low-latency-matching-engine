@@ -20,11 +20,12 @@ use std::collections::{BTreeMap, VecDeque};
 use common::strategies::scenario;
 use common::{Snapshot, snapshot};
 use orderbook::CancelReason::{
-    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade,
+    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceBand, PriceProtection, Requested,
+    SelfTrade,
 };
 use orderbook::{
-    BookConfig, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder, RejectReason,
-    SelfTradePolicy, Side, TimeInForce,
+    BookConfig, CancelReason, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder,
+    RejectReason, SelfTradePolicy, Side, TimeInForce,
 };
 use proptest::prelude::*;
 
@@ -64,6 +65,7 @@ fn ensure(condition: bool, message: impl Into<String>) -> Check {
 struct State {
     snapshot: Snapshot,
     trade_count: u64,
+    reference: Option<Price>,
 }
 
 impl State {
@@ -71,6 +73,7 @@ impl State {
         Self {
             snapshot: snapshot(book),
             trade_count: book.trade_count(),
+            reference: book.reference_price(),
         }
     }
 
@@ -126,6 +129,7 @@ impl State {
         State {
             snapshot: from_books(books),
             trade_count: self.trade_count,
+            reference: self.reference,
         }
     }
 }
@@ -174,6 +178,15 @@ fn check(
             events.len(),
             before.order_count()
         ),
+    )?;
+    // The band's reference is the last trade's price, whatever the command.
+    let last_trade = events.iter().rev().find_map(|event| match event {
+        Event::Trade { price, .. } => Some(*price),
+        _ => None,
+    });
+    ensure(
+        after.reference == last_trade.or(before.reference),
+        "the reference price must be the last trade's",
     )?;
     let required = required_rejection(cfg, before, command);
 
@@ -229,6 +242,7 @@ fn check(
                 side,
                 limit: Some(price),
                 cap: None,
+                stop: None,
                 tif: Some(tif),
                 post_only: tif == TimeInForce::PostOnly,
                 display,
@@ -244,12 +258,14 @@ fn check(
             qty,
         } => {
             ensure(first == Event::Accepted { id }, "must start with Accepted")?;
+            let (cap, stop) = market_cap(cfg, before, side);
             let taker = Taker {
                 id,
                 owner,
                 side,
                 limit: None,
-                cap: protection_cap(cfg, before, side),
+                cap,
+                stop,
                 tif: None,
                 post_only: false,
                 display: None,
@@ -308,6 +324,7 @@ fn check(
                 side,
                 limit: Some(price),
                 cap: None,
+                stop: None,
                 tif: Some(TimeInForce::Gtc),
                 post_only: order.post_only,
                 display: order.display,
@@ -351,13 +368,38 @@ fn check(
     }
 }
 
-fn protection_cap(cfg: &BookConfig, before: &State, side: Side) -> Option<Price> {
-    let ticks = i128::from(cfg.price_protection?);
-    let best = i128::from(before.best(side.opposite())?);
-    Some(match side {
-        Side::Buy => (best + ticks).min(i128::from(cfg.max_price)) as Price,
-        Side::Sell => (best - ticks).max(i128::from(cfg.min_price)) as Price,
-    })
+/// The furthest price a market order may trade at, and the reason it gives if it stops
+/// there: the tighter of price protection (from the opposite best) and the price band (from
+/// the reference price); price protection when they are equal.
+fn market_cap(
+    cfg: &BookConfig,
+    before: &State,
+    side: Side,
+) -> (Option<Price>, Option<CancelReason>) {
+    let through = |from: Price, ticks: u32| match side {
+        Side::Buy => from + i64::from(ticks),
+        Side::Sell => from - i64::from(ticks),
+    };
+    let protection = cfg
+        .price_protection
+        .zip(before.best(side.opposite()))
+        .map(|(ticks, best)| through(best, ticks));
+    let band = cfg
+        .price_band
+        .zip(before.reference)
+        .map(|(ticks, reference)| through(reference, ticks));
+    match (protection, band) {
+        (None, None) => (None, None),
+        (Some(p), None) => (Some(p), Some(PriceProtection)),
+        (None, Some(b)) => (Some(b), Some(PriceBand)),
+        (Some(p), Some(b)) => {
+            if within(side, b, p) && b != p {
+                (Some(b), Some(PriceBand))
+            } else {
+                (Some(p), Some(PriceProtection))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -367,8 +409,10 @@ struct Taker {
     side: Side,
     /// Limit price; `None` for market orders.
     limit: Option<Price>,
-    /// Price protection cap for market orders.
+    /// Cap of a market order: the tighter of price protection and the price band.
     cap: Option<Price>,
+    /// The reason a market order gives when it stops at `cap`.
+    stop: Option<CancelReason>,
     /// Time in force; `None` for market orders.
     tif: Option<TimeInForce>,
     /// A post-only order, or a modify of one: it may not trade, and rests post-only.
@@ -654,11 +698,14 @@ fn check_execution(
                     )?;
                     ensure(exhausted, "NoLiquidity while orders remain")?;
                 }
-                PriceProtection => {
-                    ensure(taker.cap.is_some(), "PriceProtection without protection")?;
+                PriceProtection | PriceBand => {
+                    ensure(
+                        taker.stop == Some(*reason),
+                        "a market order must name the tighter of its caps",
+                    )?;
                     ensure(
                         !exhausted && next_reachable.is_none(),
-                        "PriceProtection although the next order is within the cap",
+                        "a market order stopped although the next order is within its cap",
                     )?;
                 }
                 ImmediateOrCancel => {
@@ -739,6 +786,18 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             }
         })
     };
+    let beyond_band = |side: Side, price: Price| {
+        cfg.price_band
+            .zip(before.reference)
+            .is_some_and(|(ticks, reference)| {
+                let (price, reference, ticks) =
+                    (i128::from(price), i128::from(reference), i128::from(ticks));
+                match side {
+                    Side::Buy => price > reference + ticks,
+                    Side::Sell => price < reference - ticks,
+                }
+            })
+    };
     let crosses = |side: Side, price: Price| match side {
         Side::Buy => before.best(Side::Sell).is_some_and(|ask| price >= ask),
         Side::Sell => before.best(Side::Buy).is_some_and(|bid| price <= bid),
@@ -768,6 +827,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(DuplicateOrderId)
             } else if beyond_protection(side, price) {
                 Some(PriceOutsideProtection)
+            } else if beyond_band(side, price) {
+                Some(PriceOutsideBand)
             } else if tif == TimeInForce::PostOnly && crosses(side, price) {
                 Some(PostOnlyWouldCross)
             } else if may_rest && full && !crosses(side, price) {
@@ -812,6 +873,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             let replaces = leaves > 0 && !in_place;
             if replaces && beyond_protection(side, price) {
                 Some(PriceOutsideProtection)
+            } else if replaces && beyond_band(side, price) {
+                Some(PriceOutsideBand)
             } else if replaces && order.post_only && crosses(side, price) {
                 Some(PostOnlyWouldCross)
             } else if replaces && order.display.is_some_and(|d| !covers(d, qty)) {

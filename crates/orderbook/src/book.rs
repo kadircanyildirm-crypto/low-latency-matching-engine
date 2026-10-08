@@ -42,6 +42,15 @@ pub struct BookConfig {
     /// arrives. Market orders stop trading beyond it; limit orders priced further through
     /// it are rejected. `None` disables protection.
     pub price_protection: Option<u32>,
+    /// Dynamic price band in ticks around the reference price: the last trade, or
+    /// `reference_price` before the first one. A limit order or modify priced more than
+    /// this through the reference is rejected, and a market order stops at the band. Unlike
+    /// price protection, a stale order far from the market cannot move it. `None` disables
+    /// the band.
+    pub price_band: Option<u32>,
+    /// Reference price before the first trade, such as the previous close. `None` leaves
+    /// the band inactive until something trades.
+    pub reference_price: Option<Price>,
     /// What happens when an order would trade against an order of the same owner.
     pub self_trade: SelfTradePolicy,
 }
@@ -67,6 +76,8 @@ impl BookConfig {
             max_order_qty: u64::MAX / max_orders_nonzero as u64,
             max_iceberg_tranches: Self::DEFAULT_MAX_ICEBERG_TRANCHES,
             price_protection: None,
+            price_band: None,
+            reference_price: None,
             self_trade: SelfTradePolicy::CancelResting,
         }
     }
@@ -295,7 +306,7 @@ enum Halt {
     Filled,
     /// The opposite side has no more orders.
     Empty,
-    /// The opposite best no longer crosses the taker's limit (or protection cap).
+    /// The opposite best no longer crosses the taker's limit (or market cap).
     Limit,
     /// Self-trade prevention cancelled the rest of the taker.
     SelfTrade,
@@ -319,6 +330,8 @@ pub struct OrderBook {
     /// Sort buffer for mass cancels, sized for every resting order up front.
     scratch: Vec<MassCancelKey>,
     next_trade_id: TradeId,
+    /// Level of the last trade, or of the configured reference price before the first one.
+    reference: Option<u32>,
 }
 
 /// Sort key that puts an owner's orders in book order: side (bids first), price priority,
@@ -332,8 +345,8 @@ impl OrderBook {
     /// # Panics
     ///
     /// If `max_price < min_price`, the band spans `u32::MAX` levels or more, `max_orders`
-    /// is zero or `u32::MAX`, `max_order_qty` is zero, or `max_orders * max_order_qty`
-    /// does not fit in a `u64`.
+    /// is zero or `u32::MAX`, `max_order_qty` is zero, `max_orders * max_order_qty`
+    /// does not fit in a `u64`, or `reference_price` lies outside the price band.
     pub fn new(config: BookConfig) -> Self {
         let levels = i128::from(config.max_price) - i128::from(config.min_price) + 1;
         assert!(levels >= 1, "max_price must be >= min_price");
@@ -352,6 +365,14 @@ impl OrderBook {
         let levels = levels as usize;
         let mut index = FxHashMap::default();
         index.reserve((config.max_orders as usize).saturating_mul(2));
+        let reference = config.reference_price.map(|price| {
+            let offset = i128::from(price) - i128::from(config.min_price);
+            assert!(
+                (0..levels as i128).contains(&offset),
+                "reference_price outside the price band"
+            );
+            offset as u32
+        });
         Self {
             config,
             bids: HalfBook::new(Side::Buy, levels),
@@ -361,6 +382,7 @@ impl OrderBook {
             owners: Owners::new(config.max_owners, config.max_orders),
             scratch: Vec::with_capacity(config.max_orders as usize),
             next_trade_id: 1,
+            reference,
         }
     }
 
@@ -429,6 +451,9 @@ impl OrderBook {
         }
         if self.outside_protection(side, level) {
             return Err(RejectReason::PriceOutsideProtection);
+        }
+        if self.outside_band(side, level) {
+            return Err(RejectReason::PriceOutsideBand);
         }
         if tif == TimeInForce::PostOnly && self.crosses(side, level) {
             return Err(RejectReason::PostOnlyWouldCross);
@@ -536,11 +561,22 @@ impl OrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
         sink.on_event(Event::Accepted { id });
-        let cap = self.protection_cap(side);
+        // A market order stops at the tighter of its two caps, and says which one it was.
+        let (protection, band) = (self.protection_cap(side), self.band_cap(side));
+        let band_is_tighter = match (protection, band) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(protection), Some(band)) => match side {
+                Side::Buy => band < protection,
+                Side::Sell => band > protection,
+            },
+        };
+        let cap = if band_is_tighter { band } else { protection };
         let (unfilled, halt) = self.match_incoming(id, owner, side, qty, cap, sink);
         if unfilled > 0 {
             let reason = match halt {
                 Halt::SelfTrade => CancelReason::SelfTrade,
+                Halt::Limit if band_is_tighter => CancelReason::PriceBand,
                 Halt::Limit => CancelReason::PriceProtection,
                 Halt::Empty | Halt::Filled => CancelReason::NoLiquidity,
             };
@@ -651,6 +687,9 @@ impl OrderBook {
         if self.outside_protection(node.side, level) {
             return Err(RejectReason::PriceOutsideProtection);
         }
+        if self.outside_band(node.side, level) {
+            return Err(RejectReason::PriceOutsideBand);
+        }
         if node.post_only && self.crosses(node.side, level) {
             return Err(RejectReason::PostOnlyWouldCross);
         }
@@ -740,6 +779,7 @@ impl OrderBook {
             index,
             owners,
             next_trade_id,
+            reference,
             ..
         } = self;
         let resting = match taker_side {
@@ -786,6 +826,7 @@ impl OrderBook {
                 qty -= fill;
                 let trade_id = *next_trade_id;
                 *next_trade_id += 1;
+                *reference = Some(level);
                 sink.on_event(Event::Trade {
                     trade_id,
                     taker,
@@ -911,6 +952,31 @@ impl OrderBook {
         }
     }
 
+    /// Whether a limit price lies more than `price_band` ticks through the reference price.
+    #[inline]
+    fn outside_band(&self, side: Side, level: u32) -> bool {
+        let (Some(ticks), Some(reference)) = (self.config.price_band, self.reference) else {
+            return false;
+        };
+        let (level, reference, ticks) = (u64::from(level), u64::from(reference), u64::from(ticks));
+        match side {
+            Side::Buy => level > reference + ticks,
+            Side::Sell => level + ticks < reference,
+        }
+    }
+
+    /// The furthest level a market order may trade at under the price band, if the band is
+    /// on and there is a reference price.
+    #[inline]
+    fn band_cap(&self, side: Side) -> Option<u32> {
+        let ticks = self.config.price_band?;
+        let reference = self.reference?;
+        Some(match side {
+            Side::Buy => reference.saturating_add(ticks),
+            Side::Sell => reference.saturating_sub(ticks),
+        })
+    }
+
     /// The furthest level a market order may trade at, if protection is on and the
     /// opposite side has orders.
     #[inline]
@@ -964,6 +1030,12 @@ impl OrderBook {
     /// Number of resting orders.
     pub fn order_count(&self) -> usize {
         self.pool.live()
+    }
+
+    /// The price the band is measured from: the last trade, or the configured reference
+    /// price before the first trade.
+    pub fn reference_price(&self) -> Option<Price> {
+        self.reference.map(|level| self.price_of(level))
     }
 
     /// Number of trades executed so far; the next trade gets id `trade_count() + 1`.

@@ -5,7 +5,8 @@
 //! self-trade prevention stays out of the way.
 
 use orderbook::CancelReason::{
-    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade,
+    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceBand, PriceProtection, Requested,
+    SelfTrade,
 };
 use orderbook::Event::*;
 use orderbook::RejectReason::*;
@@ -1083,6 +1084,116 @@ fn modifies_into_the_protection_band_are_rejected() {
         [rejected(4, PriceOutsideProtection)]
     );
     assert_eq!(queue(&b, Buy, 90), [(4, 1)]);
+}
+
+/// A 5-tick band around a reference of 100, and asks from 100 to 110.
+fn banded_book() -> OrderBook {
+    let mut b = OrderBook::new(BookConfig {
+        price_band: Some(5),
+        reference_price: Some(100),
+        ..CFG
+    });
+    for (id, price) in (1..).zip(100..=110) {
+        run(&mut b, limit(id, Sell, price, 1));
+    }
+    b
+}
+
+#[test]
+fn limit_orders_priced_through_the_band_are_rejected() {
+    let mut b = banded_book();
+    assert_eq!(b.reference_price(), Some(100));
+    assert_eq!(
+        run(&mut b, limit(20, Buy, 106, 1)),
+        [rejected(20, PriceOutsideBand)]
+    );
+    assert_eq!(
+        run(&mut b, limit(21, Sell, 94, 1)),
+        [rejected(21, PriceOutsideBand)]
+    );
+    // At the edge is fine, and so is anything on the passive side.
+    assert_eq!(fills(&run(&mut b, limit(22, Buy, 105, 1))), [(1, 100, 1)]);
+    assert_eq!(run(&mut b, limit(23, Buy, 50, 1))[0], Accepted { id: 23 });
+    assert_eq!(run(&mut b, limit(24, Sell, 200, 1))[0], Accepted { id: 24 });
+}
+
+#[test]
+fn the_band_follows_the_last_trade() {
+    let mut b = banded_book();
+    run(&mut b, limit(20, Buy, 104, 5));
+    assert_eq!(b.reference_price(), Some(104));
+    // 109 was 9 ticks through the old reference; it is 5 through the new one.
+    assert_eq!(fills(&run(&mut b, limit(21, Buy, 109, 1))), [(6, 105, 1)]);
+    // Modifies are held to the band too.
+    run(&mut b, limit(22, Buy, 90, 1));
+    assert_eq!(
+        run(&mut b, modify(22, 111, 1)),
+        [rejected(22, PriceOutsideBand)]
+    );
+}
+
+#[test]
+fn market_orders_stop_at_the_band() {
+    let mut b = banded_book();
+    let events = run(&mut b, market(20, Buy, 10));
+    assert_eq!(
+        fills(&events),
+        [
+            (1, 100, 1),
+            (2, 101, 1),
+            (3, 102, 1),
+            (4, 103, 1),
+            (5, 104, 1),
+            (6, 105, 1)
+        ]
+    );
+    assert_eq!(events.last(), Some(&cancelled(20, 4, PriceBand)));
+}
+
+#[test]
+fn a_market_order_names_the_tighter_of_its_caps() {
+    let book_with = |protection: u32, band: u32| {
+        let mut b = OrderBook::new(BookConfig {
+            price_protection: Some(protection),
+            price_band: Some(band),
+            reference_price: Some(100),
+            ..CFG
+        });
+        for (id, price) in (1..).zip(100..=110) {
+            run(&mut b, limit(id, Sell, price, 1));
+        }
+        b
+    };
+    let stop = |mut b: OrderBook| *run(&mut b, market(20, Buy, 20)).last().unwrap();
+    assert_eq!(stop(book_with(2, 4)), cancelled(20, 17, PriceProtection));
+    assert_eq!(stop(book_with(4, 2)), cancelled(20, 17, PriceBand));
+    // A tie goes to price protection.
+    assert_eq!(stop(book_with(3, 3)), cancelled(20, 16, PriceProtection));
+}
+
+#[test]
+fn without_a_reference_the_band_waits_for_the_first_trade() {
+    let mut b = OrderBook::new(BookConfig {
+        price_band: Some(5),
+        ..CFG
+    });
+    assert_eq!(b.reference_price(), None);
+    run(&mut b, limit(1, Sell, 500, 1));
+    assert_eq!(fills(&run(&mut b, limit(2, Buy, 900, 1))), [(1, 500, 1)]);
+    assert_eq!(b.reference_price(), Some(500));
+    assert_eq!(
+        run(&mut b, limit(3, Buy, 506, 1)),
+        [rejected(3, PriceOutsideBand)]
+    );
+}
+
+#[test]
+#[should_panic(expected = "reference_price outside the price band")]
+fn a_reference_price_outside_the_band_is_refused() {
+    OrderBook::new(BookConfig {
+        reference_price: Some(10_001),
+        ..CFG
+    });
 }
 
 #[test]

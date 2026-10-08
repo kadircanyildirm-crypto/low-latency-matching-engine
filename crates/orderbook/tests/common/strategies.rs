@@ -37,11 +37,17 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
         Just(3),
         Just(BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES)
     ];
+    let price_band = prop_oneof![
+        2 => Just(None),
+        1 => (0u32..=12).prop_map(Some),
+    ];
+    // Where the band starts before the first trade: nowhere, mid-band, or at an edge.
+    let reference = 0u8..4;
     (
         band,
         (1u32..=24, max_owners, tranches),
         any::<bool>(),
-        protection,
+        (protection, price_band, reference),
         policy,
     )
         .prop_map(
@@ -49,9 +55,15 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
                 (min_price, max_price),
                 (max_orders, max_owners, max_iceberg_tranches),
                 huge_qty,
-                price_protection,
+                (price_protection, price_band, reference),
                 self_trade,
             )| {
+                let reference_price = match reference {
+                    0 => None,
+                    1 => Some(min_price + (max_price - min_price) / 2),
+                    2 => Some(min_price),
+                    _ => Some(max_price),
+                };
                 BookConfig {
                     min_price,
                     max_price,
@@ -66,6 +78,8 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
                         50
                     },
                     price_protection,
+                    price_band,
+                    reference_price,
                     self_trade,
                 }
             },

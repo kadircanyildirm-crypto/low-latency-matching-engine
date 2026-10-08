@@ -135,6 +135,8 @@ impl WorkloadConfig {
             max_order_qty: 1_000_000,
             max_iceberg_tranches: BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES,
             price_protection: Some((self.passive_depth * 4) as u32),
+            price_band: None,
+            reference_price: None,
             self_trade: SelfTradePolicy::CancelResting,
         }
     }
@@ -501,6 +503,8 @@ pub struct EventCounts {
     pub self_trade_cancels: u64,
     /// `Cancelled` events caused by price protection.
     pub protection_cancels: u64,
+    /// `Cancelled` events caused by the price band.
+    pub band_cancels: u64,
     /// `Cancelled` events caused by a mass cancel.
     pub mass_cancelled_orders: u64,
     /// Unfilled remainders of immediate-or-cancel orders.
@@ -536,6 +540,7 @@ impl EventSink for EventCounts {
                 match reason {
                     CancelReason::SelfTrade => self.self_trade_cancels += 1,
                     CancelReason::PriceProtection => self.protection_cancels += 1,
+                    CancelReason::PriceBand => self.band_cancels += 1,
                     CancelReason::MassCancel => self.mass_cancelled_orders += 1,
                     CancelReason::ImmediateOrCancel => self.ioc_cancels += 1,
                     CancelReason::FillOrKill => self.fok_kills += 1,

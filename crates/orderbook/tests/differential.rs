@@ -26,6 +26,7 @@ proptest! {
             prop_assert_eq!(&got, &want, "events differ at step {}: {:?}", step, command);
             prop_assert_eq!(snapshot(&engine), reference.snapshot(), "books differ at step {}", step);
             prop_assert_eq!(engine.trade_count(), reference.trade_count());
+            prop_assert_eq!(engine.reference_price(), reference.reference_price());
             if let Err(violation) = engine.validate() {
                 prop_assert!(false, "invariant broken at step {}: {}", step, violation);
             }

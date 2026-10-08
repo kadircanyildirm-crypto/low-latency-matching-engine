@@ -152,8 +152,8 @@ fn same_commands_produce_the_same_events() {
 /// Pinned values: CI runs this on Linux, Windows and macOS, so a match proves the engine and
 /// its state digest are deterministic across platforms, which replay on a standby machine
 /// depends on. Between them the two runs cover both self-trade policies, protection stops
-/// and rejections. They also flag any change in behaviour; if a change is intended, update
-/// the constants.
+/// and rejections. They also flag any change in behaviour; if a change is
+/// intended, update the constants.
 #[test]
 fn output_matches_the_golden_fingerprints() {
     let cfg = config();
@@ -177,6 +177,6 @@ fn output_matches_the_golden_fingerprints() {
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
-const GOLDEN_DEFAULT_DIGEST: u64 = 0x27a8_dff1_4375_a843;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x8644_8cf9_1149_88fb;
 const GOLDEN_PROTECTED: u64 = 0x0266_f614_e608_4130;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0x1cef_1946_3f85_2456;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0xaf20_bd4d_cdac_6296;

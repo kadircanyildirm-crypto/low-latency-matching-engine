@@ -44,6 +44,8 @@ pub struct ReferenceBook {
     asks: Ladder,
     orders: HashMap<OrderId, (Side, Price)>,
     trades: u64,
+    /// Last trade price, or the configured reference before the first trade.
+    reference: Option<Price>,
 }
 
 impl ReferenceBook {
@@ -54,7 +56,12 @@ impl ReferenceBook {
             asks: Ladder::new(),
             orders: HashMap::new(),
             trades: 0,
+            reference: cfg.reference_price,
         }
+    }
+
+    pub fn reference_price(&self) -> Option<Price> {
+        self.reference
     }
 
     pub fn trade_count(&self) -> u64 {
@@ -95,6 +102,9 @@ impl ReferenceBook {
                 }
                 if self.outside_protection(side, price) {
                     return Err(RejectReason::PriceOutsideProtection);
+                }
+                if self.outside_band(side, price) {
+                    return Err(RejectReason::PriceOutsideBand);
                 }
                 let crosses = self.crosses(side, price);
                 if tif == TimeInForce::PostOnly && crosses {
@@ -158,12 +168,28 @@ impl ReferenceBook {
                     return Err(RejectReason::DuplicateOrderId);
                 }
                 out.push(Event::Accepted { id });
-                let cap = self.protection_cap(side);
+                // Stop at the tighter cap; on a tie, price protection names the stop.
+                let (protection, band) = (self.protection_cap(side), self.band_cap(side));
+                let (cap, stop) = match (protection, band) {
+                    (p, None) => (p, CancelReason::PriceProtection),
+                    (None, b) => (b, CancelReason::PriceBand),
+                    (Some(p), Some(b)) => {
+                        let band_tighter = match side {
+                            Side::Buy => b < p,
+                            Side::Sell => b > p,
+                        };
+                        if band_tighter {
+                            (Some(b), CancelReason::PriceBand)
+                        } else {
+                            (Some(p), CancelReason::PriceProtection)
+                        }
+                    }
+                };
                 let (unfilled, halt) = self.match_incoming(id, owner, side, qty, cap, out);
                 if unfilled > 0 {
                     let reason = match halt {
                         Halt::SelfTrade => CancelReason::SelfTrade,
-                        Halt::Limit => CancelReason::PriceProtection,
+                        Halt::Limit => stop,
                         Halt::Empty | Halt::Filled => CancelReason::NoLiquidity,
                     };
                     out.push(Event::Cancelled {
@@ -215,6 +241,9 @@ impl ReferenceBook {
                 } else {
                     if self.outside_protection(side, price) {
                         return Err(RejectReason::PriceOutsideProtection);
+                    }
+                    if self.outside_band(side, price) {
+                        return Err(RejectReason::PriceOutsideBand);
                     }
                     if order.post_only && self.crosses(side, price) {
                         return Err(RejectReason::PostOnlyWouldCross);
@@ -334,17 +363,32 @@ impl ReferenceBook {
     }
 
     fn protection_cap(&self, side: Side) -> Option<Price> {
-        let ticks = i128::from(self.cfg.price_protection?);
+        let ticks = i64::from(self.cfg.price_protection?);
+        Some(match side {
+            Side::Buy => self.best(Side::Sell)? + ticks,
+            Side::Sell => self.best(Side::Buy)? - ticks,
+        })
+    }
+
+    fn outside_band(&self, side: Side, price: Price) -> bool {
+        let (Some(ticks), Some(reference)) = (self.cfg.price_band, self.reference) else {
+            return false;
+        };
+        let (price, reference, ticks) =
+            (i128::from(price), i128::from(reference), i128::from(ticks));
         match side {
-            Side::Buy => {
-                let ask = i128::from(self.best(Side::Sell)?);
-                Some((ask + ticks).min(i128::from(self.cfg.max_price)) as Price)
-            }
-            Side::Sell => {
-                let bid = i128::from(self.best(Side::Buy)?);
-                Some((bid - ticks).max(i128::from(self.cfg.min_price)) as Price)
-            }
+            Side::Buy => price > reference + ticks,
+            Side::Sell => price < reference - ticks,
         }
+    }
+
+    fn band_cap(&self, side: Side) -> Option<Price> {
+        let ticks = i64::from(self.cfg.price_band?);
+        let reference = self.reference?;
+        Some(match side {
+            Side::Buy => reference + ticks,
+            Side::Sell => reference - ticks,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -441,6 +485,7 @@ impl ReferenceBook {
                 front.visible -= fill;
                 qty -= fill;
                 self.trades += 1;
+                self.reference = Some(best);
                 out.push(Event::Trade {
                     trade_id: self.trades,
                     taker,

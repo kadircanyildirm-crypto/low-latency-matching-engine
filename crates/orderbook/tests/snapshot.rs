@@ -63,14 +63,18 @@ fn order(id: u64, side: Side, price: i64, leaves: u64, filled: u64) -> SnapshotO
     }
 }
 
-/// Two bids at 50 (in time priority) and an ask at 60.
+/// Two bids at 50 (in time priority) and an ask at 60, with a band around a last trade
+/// at 55.
 fn sample() -> BookSnapshot {
     BookSnapshot {
         config: BookConfig {
             price_protection: Some(3),
+            price_band: Some(20),
+            reference_price: Some(52),
             ..BookConfig::new(1, 100, 8)
         },
         trade_count: 4,
+        reference_price: Some(55),
         orders: vec![
             order(1, Side::Buy, 50, 5, 2),
             SnapshotOrder {
@@ -94,6 +98,7 @@ fn a_snapshot_round_trips_through_restore() {
     assert_eq!(book.snapshot(), snapshot);
     assert_eq!(book.digest(), snapshot.digest());
     assert_eq!(book.trade_count(), 4);
+    assert_eq!(book.reference_price(), Some(55));
     let queue: Vec<_> = book.queue(Side::Buy, 50).map(|o| o.id).collect();
     assert_eq!(queue, [1, 2]);
     let info = book.order(3).unwrap();
@@ -132,6 +137,11 @@ fn the_digest_covers_every_field() {
         s.config.self_trade = SelfTradePolicy::CancelIncoming;
     });
     vary("trade count", |s| s.trade_count += 1);
+    vary("reference price", |s| s.reference_price = Some(56));
+    vary("no reference price", |s| s.reference_price = None);
+    vary("band", |s| s.config.price_band = Some(21));
+    vary("band off", |s| s.config.price_band = None);
+    vary("initial reference", |s| s.config.reference_price = Some(53));
     vary("order id", |s| s.orders[0].id = 9);
     vary("owner", |s| s.orders[0].owner = 9);
     vary("side", |s| s.orders[2].side = Side::Buy);
@@ -160,7 +170,7 @@ fn the_digest_of_an_empty_book_is_pinned() {
     let book = OrderBook::new(BookConfig::new(-5, 5, 3));
     assert_eq!(
         book.digest(),
-        0x3e4c_fee2_e1a6_3811,
+        0xdd37_5fb5_fb33_c871,
         "got {:#018x}",
         book.digest()
     );
@@ -174,6 +184,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
         OrderBook::restore(&BookSnapshot {
             config: cfg,
             trade_count,
+            reference_price: None,
             orders,
         })
         .map(|book| book.order_count())
@@ -273,6 +284,18 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
         restore(Vec::new(), u64::MAX),
         Err(SnapshotError::TradeCountExhausted)
     );
+    for price in [0, 101] {
+        let snapshot = BookSnapshot {
+            config: cfg,
+            trade_count: 0,
+            reference_price: Some(price),
+            orders: Vec::new(),
+        };
+        assert_eq!(
+            OrderBook::restore(&snapshot).err(),
+            Some(SnapshotError::InvalidReferencePrice)
+        );
+    }
 
     // The limits themselves are fine.
     let edge = vec![
@@ -302,6 +325,10 @@ fn errors_explain_themselves() {
             "the best bid is at or above the best ask",
         ),
         (SnapshotError::TradeCountExhausted, "no trade ids left"),
+        (
+            SnapshotError::InvalidReferencePrice,
+            "the reference price is outside the band",
+        ),
     ];
     for (error, message) in messages {
         assert_eq!(error.to_string(), message);

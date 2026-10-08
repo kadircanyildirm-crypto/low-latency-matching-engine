@@ -281,6 +281,9 @@ pub enum RejectReason {
     /// for the book's `max_iceberg_tranches` to cover the quantity, or given to an IOC or
     /// fill-or-kill order.
     InvalidDisplay,
+    /// A limit price lies further through the reference price than the book's price band
+    /// allows.
+    PriceOutsideBand,
 }
 
 /// Why open quantity left the book without trading.
@@ -300,6 +303,8 @@ pub enum CancelReason {
     ImmediateOrCancel,
     /// A fill-or-kill order that could not fill completely; it did not trade at all.
     FillOrKill,
+    /// A market order reached the edge of the price band around the reference price.
+    PriceBand,
 }
 
 /// How the book prevents an owner from trading with themselves.

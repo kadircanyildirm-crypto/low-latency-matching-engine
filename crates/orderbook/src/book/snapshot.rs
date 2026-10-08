@@ -47,6 +47,9 @@ pub struct BookSnapshot {
     pub config: BookConfig,
     /// Trades executed so far; the next trade gets id `trade_count + 1`.
     pub trade_count: u64,
+    /// The price band's reference: the last trade price, or the configured reference
+    /// price before the first trade.
+    pub reference_price: Option<Price>,
     /// Resting orders: bids best price first, then asks best price first, and within each
     /// price level in time priority.
     pub orders: Vec<SnapshotOrder>,
@@ -70,6 +73,8 @@ pub enum SnapshotError {
     Crossed,
     /// The trade count leaves no room for another trade id.
     TradeCountExhausted,
+    /// The reference price lies outside the price band.
+    InvalidReferencePrice,
 }
 
 impl fmt::Display for SnapshotError {
@@ -80,6 +85,7 @@ impl fmt::Display for SnapshotError {
             Self::InvalidOrder(id) => write!(f, "order {id} cannot rest in this book"),
             Self::Crossed => f.write_str("the best bid is at or above the best ask"),
             Self::TradeCountExhausted => f.write_str("no trade ids left"),
+            Self::InvalidReferencePrice => f.write_str("the reference price is outside the band"),
         }
     }
 }
@@ -90,7 +96,12 @@ impl BookSnapshot {
     /// The digest of this state; equal to [`OrderBook::digest`] of the book it was taken
     /// from or restores to.
     pub fn digest(&self) -> u64 {
-        let mut hash = Digest::new(&self.config, self.trade_count, self.orders.len());
+        let mut hash = Digest::new(
+            &self.config,
+            self.trade_count,
+            self.reference_price,
+            self.orders.len(),
+        );
         self.orders.iter().for_each(|order| hash.order(order));
         hash.finish()
     }
@@ -104,6 +115,7 @@ impl OrderBook {
         BookSnapshot {
             config: self.config,
             trade_count: self.trade_count(),
+            reference_price: self.reference_price(),
             orders,
         }
     }
@@ -123,6 +135,13 @@ impl OrderBook {
             .trade_count
             .checked_add(1)
             .ok_or(SnapshotError::TradeCountExhausted)?;
+        book.reference = match snapshot.reference_price {
+            None => None,
+            Some(price) => Some(
+                book.level_of(price)
+                    .ok_or(SnapshotError::InvalidReferencePrice)?,
+            ),
+        };
         for order in &snapshot.orders {
             let invalid = SnapshotError::InvalidOrder(order.id);
             book.check_owner(order.owner).map_err(|_| invalid)?;
@@ -177,7 +196,12 @@ impl OrderBook {
     /// divergence between a primary and a replica, or between a live book and its replay;
     /// it is not a cryptographic hash.
     pub fn digest(&self) -> u64 {
-        let mut hash = Digest::new(&self.config, self.trade_count(), self.order_count());
+        let mut hash = Digest::new(
+            &self.config,
+            self.trade_count(),
+            self.reference_price(),
+            self.order_count(),
+        );
         self.for_each_order(|order| hash.order(&order));
         hash.finish()
     }
@@ -210,7 +234,12 @@ impl OrderBook {
 struct Digest(u64);
 
 impl Digest {
-    fn new(config: &BookConfig, trade_count: u64, orders: usize) -> Self {
+    fn new(
+        config: &BookConfig,
+        trade_count: u64,
+        reference_price: Option<Price>,
+        orders: usize,
+    ) -> Self {
         let mut hash = Self(0xcbf2_9ce4_8422_2325);
         hash.i64(config.min_price);
         hash.i64(config.max_price);
@@ -229,7 +258,10 @@ impl Digest {
             SelfTradePolicy::CancelResting => 0,
             SelfTradePolicy::CancelIncoming => 1,
         });
+        hash.optional_u64(config.price_band.map(u64::from));
+        hash.optional_u64(config.reference_price.map(|price| price as u64));
         hash.u64(trade_count);
+        hash.optional_u64(reference_price.map(|price| price as u64));
         hash.u64(orders as u64);
         hash
     }
@@ -253,6 +285,16 @@ impl Digest {
             }
         }
         self.u64(order.visible);
+    }
+
+    fn optional_u64(&mut self, value: Option<u64>) {
+        match value {
+            None => self.u64(0),
+            Some(value) => {
+                self.u64(1);
+                self.u64(value);
+            }
+        }
     }
 
     fn i64(&mut self, value: i64) {

@@ -133,8 +133,8 @@ fn mass_cancels_never_allocate() {
     );
 }
 
-/// Fill-or-kill orders walk the book before matching, and iceberg tranches move to the
-/// back of their queue; none of it may allocate.
+/// Fill-or-kill orders walk the book before matching, iceberg tranches move to the back of
+/// their queue, and stops trigger in cascades; none of it may allocate.
 #[test]
 fn every_order_type_never_allocates() {
     let cfg = WorkloadConfig {
@@ -144,6 +144,11 @@ fn every_order_type_never_allocates() {
             post_only: 30,
         },
         iceberg: 30,
+        mix: Mix {
+            cancel: 20,
+            stop: 5,
+            ..WorkloadConfig::default().mix
+        },
         ..WorkloadConfig::default()
     };
     let counts = assert_no_allocations(cfg, 100_000, 1_000_000);
@@ -151,6 +156,7 @@ fn every_order_type_never_allocates() {
         counts.ioc_cancels > 1_000 && counts.fok_kills > 1_000 && counts.replenishes > 1_000,
         "{counts:?}"
     );
+    assert!(counts.stops_triggered > 1_000, "{counts:?}");
 }
 
 /// A deep book (100k resting orders), where the index and the pool are large.

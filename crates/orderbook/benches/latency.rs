@@ -62,9 +62,9 @@ fn scenarios() -> Vec<Scenario> {
             passive_limit: 50,
             aggressive_limit: 5,
             market: 20,
-            cancel: 20,
+            cancel: 16,
             mass_cancel: 0,
-            stop: 0,
+            stop: 4,
             modify: 5,
         },
         tif: TifMix {
@@ -115,7 +115,7 @@ fn scenarios() -> Vec<Scenario> {
         // side of the book stays empty for long stretches.
         Scenario {
             name: "protected",
-            about: "2-tick protection, 4 owners, IOC/FOK/post-only, icebergs; every path",
+            about: "2-tick protection, 4 owners, every order type; every path",
             workload: protected,
             book: BookConfig {
                 price_protection: Some(2),

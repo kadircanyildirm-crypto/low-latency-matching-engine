@@ -68,7 +68,7 @@ fn synthetic_flow_matches_reference() {
 
 /// Few owners for frequent self-trades under `CancelIncoming`, many market orders against
 /// a one-tick protection band for frequent protection stops and rejections, mass cancels,
-/// every time in force, and icebergs.
+/// every time in force, icebergs, and stop orders.
 fn protected_config() -> (WorkloadConfig, BookConfig) {
     let cfg = WorkloadConfig {
         owners: 4,
@@ -77,9 +77,9 @@ fn protected_config() -> (WorkloadConfig, BookConfig) {
             passive_limit: 50,
             aggressive_limit: 5,
             market: 20,
-            cancel: 19,
+            cancel: 15,
             mass_cancel: 1,
-            stop: 0,
+            stop: 4,
             modify: 5,
         },
         tif: TifMix {
@@ -113,6 +113,7 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
         "{counts:?}"
     );
     assert!(counts.replenishes > 100, "{counts:?}");
+    assert!(counts.stops_triggered > 100, "{counts:?}");
 }
 
 /// A tight price band around the last trade and no price protection, so the band does all
@@ -220,7 +221,7 @@ fn output_matches_the_golden_fingerprints() {
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
 const GOLDEN_DEFAULT_DIGEST: u64 = 0x6af9_1bee_2c68_365b;
-const GOLDEN_PROTECTED: u64 = 0x0266_f614_e608_4130;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0xe5ca_b58b_3dc2_1156;
+const GOLDEN_PROTECTED: u64 = 0x1c6e_12e1_87ef_3f44;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0xf898_d029_54fd_1fc8;
 const GOLDEN_BANDED: u64 = 0xdbe4_19eb_3a15_01ed;
 const GOLDEN_BANDED_DIGEST: u64 = 0x2a22_6461_fdd2_37b2;

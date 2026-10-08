@@ -152,11 +152,11 @@ lots at one price made the level total wrap to 1 in release builds, and the old
 
 | Layer | What it shows |
 |---|---|
-| `tests/scenarios.rs` | One rule per test, with the exact expected event sequence (32 tests). |
+| `tests/scenarios.rs` | One rule per test, with the exact expected event sequence. |
 | `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
-| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; and each rejection reason actually applies. |
+| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; and a command is rejected exactly when a rule requires it, with that rule's reason. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
-| `tests/soak.rs` (golden) | A pinned fingerprint of all events. CI runs it on Linux, Windows and macOS, which shows the output is identical across platforms. |
+| `tests/soak.rs` (golden) | Pinned fingerprints of all events for two flows, which between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
 | `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), and in a deep book. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
 | Mutation testing | `cargo mutants` injects 316 small faults into the engine. The tests detect every one of the 297 that compile ([results](../README.md#mutation-testing)). |
@@ -170,9 +170,14 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 
 | Limitation | Plan |
 |---|---|
-| Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
+| No way to restore a book from a snapshot (orders with their fill history, the trade counter), and no public digest of the book's state | Phase 2: needed to start from a snapshot instead of replaying from the beginning, and to show that a replay reproduces the live state |
 | No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
-| Price protection is measured from the opposite best at arrival, not from a reference or last-trade price; no dynamic bands for limit orders resting away from the market | Later: reference price and dynamic bands |
-| Self-trade policy is per book, not per order | Later: per-order STP instruction |
+| No mass cancel: the book keeps no list of each owner's orders, so pulling all of them takes one `Cancel` per order | Phase 3: cancel-on-disconnect needs it |
+| The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |
+| One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
+| Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
+| Price protection is measured from the opposite best at arrival, not from a reference or last-trade price, so a stale order far from the market anchors the band, and orders priced at the market can be rejected as fat-finger orders. There are no dynamic bands for limit orders resting away from the market | Phase 7: reference price and dynamic bands |
 | Only GTC limit and market orders | Phase 7: IOC, FOK, post-only |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
+| No market states: trading halts, opening and closing auctions | Phase 7 |
+| Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |

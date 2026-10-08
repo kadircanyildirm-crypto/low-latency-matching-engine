@@ -40,6 +40,8 @@ The [verification](#10-verification) section says which one.
 
  occupancy bitset: 1 bit per level + 1 summary bit per 64 words
  id index: FxHashMap<OrderId, slot>, reserved at 2x capacity
+ stop ladders: two more ladders of the same shape, keyed by trigger level; buy stops
+               run like asks (lowest trigger first), sell stops like bids
  iceberg parts: (display, visible) per slot, beside the slab; a level's total counts
                 what its orders show
  owner lists: one list per owner, head/tail in a table indexed by owner id,
@@ -112,7 +114,9 @@ does not need to record it.
 | `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention, and `Replenished` right after a trade that uses up an iceberg's tranche), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only |
 | `Cancel` | `Cancelled{Requested}` or `Rejected` |
 | `Modify` | `Rejected`, or `Modified` followed, if priority is lost, by the events of a new limit order |
-| `CancelAll` | `Cancelled{MassCancel}` for each of the owner's orders in book order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing resting |
+| `Stop` | `Rejected`, or `Accepted` and `StopPlaced` |
+| `CancelAll` | `Cancelled{MassCancel}` for each of the owner's resting orders in book order, then each of its pending stops in trigger order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing |
+| any command that trades | then, for each stop its trades reached, `Triggered` and the events of the order the stop becomes |
 
 Every `Trade` carries the trade id and both sides' remaining open quantity (`leaves`).
 A participant can therefore track its orders from events alone; the soak test checks
@@ -132,7 +136,8 @@ The engine itself has no notion of time or transport.
 | `Market` | Trades at any price within price protection and the price band. The remainder is cancelled with `NoLiquidity`, `PriceProtection`, `PriceBand` or `SelfTrade`. Never rests. |
 | `Cancel` | Removes the order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
-| `CancelAll` | Removes every resting order of one owner, as on a session disconnect. |
+| `Stop` | Waits off the book, invisible to market data, until a trade reaches its trigger; then works as a market order, or as a GTC limit order if it has a limit price. See below. |
+| `CancelAll` | Removes every resting order and pending stop of one owner, as on a session disconnect. |
 
 **Modify uses total quantity, as FIX does.** Suppose a participant sends "reduce 10 to 8"
 while 5 lots are filling:
@@ -184,6 +189,23 @@ match it precedes. The reference book does not reimplement this rule: it runs th
 a copy of itself and keeps the copy only if every lot traded. The two must agree on every
 random sequence.
 
+**Stops trigger on what traded, in a fixed order.**
+
+- **When.** A buy stop triggers when a trade happens at or above its trigger, a sell stop
+  at or below. Every price the command traded at counts, not just the last. A buy that
+  trades at 99 and then 101 has reached a sell stop at 99, even though it ended above it.
+- **Not at once.** A stop whose trigger the last trade price has already reached is
+  refused (`StopWouldTrigger`); before the first trade, any trigger waits.
+- **In which order.** Released stops trade, and their trades can reach further stops, so
+  release repeats until none is left. Buy stops go before sell stops; within a side, the
+  trigger the price passed first goes first, and at one trigger the oldest stop.
+- **Becoming an order.** A stop-market becomes a market order with its caps measured at
+  that moment. A stop-limit faces price protection and the band as they stand then; it was
+  accepted long ago, so it is cancelled rather than rejected if it falls outside. What a
+  stop-limit cannot fill rests in the slot the stop already held, at the back of its level.
+- **Capacity.** A pending stop holds a slot of `max_orders`, sits in the id index and its
+  owner's list, can be cancelled and mass-cancelled, but not modified (`PendingStop`).
+
 ## 6. Risk controls in the core
 
 | Control | Rule |
@@ -221,7 +243,8 @@ trade within it, and the banded soak flow uses a 10-tick band for that reason.
 
 ## 7. Capacity and admission
 
-The book holds at most `max_orders` resting orders. When it is full, a new GTC or
+The book holds at most `max_orders` resting orders and pending stops. A new stop needs a
+free slot. When the book is full, a new GTC or
 post-only order is refused with `BookFull` **only if it does not cross**. IOC and FOK
 orders never rest, so they are never refused. A crossing order always finds a slot:
 
@@ -281,7 +304,7 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 |---|---|
 | `tests/scenarios.rs` | One rule per test, with the exact expected event sequence. |
 | `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
-| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
+| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; exactly the stops the command's trades reached trigger, in the order the rules release them; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. Each part of a command, its own effect and then each stop it releases, yields the state the rules say it must leave, and the engine's book must equal the end of that chain. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
 | `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for three flows that between them cover both self-trade policies, protection and band stops, and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
 | `tests/market_health.rs` | An ignored experiment, run by hand: how long each price control leaves one side of the book empty under a harsh flow (see §6). |
@@ -307,3 +330,4 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | No market states: trading halts, opening and closing auctions | Phase 7 |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
+| Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |

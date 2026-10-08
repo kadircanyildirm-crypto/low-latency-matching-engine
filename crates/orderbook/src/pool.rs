@@ -69,11 +69,6 @@ impl OrderPool {
         self.live
     }
 
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.nodes.len()
-    }
-
     /// Stores `node` in a free slot.
     ///
     /// # Panics

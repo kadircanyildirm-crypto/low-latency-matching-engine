@@ -49,10 +49,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
-#[test]
-fn processing_commands_never_allocates() {
-    let cfg = WorkloadConfig::default();
-
+fn assert_no_allocations(cfg: WorkloadConfig, warmup: usize, measured: usize) -> EventCounts {
     let before_setup = allocations();
     let mut book = OrderBook::new(cfg.book_config());
     let mut workload = Workload::new(cfg);
@@ -73,18 +70,51 @@ fn processing_commands_never_allocates() {
         }
     };
 
-    for _ in 0..100_000 {
+    for _ in 0..warmup {
         step(&mut counts);
     }
     let before = allocations();
-    for _ in 0..1_000_000 {
+    for _ in 0..measured {
         step(&mut counts);
     }
     let allocated = allocations() - before;
 
     assert_eq!(allocated, 0, "hot path allocated {allocated} times");
     assert!(
-        counts.trades > 0 && counts.cancelled > 0 && counts.modified > 0 && counts.rested > 0,
+        counts.trades > 0
+            && counts.cancelled > 0
+            && counts.modified > 0
+            && counts.rested > 0
+            && counts.self_trade_cancels > 0,
         "{counts:?}"
     );
+    counts
+}
+
+#[test]
+fn processing_commands_never_allocates() {
+    assert_no_allocations(WorkloadConfig::default(), 100_000, 1_000_000);
+}
+
+/// A tiny book that is permanently full: every new order first cancels an old one, so the
+/// id index sees maximum churn at maximum occupancy, the worst case for its tombstones.
+#[test]
+fn a_permanently_full_book_never_allocates() {
+    let cfg = WorkloadConfig {
+        max_live: 64,
+        owners: 8,
+        ..WorkloadConfig::default()
+    };
+    assert_no_allocations(cfg, 10_000, 1_000_000);
+}
+
+/// A deep book (100k resting orders), where the index and the pool are large.
+#[test]
+fn a_deep_book_never_allocates() {
+    let cfg = WorkloadConfig {
+        max_live: 100_000,
+        passive_depth: 2_000,
+        ..WorkloadConfig::default()
+    };
+    assert_no_allocations(cfg, 400_000, 500_000);
 }

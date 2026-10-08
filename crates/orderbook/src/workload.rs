@@ -1,24 +1,30 @@
 //! Deterministic synthetic order flow, plus a counting [`EventSink`], for benchmarks and
 //! soak tests.
 //!
-//! [`Workload`] behaves like a single client trading against the book: it generates commands
-//! and learns from the engine's events (its execution reports) which of its orders are still
-//! resting, so its cancels and modifies target live orders. Neither generating a command nor
-//! observing an event allocates, so the generator can run inside allocation-checked loops.
+//! [`Workload`] behaves like a set of participants trading against the book: it generates
+//! commands and learns from the engine's events (their execution reports) which orders are
+//! still resting, so cancels and modifies target live orders and carry the right owner.
+//! Neither generating a command nor observing an event allocates, so the generator can run
+//! inside allocation-checked loops.
 
 use rustc_hash::FxHashMap;
 
-use crate::{BookConfig, Command, Event, EventSink, OrderId, Price, Qty, RejectReason, Side};
+use crate::{
+    BookConfig, CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty,
+    RejectReason, SelfTradePolicy, Side,
+};
 
 /// SplitMix64: tiny, fast and identical on every platform, so a seed fully determines a run.
 #[derive(Clone, Debug)]
 pub struct SplitMix64(u64);
 
 impl SplitMix64 {
+    /// A generator starting from `seed`.
     pub fn new(seed: u64) -> Self {
         Self(seed)
     }
 
+    /// Next 64 random bits.
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
@@ -40,25 +46,35 @@ pub struct Mix {
     pub passive_limit: u8,
     /// New limit orders priced through the mid; they usually trade.
     pub aggressive_limit: u8,
+    /// Market orders.
     pub market: u8,
+    /// Cancels of resting orders.
     pub cancel: u8,
+    /// Modifies of resting orders.
     pub modify: u8,
 }
 
 /// Shape of the generated order flow.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkloadConfig {
+    /// Seed; the same seed yields the same stream.
     pub seed: u64,
+    /// Lowest price of the book's band.
     pub min_price: Price,
+    /// Highest price of the book's band.
     pub max_price: Price,
     /// Starting mid price; it then random-walks by one tick at a time.
     pub initial_mid: Price,
     /// Passive orders land 1..=`passive_depth` ticks from the mid, skewed toward the touch.
     pub passive_depth: Price,
+    /// Order sizes are uniform in `1..=max_qty`.
     pub max_qty: Qty,
+    /// Number of distinct participants; orders get a uniformly random owner.
+    pub owners: u32,
     /// Upper bound on resting orders. At the bound, a random resting order is cancelled
     /// before a new one is placed, so the book reaches a steady state instead of growing.
     pub max_live: u32,
+    /// Command mix.
     pub mix: Mix,
 }
 
@@ -71,6 +87,7 @@ impl Default for WorkloadConfig {
             initial_mid: 100_000,
             passive_depth: 50,
             max_qty: 100,
+            owners: 64,
             max_live: 10_000,
             mix: Mix {
                 passive_limit: 55,
@@ -84,23 +101,28 @@ impl Default for WorkloadConfig {
 }
 
 impl WorkloadConfig {
-    /// A book that can hold everything this workload generates.
+    /// A book that can hold everything this workload generates, with price protection and
+    /// self-trade prevention switched on.
     pub fn book_config(&self) -> BookConfig {
         BookConfig {
             min_price: self.min_price,
             max_price: self.max_price,
             max_orders: self.max_live,
+            max_order_qty: 1_000_000,
+            price_protection: Some((self.passive_depth * 4) as u32),
+            self_trade: SelfTradePolicy::CancelResting,
         }
     }
 }
 
-/// One of the client's resting orders, as last reported by the engine.
+/// A resting order, as last reported by the engine.
 #[derive(Clone, Copy, Debug)]
 struct Resting {
     id: OrderId,
+    owner: OwnerId,
     side: Side,
     price: Price,
-    qty: Qty,
+    leaves: Qty,
 }
 
 /// Endless, reproducible stream of [`Command`]s.
@@ -122,10 +144,12 @@ pub struct Workload {
 }
 
 impl Workload {
+    /// A generator for `cfg`.
+    ///
     /// # Panics
     ///
-    /// If the mix does not add up to 100 or the price band is too narrow for the mid to
-    /// move in.
+    /// If the mix does not add up to 100, a size or count is zero, or the price band is too
+    /// narrow for the mid to move in.
     pub fn new(cfg: WorkloadConfig) -> Self {
         let m = cfg.mix;
         let total: u32 = [
@@ -139,7 +163,7 @@ impl Workload {
         .map(|&p| u32::from(p))
         .sum();
         assert_eq!(total, 100, "mix must add up to 100");
-        assert!(cfg.max_live > 0 && cfg.max_qty > 0 && cfg.passive_depth > 0);
+        assert!(cfg.max_live > 0 && cfg.max_qty > 0 && cfg.owners > 0 && cfg.passive_depth > 0);
         let margin = cfg.passive_depth + 8;
         assert!(
             cfg.min_price + margin <= cfg.max_price - margin,
@@ -158,11 +182,12 @@ impl Workload {
         }
     }
 
-    /// Number of orders the client believes are resting.
+    /// Number of orders the participants believe are resting.
     pub fn live_orders(&self) -> usize {
         self.live.len()
     }
 
+    /// The next command to send.
     pub fn next_command(&mut self) -> Command {
         if let Some(command) = self.pending.take() {
             return command;
@@ -188,7 +213,7 @@ impl Workload {
         self.modify()
     }
 
-    /// Updates the client's view of its resting orders from one engine event.
+    /// Updates the participants' view of their resting orders from one engine event.
     pub fn observe(&mut self, event: &Event) {
         match *event {
             Event::Rested {
@@ -197,38 +222,50 @@ impl Workload {
                 price,
                 qty,
             } => {
+                let owner = self.owner_of_new(id);
                 self.position.insert(id, self.live.len() as u32);
                 self.live.push(Resting {
                     id,
+                    owner,
                     side,
                     price,
-                    qty,
+                    leaves: qty,
                 });
             }
-            Event::Trade { maker, qty, .. } => {
-                if let Some(&i) = self.position.get(&maker) {
-                    let order = &mut self.live[i as usize];
-                    order.qty -= qty;
-                    if order.qty == 0 {
-                        self.forget(maker);
-                    }
+            Event::Trade {
+                maker,
+                maker_leaves,
+                ..
+            } => {
+                if maker_leaves == 0 {
+                    self.forget(maker);
+                } else if let Some(&i) = self.position.get(&maker) {
+                    self.live[i as usize].leaves = maker_leaves;
                 }
             }
             Event::Cancelled { id, .. } => self.forget(id),
-            Event::Modified { id, price, qty } => {
+            Event::Modified {
+                id, price, leaves, ..
+            } => {
                 if let Some(&i) = self.position.get(&id) {
                     let order = &mut self.live[i as usize];
-                    if order.price == price && qty <= order.qty {
-                        order.qty = qty;
+                    if leaves > 0 && order.price == price && leaves <= order.leaves {
+                        order.leaves = leaves;
                     } else {
-                        // Lost priority: the engine re-enters it, and a `Rested` follows if
-                        // anything is left after trading.
+                        // Done, or lost priority: in the latter case the engine re-enters
+                        // the order and a `Rested` follows if anything is left.
                         self.forget(id);
                     }
                 }
             }
             Event::Accepted { .. } | Event::Rejected { .. } => {}
         }
+    }
+
+    /// Owners are a pure function of the order id, so the generator needs no extra state to
+    /// remember who placed an order that has just rested.
+    fn owner_of_new(&self, id: OrderId) -> OwnerId {
+        (SplitMix64::new(id ^ self.cfg.seed).next_u64() % u64::from(self.cfg.owners)) as OwnerId
     }
 
     fn forget(&mut self, id: OrderId) {
@@ -303,8 +340,10 @@ impl Workload {
             self.passive_price(side)
         };
         let qty = self.random_qty();
+        let id = self.take_id();
         let order = Command::Limit {
-            id: self.take_id(),
+            id,
+            owner: self.owner_of_new(id),
             side,
             price,
             qty,
@@ -312,17 +351,23 @@ impl Workload {
         if self.live.len() < self.cfg.max_live as usize {
             return order;
         }
-        // At the bound: pull a resting order first, like a client cancelling stale quotes.
+        // At the bound: pull a resting order first, like a participant cancelling stale
+        // quotes.
         let victim = self.random_live().expect("max_live > 0");
         self.pending = Some(order);
-        Command::Cancel { id: victim.id }
+        Command::Cancel {
+            id: victim.id,
+            owner: victim.owner,
+        }
     }
 
     fn new_market(&mut self) -> Command {
         let side = self.random_side();
         let qty = self.random_qty();
+        let id = self.take_id();
         Command::Market {
-            id: self.take_id(),
+            id,
+            owner: self.owner_of_new(id),
             side,
             qty,
         }
@@ -330,12 +375,17 @@ impl Workload {
 
     fn cancel(&mut self) -> Command {
         match self.random_live() {
-            Some(order) => Command::Cancel { id: order.id },
+            Some(order) => Command::Cancel {
+                id: order.id,
+                owner: order.owner,
+            },
             None => self.new_limit(false),
         }
     }
 
-    /// Half the time keeps the price (a size change), half the time moves it.
+    /// Half the time keeps the price (a size change), half the time moves it. The new total
+    /// quantity is random, so some modifies shrink in place, some lose priority, and some
+    /// end the order because the new total is already filled.
     fn modify(&mut self) -> Command {
         let Some(order) = self.random_live() else {
             return self.new_limit(false);
@@ -347,6 +397,7 @@ impl Workload {
         };
         Command::Modify {
             id: order.id,
+            owner: order.owner,
             price,
             qty: self.random_qty(),
         }
@@ -356,13 +407,25 @@ impl Workload {
 /// An [`EventSink`] that only counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventCounts {
+    /// `Accepted` events.
     pub accepted: u64,
+    /// `Rejected` events.
     pub rejected: u64,
+    /// `Rejected` events with reason `BookFull`.
     pub rejected_book_full: u64,
+    /// `Trade` events.
     pub trades: u64,
+    /// Total traded quantity.
     pub traded_qty: u64,
+    /// `Rested` events.
     pub rested: u64,
+    /// `Cancelled` events.
     pub cancelled: u64,
+    /// `Cancelled` events caused by self-trade prevention.
+    pub self_trade_cancels: u64,
+    /// `Cancelled` events caused by price protection.
+    pub protection_cancels: u64,
+    /// `Modified` events.
     pub modified: u64,
 }
 
@@ -382,7 +445,14 @@ impl EventSink for EventCounts {
                 self.traded_qty += qty;
             }
             Event::Rested { .. } => self.rested += 1,
-            Event::Cancelled { .. } => self.cancelled += 1,
+            Event::Cancelled { reason, .. } => {
+                self.cancelled += 1;
+                match reason {
+                    CancelReason::SelfTrade => self.self_trade_cancels += 1,
+                    CancelReason::PriceProtection => self.protection_cancels += 1,
+                    CancelReason::Requested | CancelReason::NoLiquidity => {}
+                }
+            }
             Event::Modified { .. } => self.modified += 1,
         }
     }

@@ -39,7 +39,7 @@ impl LevelBitset {
         }
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn contains(&self, i: usize) -> bool {
         i < self.len && self.words[i / 64] & (1 << (i % 64)) != 0
     }
@@ -122,9 +122,6 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
-    /// Spans several words and three summary words.
-    const LEN: usize = 10_000;
-
     #[derive(Clone, Debug)]
     enum Op {
         Insert(usize),
@@ -133,27 +130,40 @@ mod tests {
         Prev(usize),
     }
 
-    /// Mostly random, with extra weight on word and summary boundaries.
-    fn index() -> impl Strategy<Value = usize> {
-        prop_oneof![
-            4 => 0..LEN,
-            1 => prop::sample::select(vec![0, 1, 63, 64, 65, 127, 128, 4095, 4096, 4097, LEN - 1]),
-        ]
+    /// Lengths just below, at and above a word (64) and a summary word (4096), so the last
+    /// word is sometimes full and sometimes partial; and one spanning three summary words.
+    fn len() -> impl Strategy<Value = usize> {
+        prop::sample::select(vec![1, 63, 64, 65, 128, 4_095, 4_096, 4_097, 8_192, 10_000])
     }
 
-    fn op() -> impl Strategy<Value = Op> {
-        prop_oneof![
-            index().prop_map(Op::Insert),
-            index().prop_map(Op::Remove),
-            (0..LEN + 100).prop_map(Op::Next),
-            (0..LEN + 100).prop_map(Op::Prev),
-        ]
+    /// Mostly random, with extra weight on word and summary boundaries.
+    fn index(len: usize) -> impl Strategy<Value = usize> {
+        let boundaries: Vec<usize> = [0, 1, 63, 64, 65, 127, 128, 4_095, 4_096, 4_097, len - 1]
+            .into_iter()
+            .filter(|&i| i < len)
+            .collect();
+        prop_oneof![4 => 0..len, 1 => prop::sample::select(boundaries)]
+    }
+
+    /// Queries also probe past the end, including `usize::MAX`.
+    fn query(len: usize) -> impl Strategy<Value = usize> {
+        prop_oneof![10 => 0..len + 100, 1 => Just(usize::MAX)]
+    }
+
+    fn ops(len: usize) -> impl Strategy<Value = Vec<Op>> {
+        let op = prop_oneof![
+            index(len).prop_map(Op::Insert),
+            index(len).prop_map(Op::Remove),
+            query(len).prop_map(Op::Next),
+            query(len).prop_map(Op::Prev),
+        ];
+        prop::collection::vec(op, 1..300)
     }
 
     proptest! {
         #[test]
-        fn behaves_like_btreeset(ops in prop::collection::vec(op(), 1..300)) {
-            let mut bits = LevelBitset::new(LEN);
+        fn behaves_like_btreeset((len, ops) in len().prop_flat_map(|len| (Just(len), ops(len)))) {
+            let mut bits = LevelBitset::new(len);
             let mut model = BTreeSet::new();
             for op in ops {
                 match op {
@@ -173,7 +183,7 @@ mod tests {
                     }
                 }
             }
-            for i in 0..LEN {
+            for i in 0..len {
                 prop_assert_eq!(bits.contains(i), model.contains(&i));
             }
         }
@@ -191,5 +201,16 @@ mod tests {
         assert_eq!(bits.prev_at_or_before(usize::MAX), Some(0));
         bits.remove(0);
         assert_eq!(bits.prev_at_or_before(0), None);
+    }
+
+    #[test]
+    fn queries_past_a_full_last_word() {
+        // 128 levels fill exactly two words: a query past the end must not step into a
+        // third word that does not exist.
+        let mut bits = LevelBitset::new(128);
+        bits.insert(127);
+        assert_eq!(bits.prev_at_or_before(128), Some(127));
+        assert_eq!(bits.prev_at_or_before(usize::MAX), Some(127));
+        assert_eq!(bits.next_at_or_after(128), None);
     }
 }

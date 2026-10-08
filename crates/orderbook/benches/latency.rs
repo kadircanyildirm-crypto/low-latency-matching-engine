@@ -1,18 +1,20 @@
-//! Per-command service-time distribution of the matching core.
+//! Per-command service-time distribution of the matching core, over several order-flow
+//! scenarios.
 //!
 //! What this measures: the time `OrderBook::process` takes for one command, on one pinned
 //! thread, with commands issued back to back (closed loop). There is no network, queueing or
 //! arrival schedule involved, so coordinated omission does not apply here; end-to-end latency
 //! under an open-loop arrival rate is measured separately once the gateway exists.
 //!
-//! Method: a client-like generator drives a scratch book once and its commands are recorded.
-//! The recording is then replayed into fresh books, so the measured loops contain nothing
-//! but the engine (plus the timer, in the latency pass). Because the engine is
-//! deterministic, every replay reproduces the recorded run exactly.
+//! Method: per scenario, a participant-like generator drives a scratch book once and its
+//! commands are recorded. The recording is then replayed into fresh books, several times, so
+//! the measured loops contain nothing but the engine (plus the timer, in the latency pass).
+//! The engine is deterministic, so every replay reproduces the recorded run exactly.
 //!
 //! Run: `cargo bench --bench latency`
-//! Env: `LAT_COMMANDS` (default 3,000,000), `LAT_WARMUP` (default 500,000).
-//! Writes HdrHistogram percentile files to `target/latency/*.hgrm`
+//! Env: `LAT_COMMANDS` measured commands per run (default 2,000,000), `LAT_RUNS` (default 3),
+//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep`.
+//! Writes merged HdrHistogram percentile files to `target/latency/<scenario>.hgrm`
 //! (plot at https://hdrhistogram.github.io/HdrHistogram/plotFiles.html).
 
 use std::fmt::Write as _;
@@ -22,96 +24,195 @@ use std::path::Path;
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
-use orderbook::workload::{EventCounts, Workload, WorkloadConfig};
+use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
 use orderbook::{Command, Event, EventSink, OrderBook, Side};
 
 const KINDS: [&str; 5] = ["all", "limit", "market", "cancel", "modify"];
 
+struct Scenario {
+    name: &'static str,
+    about: &'static str,
+    workload: WorkloadConfig,
+    warmup: usize,
+}
+
+fn scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            name: "baseline",
+            about: "~6k resting orders near the touch; fits in cache",
+            workload: WorkloadConfig::default(),
+            warmup: 500_000,
+        },
+        Scenario {
+            name: "deep",
+            about: "~1M resting orders over ~10k levels; working set far exceeds L2",
+            workload: WorkloadConfig {
+                max_live: 1_000_000,
+                passive_depth: 5_000,
+                ..WorkloadConfig::default()
+            },
+            warmup: 4_000_000,
+        },
+        Scenario {
+            name: "sweep",
+            about: "40% aggressive/market flow, sizes up to 1000; multi-level sweeps",
+            workload: WorkloadConfig {
+                max_qty: 1_000,
+                mix: Mix {
+                    passive_limit: 40,
+                    aggressive_limit: 20,
+                    market: 20,
+                    cancel: 15,
+                    modify: 5,
+                },
+                ..WorkloadConfig::default()
+            },
+            warmup: 500_000,
+        },
+    ]
+}
+
 fn main() {
-    let commands = env_count("LAT_COMMANDS", 3_000_000);
-    let warmup = env_count("LAT_WARMUP", 500_000);
+    let commands = env_count("LAT_COMMANDS", 2_000_000);
+    let runs = env_count("LAT_RUNS", 3).max(1);
+    let only = std::env::var("LAT_SCENARIOS").ok();
 
     let core = pin_to_last_core();
     let clock = Clock::calibrate();
-    let cfg = WorkloadConfig::default();
-
-    let stream = record(cfg, warmup + commands);
-    let (warm, measured) = stream.split_at(warmup);
-    let mut events: Vec<Event> = Vec::with_capacity(1024);
-
-    // Throughput pass: no per-command timers.
-    let mut book = OrderBook::new(cfg.book_config());
-    replay(&mut book, warm, &mut events);
-    let (resting, bid_levels, ask_levels) = (
-        book.order_count(),
-        book.depth(Side::Buy).count(),
-        book.depth(Side::Sell).count(),
-    );
-    let started = Instant::now();
-    replay(&mut book, measured, &mut events);
-    let untimed = started.elapsed();
-    let final_orders = book.order_count();
-
-    // Latency pass: same commands into a fresh book, each one timed.
-    let mut hists: Vec<Histogram<u64>> = KINDS
-        .iter()
-        .map(|_| Histogram::new_with_bounds(1, 100_000_000, 3).expect("histogram bounds"))
-        .collect();
-    let overhead = clock.overhead_ns();
-    let mut counts = EventCounts::default();
-    let mut book = OrderBook::new(cfg.book_config());
-    replay(&mut book, warm, &mut events);
-    for &command in measured {
-        events.clear();
-        let start = clock.start();
-        book.process(command, &mut events);
-        let end = clock.stop();
-        let ns = (clock.to_ns(end.wrapping_sub(start)).round() as u64).max(1);
-        hists[0].saturating_record(ns);
-        hists[kind_index(&command)].saturating_record(ns);
-        events.iter().for_each(|&e| counts.on_event(e));
-    }
-    black_box(&book);
-    assert_eq!(
-        book.order_count(),
-        final_orders,
-        "replays of the same stream diverged"
-    );
-
-    println!("matching core service time (single thread, closed loop, replayed stream)");
+    println!("matching core service time (single thread, closed loop, replayed streams)");
+    println!("  cpu            : {}", cpu_brand());
     println!(
-        "  pinned core     : {}",
+        "  os / cores     : {} / {} logical, pinned to core {}",
+        std::env::consts::OS,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
         core.map_or("none".to_string(), |c| c.to_string())
     );
-    println!("  clock           : {}", clock.describe());
-    println!("  timer overhead  : ~{overhead:.0} ns per measurement (included below)");
+    println!("  clock          : {}", clock.describe());
     println!(
-        "  stream          : {warmup} warm-up + {commands} measured commands ({:.0} MB)",
-        (stream.len() * size_of::<Command>()) as f64 / 1e6
+        "  timer overhead : ~{:.0} ns per measurement, included below",
+        clock.overhead_ns()
     );
+    println!("  per scenario   : {runs} runs x {commands} measured commands");
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/latency");
+    fs::create_dir_all(&dir).expect("create output dir");
+
+    for scenario in scenarios() {
+        if only
+            .as_deref()
+            .is_some_and(|names| !names.split(',').any(|n| n.trim() == scenario.name))
+        {
+            continue;
+        }
+        run_scenario(&scenario, commands, runs, &clock, &dir);
+    }
     println!(
-        "  book after warm : {resting} resting orders, {bid_levels} bid / {ask_levels} ask levels"
+        "\n  percentile files: {}",
+        dir.canonicalize().unwrap_or(dir).display()
     );
+}
+
+fn run_scenario(scenario: &Scenario, commands: usize, runs: usize, clock: &Clock, dir: &Path) {
+    let cfg = scenario.workload;
+    let stream = record(cfg, scenario.warmup + commands);
+    let (warm, measured) = stream.split_at(scenario.warmup);
+    let mut events: Vec<Event> = Vec::with_capacity(4096);
+
+    let mut merged: Vec<Histogram<u64>> = KINDS.iter().map(|_| new_histogram()).collect();
+    let mut summary = String::new();
+    let mut counts = EventCounts::default();
+    let mut shape = String::new();
+    let mut final_orders = None;
+
+    for run in 0..runs {
+        // Throughput: no per-command timers.
+        let mut book = OrderBook::new(cfg.book_config());
+        replay(&mut book, warm, &mut events);
+        if run == 0 {
+            shape = format!(
+                "{} resting orders, {} bid / {} ask levels",
+                book.order_count(),
+                book.depth(Side::Buy).count(),
+                book.depth(Side::Sell).count()
+            );
+        }
+        let started = Instant::now();
+        replay(&mut book, measured, &mut events);
+        let untimed = started.elapsed();
+        let orders = book.order_count();
+        assert!(
+            final_orders.is_none_or(|n| n == orders),
+            "replays of the same stream diverged"
+        );
+        final_orders = Some(orders);
+        drop(book);
+
+        // Latency: the same commands into a fresh book, each one timed.
+        let mut hists: Vec<Histogram<u64>> = KINDS.iter().map(|_| new_histogram()).collect();
+        let mut book = OrderBook::new(cfg.book_config());
+        replay(&mut book, warm, &mut events);
+        for &command in measured {
+            events.clear();
+            let start = clock.start();
+            book.process(command, &mut events);
+            let end = clock.stop();
+            let ns = (clock.to_ns(end.wrapping_sub(start)).round() as u64).max(1);
+            hists[0].saturating_record(ns);
+            hists[kind_index(&command)].saturating_record(ns);
+            if run == 0 {
+                events.iter().for_each(|&e| counts.on_event(e));
+            }
+        }
+        black_box(&book);
+        assert_eq!(
+            book.order_count(),
+            orders,
+            "replays of the same stream diverged"
+        );
+
+        let all = &hists[0];
+        let _ = writeln!(
+            summary,
+            "    run {}: {:>6.2} M cmd/s | p50 {:>4} | p99 {:>5} | p99.9 {:>5} | p99.99 {:>6} | max {:>8}",
+            run + 1,
+            commands as f64 / untimed.as_secs_f64() / 1e6,
+            all.value_at_quantile(0.50),
+            all.value_at_quantile(0.99),
+            all.value_at_quantile(0.999),
+            all.value_at_quantile(0.9999),
+            all.max()
+        );
+        for (m, h) in merged.iter_mut().zip(&hists) {
+            m.add(h).expect("same bounds");
+        }
+    }
+
+    println!("\n== {} ({})", scenario.name, scenario.about);
+    println!("  book after warm-up : {shape}");
     println!(
-        "  throughput      : {:.2} M commands/s ({:.1} ns/command, untimed)",
-        commands as f64 / untimed.as_secs_f64() / 1e6,
-        untimed.as_nanos() as f64 / commands as f64
+        "  events per run     : {} trades, {} rests, {} cancels ({} self-trade, {} protection), {} modifies, {} rejects",
+        counts.trades,
+        counts.rested,
+        counts.cancelled,
+        counts.self_trade_cancels,
+        counts.protection_cancels,
+        counts.modified,
+        counts.rejected
     );
+    println!("  per run (ns):");
+    print!("{summary}");
+    println!("  all runs merged (ns):");
     println!(
-        "  measured events : {} trades, {} rests, {} cancels, {} modifies, {} rejects",
-        counts.trades, counts.rested, counts.cancelled, counts.modified, counts.rejected
-    );
-    println!();
-    println!(
-        "  {:<7} {:>10} {:>7} {:>7} {:>7} {:>7} {:>8} {:>9} {:>9}   (ns)",
+        "    {:<7} {:>10} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8} {:>9}",
         "command", "count", "mean", "p50", "p90", "p99", "p99.9", "p99.99", "max"
     );
-    for (name, hist) in KINDS.iter().zip(&hists) {
+    for (name, hist) in KINDS.iter().zip(&merged) {
         if hist.is_empty() {
             continue;
         }
         println!(
-            "  {:<7} {:>10} {:>7.0} {:>7} {:>7} {:>7} {:>8} {:>9} {:>9}",
+            "    {:<7} {:>10} {:>6.0} {:>6} {:>6} {:>6} {:>7} {:>8} {:>9}",
             name,
             hist.len(),
             hist.mean(),
@@ -123,31 +224,23 @@ fn main() {
             hist.max()
         );
     }
-
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/latency");
-    fs::create_dir_all(&dir).expect("create output dir");
-    for (name, hist) in KINDS.iter().zip(&hists) {
-        if !hist.is_empty() {
-            fs::write(
-                dir.join(format!("{name}.hgrm")),
-                percentile_distribution(hist),
-            )
-            .expect("write .hgrm");
-        }
-    }
-    println!();
-    println!(
-        "  percentile files: {}",
-        dir.canonicalize().unwrap_or(dir).display()
-    );
+    fs::write(
+        dir.join(format!("{}.hgrm", scenario.name)),
+        percentile_distribution(&merged[0]),
+    )
+    .expect("write .hgrm");
 }
 
-/// Drives a scratch book with the client-like generator, feeding every event back to it,
-/// and returns the commands it issued.
+fn new_histogram() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, 100_000_000, 3).expect("histogram bounds")
+}
+
+/// Drives a scratch book with the participant-like generator, feeding every event back to
+/// it, and returns the commands it issued.
 fn record(cfg: WorkloadConfig, n: usize) -> Vec<Command> {
     let mut book = OrderBook::new(cfg.book_config());
     let mut workload = Workload::new(cfg);
-    let mut events = Vec::with_capacity(1024);
+    let mut events = Vec::with_capacity(4096);
     let mut stream = Vec::with_capacity(n);
     for _ in 0..n {
         let command = workload.next_command();
@@ -185,6 +278,30 @@ fn env_count(name: &str, default: usize) -> usize {
 fn pin_to_last_core() -> Option<usize> {
     let core = core_affinity::get_core_ids()?.pop()?;
     core_affinity::set_for_current(core).then_some(core.id)
+}
+
+/// The processor brand string from CPUID, so results are tied to the hardware that
+/// produced them.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+fn cpu_brand() -> String {
+    use std::arch::x86_64::__cpuid;
+    let mut bytes = Vec::with_capacity(48);
+    for leaf in 0x8000_0002u32..=0x8000_0004 {
+        let r = unsafe { __cpuid(leaf) };
+        for reg in [r.eax, r.ebx, r.ecx, r.edx] {
+            bytes.extend_from_slice(&reg.to_le_bytes());
+        }
+    }
+    String::from_utf8_lossy(&bytes)
+        .trim_matches(char::from(0))
+        .trim()
+        .to_string()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_brand() -> String {
+    std::env::consts::ARCH.to_string()
 }
 
 /// HdrHistogram's text percentile format, values in microseconds.

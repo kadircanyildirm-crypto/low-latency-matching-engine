@@ -7,5 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Only the exporter uses it: it records the stream from our engine's workload generator.
+core_affinity = "0.8.3"
+# The scenarios are settings of our workload generator, and the exporter records the streams
+# from our engine; the replay driver itself does not use it.
 orderbook = { path = "../../crates/orderbook" }

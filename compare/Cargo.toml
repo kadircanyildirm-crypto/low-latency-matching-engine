@@ -4,7 +4,7 @@
 # the harness or the competitors' dependencies.
 [workspace]
 resolver = "3"
-members = ["harness"]
+members = ["harness", "ours"]
 
 [workspace.package]
 edition = "2024"

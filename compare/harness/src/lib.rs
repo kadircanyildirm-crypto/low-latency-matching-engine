@@ -1,8 +1,11 @@
 //! Shared code of the head-to-head comparison (`docs/COMPARISON.md`): the engine-neutral
-//! command stream format and the scenarios recorded into it.
+//! command stream format, the scenarios recorded into it, and the replay driver every
+//! Rust-side adapter runs.
 
 use std::path::PathBuf;
 
+pub mod clock;
+pub mod run;
 pub mod scenarios;
 pub mod stream;
 

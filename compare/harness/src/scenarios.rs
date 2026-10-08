@@ -79,7 +79,7 @@ pub fn all() -> Vec<Scenario> {
         },
         Scenario {
             name: "modify",
-            about: "baseline flow with 5% price moves (cancel/replace keeping open quantity)",
+            about: "baseline flow with 5% price moves: cancel/replace keeping the open quantity",
             // The default mix: 25% cancels and 5% modifies, which the exporter turns into
             // price moves.
             workload: base,

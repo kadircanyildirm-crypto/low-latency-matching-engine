@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
-use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
+use orderbook::workload::{EventCounts, Mix, TifMix, Workload, WorkloadConfig};
 use orderbook::{BookConfig, Command, Event, EventSink, OrderBook, Side};
 
 const KINDS: [&str; 6] = ["all", "limit", "market", "cancel", "modify", "mass"];
@@ -65,6 +65,11 @@ fn scenarios() -> Vec<Scenario> {
             cancel: 20,
             mass_cancel: 0,
             modify: 5,
+        },
+        tif: TifMix {
+            ioc: 30,
+            fok: 20,
+            post_only: 20,
         },
         ..WorkloadConfig::default()
     };
@@ -107,7 +112,7 @@ fn scenarios() -> Vec<Scenario> {
         // side of the book stays empty for long stretches.
         Scenario {
             name: "protected",
-            about: "2-tick protection, 4 owners; protection stops, self-trades and rejects",
+            about: "2-tick protection, 4 owners, IOC/FOK/post-only; stops, self-trades, rejects",
             workload: protected,
             book: BookConfig {
                 price_protection: Some(2),

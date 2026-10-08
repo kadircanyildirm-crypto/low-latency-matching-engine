@@ -4,13 +4,15 @@
 //! Unless a test is about owners, every order gets its own owner (`owner == id`), so
 //! self-trade prevention stays out of the way.
 
-use orderbook::CancelReason::{MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade};
+use orderbook::CancelReason::{
+    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade,
+};
 use orderbook::Event::*;
 use orderbook::RejectReason::*;
 use orderbook::Side::{Buy, Sell};
 use orderbook::{
     BookConfig, Command, Event, EventSink, LevelInfo, OrderBook, OrderId, OwnerId, Price, Qty,
-    SelfTradePolicy, Side,
+    SelfTradePolicy, Side, TimeInForce,
 };
 
 const CFG: BookConfig = BookConfig::new(1, 10_000, 1_024);
@@ -31,12 +33,24 @@ fn limit(id: OrderId, side: Side, price: Price, qty: Qty) -> Command {
 }
 
 fn limit_by(owner: OwnerId, id: OrderId, side: Side, price: Price, qty: Qty) -> Command {
+    limit_tif(owner, id, side, price, qty, TimeInForce::Gtc)
+}
+
+fn limit_tif(
+    owner: OwnerId,
+    id: OrderId,
+    side: Side,
+    price: Price,
+    qty: Qty,
+    tif: TimeInForce,
+) -> Command {
     Command::Limit {
         id,
         owner,
         side,
         price,
         qty,
+        tif,
     }
 }
 
@@ -547,6 +561,152 @@ fn cancel_incoming_stops_at_the_first_own_order() {
 
     let events = run(&mut b, market_by(7, 5, Buy, 1));
     assert_eq!(events, [Accepted { id: 5 }, cancelled(5, 1, SelfTrade)]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Time in force
+
+use TimeInForce::{Fok, Ioc, PostOnly};
+
+/// Asks: 100 ×2 (#1), 101 ×3 (#2), 103 ×5 (#3).
+fn ask_ladder() -> OrderBook {
+    let mut b = book();
+    run(&mut b, limit(1, Sell, 100, 2));
+    run(&mut b, limit(2, Sell, 101, 3));
+    run(&mut b, limit(3, Sell, 103, 5));
+    b
+}
+
+#[test]
+fn ioc_trades_what_it_can_and_cancels_the_rest() {
+    let mut b = ask_ladder();
+    let events = run(&mut b, limit_tif(9, 9, Buy, 101, 10, Ioc));
+    assert_eq!(fills(&events), [(1, 100, 2), (2, 101, 3)]);
+    assert_eq!(events.last(), Some(&cancelled(9, 5, ImmediateOrCancel)));
+    assert!(b.best_bid().is_none());
+    assert_eq!(b.best_ask(), level(103, 5, 1));
+}
+
+#[test]
+fn ioc_that_cannot_trade_is_cancelled_whole() {
+    let mut b = ask_ladder();
+    assert_eq!(
+        run(&mut b, limit_tif(9, 9, Buy, 99, 4, Ioc)),
+        [Accepted { id: 9 }, cancelled(9, 4, ImmediateOrCancel)]
+    );
+    assert_eq!(b.order_count(), 3);
+}
+
+#[test]
+fn fok_fills_completely_across_levels() {
+    let mut b = ask_ladder();
+    let events = run(&mut b, limit_tif(9, 9, Buy, 103, 7, Fok));
+    assert_eq!(fills(&events), [(1, 100, 2), (2, 101, 3), (3, 103, 2)]);
+    assert!(!events.iter().any(|e| matches!(e, Cancelled { id: 9, .. })));
+    assert_eq!(queue(&b, Sell, 103), [(3, 3)]);
+}
+
+#[test]
+fn fok_that_cannot_fill_is_killed_without_trading() {
+    let mut b = ask_ladder();
+    // 5 lots up to 101, but 6 wanted: nothing trades.
+    assert_eq!(
+        run(&mut b, limit_tif(9, 9, Buy, 101, 6, Fok)),
+        [Accepted { id: 9 }, cancelled(9, 6, FillOrKill)]
+    );
+    assert_eq!(b.order_count(), 3);
+    assert_eq!(b.trade_count(), 0);
+}
+
+#[test]
+fn fok_counts_only_liquidity_self_trade_prevention_lets_it_reach() {
+    // Under CancelResting the owner's own ask would be cancelled, not traded: 2 + 5 lots
+    // reachable, not 2 + 3 + 5.
+    let mut b = book();
+    run(&mut b, limit_by(1, 1, Sell, 100, 2));
+    run(&mut b, limit_by(7, 2, Sell, 101, 3));
+    run(&mut b, limit_by(3, 3, Sell, 103, 5));
+    assert_eq!(
+        run(&mut b, limit_tif(7, 9, Buy, 103, 8, Fok)),
+        [Accepted { id: 9 }, cancelled(9, 8, FillOrKill)]
+    );
+    let events = run(&mut b, limit_tif(7, 10, Buy, 103, 7, Fok));
+    assert_eq!(fills(&events), [(1, 100, 2), (3, 103, 5)]);
+    assert!(events.contains(&cancelled(2, 3, SelfTrade)));
+
+    // Under CancelIncoming matching would stop at the owner's ask, so only what lies in
+    // front of it counts, however much sits behind.
+    let mut b = OrderBook::new(BookConfig {
+        self_trade: SelfTradePolicy::CancelIncoming,
+        ..CFG
+    });
+    run(&mut b, limit_by(1, 1, Sell, 100, 2));
+    run(&mut b, limit_by(7, 2, Sell, 101, 3));
+    run(&mut b, limit_by(3, 3, Sell, 103, 50));
+    assert_eq!(
+        run(&mut b, limit_tif(7, 9, Buy, 103, 3, Fok)),
+        [Accepted { id: 9 }, cancelled(9, 3, FillOrKill)]
+    );
+    assert_eq!(
+        fills(&run(&mut b, limit_tif(7, 10, Buy, 103, 2, Fok))),
+        [(1, 100, 2)]
+    );
+}
+
+#[test]
+fn orders_that_never_rest_are_not_refused_by_a_full_book() {
+    let mut b = OrderBook::new(BookConfig::new(1, 10_000, 1));
+    run(&mut b, limit(1, Sell, 100, 1));
+    assert_eq!(run(&mut b, limit(2, Buy, 90, 1)), [rejected(2, BookFull)]);
+    assert_eq!(
+        run(&mut b, limit_tif(2, 2, Buy, 90, 1, Ioc)),
+        [Accepted { id: 2 }, cancelled(2, 1, ImmediateOrCancel)]
+    );
+    assert_eq!(
+        run(&mut b, limit_tif(3, 3, Buy, 90, 1, Fok)),
+        [Accepted { id: 3 }, cancelled(3, 1, FillOrKill)]
+    );
+    assert_eq!(
+        run(&mut b, limit_tif(4, 4, Buy, 90, 1, PostOnly)),
+        [rejected(4, BookFull)]
+    );
+}
+
+#[test]
+fn post_only_rests_and_never_takes_liquidity() {
+    let mut b = ask_ladder();
+    assert_eq!(
+        run(&mut b, limit_tif(9, 9, Buy, 99, 4, PostOnly)),
+        [Accepted { id: 9 }, rested(9, Buy, 99, 4)]
+    );
+    assert!(b.order(9).unwrap().post_only);
+    // At or through the best ask it would trade, so it is refused and nothing happens.
+    assert_eq!(
+        run(&mut b, limit_tif(10, 10, Buy, 100, 1, PostOnly)),
+        [rejected(10, PostOnlyWouldCross)]
+    );
+    assert_eq!(b.order_count(), 4);
+}
+
+#[test]
+fn post_only_restriction_survives_modifies() {
+    let mut b = ask_ladder();
+    run(&mut b, limit_tif(9, 9, Buy, 98, 4, PostOnly));
+    // Moving it so that it would cross is refused like a new post-only order.
+    assert_eq!(
+        run(&mut b, modify(9, 100, 4)),
+        [rejected(9, PostOnlyWouldCross)]
+    );
+    assert_eq!(queue(&b, Buy, 98), [(9, 4)]);
+    // A move that does not cross is fine, and the order stays post-only.
+    assert_eq!(
+        run(&mut b, modify(9, 99, 6)),
+        [modified(9, 99, 6, 6), rested(9, Buy, 99, 6)]
+    );
+    assert!(b.order(9).unwrap().post_only);
+    // A plain GTC order may be modified into the market.
+    run(&mut b, limit(10, Buy, 97, 1));
+    assert_eq!(fills(&run(&mut b, modify(10, 100, 1))), [(1, 100, 1)]);
 }
 
 // ---------------------------------------------------------------------------------------

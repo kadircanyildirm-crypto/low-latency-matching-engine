@@ -19,6 +19,9 @@ pub(crate) struct OrderNode {
     pub next: u32,
     pub owner: OwnerId,
     pub side: Side,
+    /// Post-only orders keep the restriction while they rest: a modify may not make them
+    /// trade.
+    pub post_only: bool,
 }
 
 // The node's size is part of the cache budget; growing it should be a deliberate decision.
@@ -34,6 +37,7 @@ impl OrderNode {
         level: u32,
         remaining: Qty,
         total: Qty,
+        post_only: bool,
     ) -> Self {
         Self {
             id,
@@ -44,6 +48,7 @@ impl OrderNode {
             next: NIL,
             owner,
             side,
+            post_only,
         }
     }
 }
@@ -74,6 +79,7 @@ impl OrderPool {
                 next: if slot + 1 < capacity { slot + 1 } else { NIL },
                 owner: 0,
                 side: Side::Buy,
+                post_only: false,
             })
             .collect();
         Self {

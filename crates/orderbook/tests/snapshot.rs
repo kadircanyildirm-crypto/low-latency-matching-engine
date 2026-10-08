@@ -57,6 +57,7 @@ fn order(id: u64, side: Side, price: i64, leaves: u64, filled: u64) -> SnapshotO
         price,
         leaves,
         filled,
+        post_only: false,
     }
 }
 
@@ -70,7 +71,10 @@ fn sample() -> BookSnapshot {
         trade_count: 4,
         orders: vec![
             order(1, Side::Buy, 50, 5, 2),
-            order(2, Side::Buy, 50, 7, 0),
+            SnapshotOrder {
+                post_only: true,
+                ..order(2, Side::Buy, 50, 7, 0)
+            },
             order(3, Side::Sell, 60, 1, 9),
         ],
     }
@@ -88,6 +92,7 @@ fn a_snapshot_round_trips_through_restore() {
     assert_eq!(queue, [1, 2]);
     let info = book.order(3).unwrap();
     assert_eq!((info.leaves, info.filled), (1, 9));
+    assert!(book.order(2).unwrap().post_only && !info.post_only);
 }
 
 #[test]
@@ -125,6 +130,7 @@ fn the_digest_covers_every_field() {
     vary("price", |s| s.orders[2].price += 1);
     vary("leaves", |s| s.orders[0].leaves += 1);
     vary("filled", |s| s.orders[0].filled += 1);
+    vary("post-only", |s| s.orders[0].post_only = true);
     vary("queue order", |s| s.orders.swap(0, 1));
     vary("missing order", |s| {
         s.orders.pop();

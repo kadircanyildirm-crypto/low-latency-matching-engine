@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use orderbook::{
     BookConfig, CancelReason, Command, Event, OrderId, OwnerId, Price, Qty, QueuedOrder,
-    RejectReason, SelfTradePolicy, Side,
+    RejectReason, SelfTradePolicy, Side, TimeInForce,
 };
 
 use super::Snapshot;
@@ -20,6 +20,7 @@ struct Order {
     owner: OwnerId,
     leaves: Qty,
     total: Qty,
+    post_only: bool,
 }
 
 type Ladder = BTreeMap<Price, VecDeque<Order>>;
@@ -32,6 +33,7 @@ enum Halt {
     SelfTrade,
 }
 
+#[derive(Clone)]
 pub struct ReferenceBook {
     cfg: BookConfig,
     bids: Ladder,
@@ -72,6 +74,7 @@ impl ReferenceBook {
                 side,
                 price,
                 qty,
+                tif,
             } => {
                 self.check_owner(owner)?;
                 self.check_qty(qty)?;
@@ -82,11 +85,55 @@ impl ReferenceBook {
                 if self.outside_protection(side, price) {
                     return Err(RejectReason::PriceOutsideProtection);
                 }
-                if self.orders.len() >= self.cfg.max_orders as usize && !self.crosses(side, price) {
+                let crosses = self.crosses(side, price);
+                if tif == TimeInForce::PostOnly && crosses {
+                    return Err(RejectReason::PostOnlyWouldCross);
+                }
+                let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
+                if may_rest && self.orders.len() >= self.cfg.max_orders as usize && !crosses {
                     return Err(RejectReason::BookFull);
                 }
                 out.push(Event::Accepted { id });
-                self.execute_limit(id, owner, side, price, qty, qty, out);
+                match tif {
+                    TimeInForce::Gtc | TimeInForce::PostOnly => {
+                        let post_only = tif == TimeInForce::PostOnly;
+                        self.execute_limit(id, owner, side, price, qty, qty, post_only, out);
+                    }
+                    TimeInForce::Ioc => {
+                        let (left, halt) =
+                            self.match_incoming(id, owner, side, qty, Some(price), out);
+                        if left > 0 {
+                            let reason = if halt == Halt::SelfTrade {
+                                CancelReason::SelfTrade
+                            } else {
+                                CancelReason::ImmediateOrCancel
+                            };
+                            out.push(Event::Cancelled {
+                                id,
+                                qty: left,
+                                reason,
+                            });
+                        }
+                    }
+                    TimeInForce::Fok => {
+                        // Try it on a copy of the whole book, and keep the outcome only if
+                        // every lot traded.
+                        let mut trial = self.clone();
+                        let mut trial_out = Vec::new();
+                        let (left, _) =
+                            trial.match_incoming(id, owner, side, qty, Some(price), &mut trial_out);
+                        if left == 0 {
+                            *self = trial;
+                            out.extend(trial_out);
+                        } else {
+                            out.push(Event::Cancelled {
+                                id,
+                                qty,
+                                reason: CancelReason::FillOrKill,
+                            });
+                        }
+                    }
+                }
             }
             Command::Market {
                 id,
@@ -157,6 +204,9 @@ impl ReferenceBook {
                     if self.outside_protection(side, price) {
                         return Err(RejectReason::PriceOutsideProtection);
                     }
+                    if order.post_only && self.crosses(side, price) {
+                        return Err(RejectReason::PostOnlyWouldCross);
+                    }
                     self.take_out(id, side, old_price);
                     out.push(Event::Modified {
                         id,
@@ -164,7 +214,8 @@ impl ReferenceBook {
                         qty,
                         leaves: qty - filled,
                     });
-                    self.execute_limit(id, owner, side, price, qty - filled, qty, out);
+                    let leaves = qty - filled;
+                    self.execute_limit(id, owner, side, price, leaves, qty, order.post_only, out);
                 }
             }
             Command::CancelAll { owner } => {
@@ -281,6 +332,7 @@ impl ReferenceBook {
         price: Price,
         open: Qty,
         total: Qty,
+        post_only: bool,
         out: &mut Vec<Event>,
     ) {
         let (left, halt) = self.match_incoming(id, owner, side, open, Some(price), out);
@@ -303,6 +355,7 @@ impl ReferenceBook {
                 owner,
                 leaves: left,
                 total,
+                post_only,
             });
         self.orders.insert(id, (side, price));
         out.push(Event::Rested {
@@ -426,6 +479,7 @@ impl ReferenceBook {
                     owner: o.owner,
                     leaves: o.leaves,
                     filled: o.total - o.leaves,
+                    post_only: o.post_only,
                 })
                 .collect();
             (*price, orders)

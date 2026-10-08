@@ -7,7 +7,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
+use orderbook::workload::{EventCounts, Mix, TifMix, Workload, WorkloadConfig};
 use orderbook::{Event, EventSink, OrderBook};
 
 struct CountingAllocator;
@@ -129,6 +129,25 @@ fn mass_cancels_never_allocate() {
     let counts = assert_no_allocations(cfg, 100_000, 1_000_000);
     assert!(
         counts.mass_cancels > 10_000 && counts.mass_cancelled_orders > 100_000,
+        "{counts:?}"
+    );
+}
+
+/// Fill-or-kill orders walk the book before matching; neither that nor any other time in
+/// force may allocate.
+#[test]
+fn every_time_in_force_never_allocates() {
+    let cfg = WorkloadConfig {
+        tif: TifMix {
+            ioc: 30,
+            fok: 30,
+            post_only: 30,
+        },
+        ..WorkloadConfig::default()
+    };
+    let counts = assert_no_allocations(cfg, 100_000, 1_000_000);
+    assert!(
+        counts.ioc_cancels > 1_000 && counts.fok_kills > 1_000,
         "{counts:?}"
     );
 }

@@ -5,7 +5,7 @@ mod common;
 
 use common::reference::ReferenceBook;
 use common::{Fnv, snapshot};
-use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
+use orderbook::workload::{EventCounts, Mix, TifMix, Workload, WorkloadConfig};
 use orderbook::{BookConfig, EventSink, OrderBook, SelfTradePolicy};
 
 fn config() -> WorkloadConfig {
@@ -67,8 +67,8 @@ fn synthetic_flow_matches_reference() {
 }
 
 /// Few owners for frequent self-trades under `CancelIncoming`, many market orders against
-/// a one-tick protection band for frequent protection stops and rejections, and mass
-/// cancels.
+/// a one-tick protection band for frequent protection stops and rejections, mass cancels,
+/// and every time in force.
 fn protected_config() -> (WorkloadConfig, BookConfig) {
     let cfg = WorkloadConfig {
         owners: 4,
@@ -80,6 +80,11 @@ fn protected_config() -> (WorkloadConfig, BookConfig) {
             cancel: 19,
             mass_cancel: 1,
             modify: 5,
+        },
+        tif: TifMix {
+            ioc: 30,
+            fok: 20,
+            post_only: 20,
         },
         ..config()
     };
@@ -101,6 +106,10 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
     assert!(counts.rejected > 100, "{counts:?}");
     assert!(counts.mass_cancels > 100, "{counts:?}");
     assert!(counts.mass_cancelled_orders > 1_000, "{counts:?}");
+    assert!(
+        counts.ioc_cancels > 100 && counts.fok_kills > 100,
+        "{counts:?}"
+    );
 }
 
 /// Fingerprint of every event and the final book after 100k commands of synthetic flow,
@@ -166,6 +175,6 @@ fn output_matches_the_golden_fingerprints() {
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
-const GOLDEN_DEFAULT_DIGEST: u64 = 0x1069_1cd1_ccfd_aea6;
-const GOLDEN_PROTECTED: u64 = 0xaabb_7b6c_8feb_f4b2;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0x2fab_76d9_4590_5299;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x61c7_8078_5268_f126;
+const GOLDEN_PROTECTED: u64 = 0x28fa_3b96_7123_4f89;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0xc9d0_7f40_abc7_e800;

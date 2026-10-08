@@ -5,7 +5,9 @@
 //! edges or just outside the band, and quantities at zero, at `max_order_qty`, just above
 //! it, and at `u64::MAX`.
 
-use orderbook::{BookConfig, Command, OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side};
+use orderbook::{
+    BookConfig, Command, OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side, TimeInForce,
+};
 use proptest::prelude::*;
 use proptest::strategy::BoxedStrategy;
 
@@ -71,8 +73,8 @@ pub fn scenario(max_len: usize) -> impl Strategy<Value = (BookConfig, Vec<Comman
 
 pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
     prop_oneof![
-        6 => (id(), owner(), side(), price(cfg), qty(cfg))
-            .prop_map(|(id, owner, side, price, qty)| Command::Limit { id, owner, side, price, qty }),
+        6 => (id(), owner(), side(), price(cfg), qty(cfg), tif())
+            .prop_map(|(id, owner, side, price, qty, tif)| Command::Limit { id, owner, side, price, qty, tif }),
         1 => (id(), owner(), side(), qty(cfg))
             .prop_map(|(id, owner, side, qty)| Command::Market { id, owner, side, qty }),
         2 => (id(), owner())
@@ -90,6 +92,15 @@ fn id() -> impl Strategy<Value = OrderId> {
 
 fn owner() -> impl Strategy<Value = OwnerId> {
     0..4u32
+}
+
+fn tif() -> impl Strategy<Value = TimeInForce> {
+    prop_oneof![
+        5 => Just(TimeInForce::Gtc),
+        1 => Just(TimeInForce::Ioc),
+        1 => Just(TimeInForce::Fok),
+        1 => Just(TimeInForce::PostOnly),
+    ]
 }
 
 fn side() -> impl Strategy<Value = Side> {

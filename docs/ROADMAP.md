@@ -22,9 +22,9 @@ documented are worth more than five half-finished ones.
 allocates on the hot path.
 
 **Delivered**
-- Commands: GTC limit, market, cancel, and modify with FIX cancel/replace semantics on
-  total quantity. Shrinking at the same price keeps queue priority; any other change goes
-  to the back of the queue.
+- Commands: limit orders (GTC, IOC, fill-or-kill, post-only), market, cancel, and modify
+  with FIX cancel/replace semantics on total quantity. Shrinking at the same price keeps
+  queue priority; any other change goes to the back of the queue.
 - Mass cancel: `CancelAll` pulls every order of one owner in O(k log k) in that owner's
   orders, through per-owner lists keyed by dense owner ids.
 - Risk controls in the core: static price band, maximum order size, price protection,
@@ -143,7 +143,6 @@ primary's.
 
 ## Phase 7 — Extensions (optional)
 
-- IOC / FOK / post-only order types.
 - Price protection against a reference price (last trade or mid) with dynamic bands,
   instead of the opposite best price.
 - Market states: trading halts, opening and closing auctions.

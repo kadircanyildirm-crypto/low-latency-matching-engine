@@ -7,8 +7,10 @@
 //! of the outcome instead: each trade is with the next order in price-time priority, never
 //! through the taker's limit or the protection cap, never between the same owner; fills are
 //! as large as possible; quantity is conserved; rejected commands change nothing; orders the
-//! command did not touch are left exactly as they were; and a command is rejected exactly
-//! when a rule requires it, with the reason that rule gives.
+//! command did not touch are left exactly as they were; a command is rejected exactly when a
+//! rule requires it, with the reason that rule gives; immediate-or-cancel and fill-or-kill
+//! orders never rest, a fill-or-kill order fills completely exactly when the book could fill
+//! it, and post-only orders never trade.
 
 mod common;
 
@@ -16,10 +18,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use common::strategies::scenario;
 use common::{Snapshot, snapshot};
-use orderbook::CancelReason::{MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade};
+use orderbook::CancelReason::{
+    FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade,
+};
 use orderbook::{
     BookConfig, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder, RejectReason,
-    SelfTradePolicy, Side,
+    SelfTradePolicy, Side, TimeInForce,
 };
 use proptest::prelude::*;
 
@@ -203,6 +207,7 @@ fn check(
             side,
             price,
             qty,
+            tif,
         } => {
             ensure(first == Event::Accepted { id }, "must start with Accepted")?;
             let taker = Taker {
@@ -211,6 +216,8 @@ fn check(
                 side,
                 limit: Some(price),
                 cap: None,
+                tif: Some(tif),
+                post_only: tif == TimeInForce::PostOnly,
                 qty,
                 filled_before: 0,
             };
@@ -229,6 +236,8 @@ fn check(
                 side,
                 limit: None,
                 cap: protection_cap(cfg, before, side),
+                tif: None,
+                post_only: false,
                 qty,
                 filled_before: 0,
             };
@@ -275,14 +284,16 @@ fn check(
                     "an in-place modify must keep queue position and change only leaves",
                 );
             }
-            // Lost priority: the same as a new limit order for `leaves` arriving at a book
-            // without the old order.
+            // Lost priority: the same as a new GTC order for `leaves` arriving at a book
+            // without the old order, keeping its post-only restriction.
             let taker = Taker {
                 id,
                 owner,
                 side,
                 limit: Some(price),
                 cap: None,
+                tif: Some(TimeInForce::Gtc),
+                post_only: order.post_only,
                 qty: leaves,
                 filled_before: order.filled,
             };
@@ -341,6 +352,10 @@ struct Taker {
     limit: Option<Price>,
     /// Price protection cap for market orders.
     cap: Option<Price>,
+    /// Time in force; `None` for market orders.
+    tif: Option<TimeInForce>,
+    /// A post-only order, or a modify of one: it may not trade, and rests post-only.
+    post_only: bool,
     /// Quantity to work.
     qty: Qty,
     /// Filled before this command (modifies keep their history).
@@ -351,6 +366,26 @@ impl Taker {
     fn may_trade_at(&self, price: Price) -> bool {
         self.limit.is_none_or(|l| within(self.side, price, l))
             && self.cap.is_none_or(|c| within(self.side, price, c))
+    }
+
+    /// Whether matching against `line` (the opposite side in priority order) would fill the
+    /// whole quantity. Under `CancelResting` the owner's own orders would be cancelled, not
+    /// traded; under `CancelIncoming` matching would stop at the first of them.
+    fn could_fill(&self, cfg: &BookConfig, line: &[(Price, QueuedOrder)]) -> bool {
+        let mut available = 0u128;
+        for &(price, order) in line {
+            if !self.may_trade_at(price) {
+                break;
+            }
+            if order.owner == self.owner {
+                if cfg.self_trade == SelfTradePolicy::CancelIncoming {
+                    break;
+                }
+                continue;
+            }
+            available += u128::from(order.leaves);
+        }
+        available >= u128::from(self.qty)
     }
 }
 
@@ -364,6 +399,21 @@ fn check_execution(
     events: &[Event],
 ) -> Check {
     let line = before.priority(taker.side.opposite());
+    if taker.tif == Some(TimeInForce::Fok) && !taker.could_fill(cfg, &line) {
+        ensure(
+            events
+                == [Event::Cancelled {
+                    id: taker.id,
+                    qty: taker.qty,
+                    reason: FillOrKill,
+                }],
+            "a fill-or-kill order the book cannot fill must be killed without trading",
+        )?;
+        return ensure(
+            after.snapshot == before.snapshot && after.trade_count == before.trade_count,
+            "a killed fill-or-kill order changed the book",
+        );
+    }
     let mut next_in_line = 0usize;
     let mut left = taker.qty;
     let mut next_trade_id = before.trade_count + 1;
@@ -387,6 +437,7 @@ fn check_execution(
                     t == taker.id && taker_side == taker.side,
                     "trade names the wrong taker",
                 )?;
+                ensure(!taker.post_only, "a post-only order traded")?;
                 ensure(trade_id == next_trade_id, "trade ids must be consecutive")?;
                 next_trade_id += 1;
                 let (maker_price, m) = *line
@@ -486,6 +537,10 @@ fn check_execution(
                 "rested with the wrong id, side or price",
             )?;
             ensure(
+                matches!(taker.tif, Some(TimeInForce::Gtc | TimeInForce::PostOnly)),
+                "only GTC and post-only orders rest",
+            )?;
+            ensure(
                 *qty == left && left > 0,
                 "rested quantity must be the unfilled quantity",
             )?;
@@ -529,6 +584,19 @@ fn check_execution(
                         "PriceProtection although the next order is within the cap",
                     )?;
                 }
+                ImmediateOrCancel => {
+                    ensure(
+                        taker.tif == Some(TimeInForce::Ioc),
+                        "only immediate-or-cancel orders expire",
+                    )?;
+                    ensure(
+                        next_reachable.is_none(),
+                        "an immediate-or-cancel order expired although it could still trade",
+                    )?;
+                }
+                FillOrKill => {
+                    return Err("a fill-or-kill order that could fill was killed".into());
+                }
                 Requested | MassCancel => return Err("a Cancel reason on a new order".into()),
             }
         }
@@ -561,6 +629,7 @@ fn check_execution(
                 owner: taker.owner,
                 leaves: qty,
                 filled: taker.filled_before + (taker.qty - qty),
+                post_only: taker.post_only,
             });
     }
     ensure(
@@ -609,7 +678,10 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             side,
             price,
             qty,
+            tif,
         } => {
+            let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
+            let full = before.order_count() == cfg.max_orders as usize;
             if owner_invalid(owner) {
                 Some(InvalidOwner)
             } else if qty_invalid(qty) {
@@ -620,8 +692,11 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(DuplicateOrderId)
             } else if beyond_protection(side, price) {
                 Some(PriceOutsideProtection)
-            } else if before.order_count() == cfg.max_orders as usize && !crosses(side, price) {
-                // A crossing order frees a slot by its first match, so it is never refused.
+            } else if tif == TimeInForce::PostOnly && crosses(side, price) {
+                Some(PostOnlyWouldCross)
+            } else if may_rest && full && !crosses(side, price) {
+                // A crossing order frees a slot by its first match, and orders that never
+                // rest need none, so neither is refused.
                 Some(BookFull)
             } else {
                 None
@@ -659,7 +734,13 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             let leaves = qty.saturating_sub(order.filled);
             let in_place = price == old_price && leaves <= order.leaves;
             let replaces = leaves > 0 && !in_place;
-            (replaces && beyond_protection(side, price)).then_some(PriceOutsideProtection)
+            if replaces && beyond_protection(side, price) {
+                Some(PriceOutsideProtection)
+            } else if replaces && order.post_only && crosses(side, price) {
+                Some(PostOnlyWouldCross)
+            } else {
+                None
+            }
         }
         Command::CancelAll { .. } => None,
     }

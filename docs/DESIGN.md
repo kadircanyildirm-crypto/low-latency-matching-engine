@@ -107,7 +107,7 @@ does not need to record it.
 
 | Command | Events |
 |---|---|
-| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention), then at most one of `Rested` or `Cancelled` for the remainder |
+| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only |
 | `Cancel` | `Cancelled{Requested}` or `Rejected` |
 | `Modify` | `Rejected`, or `Modified` followed, if priority is lost, by the events of a new limit order |
 | `CancelAll` | `Cancelled{MassCancel}` for each of the owner's orders in book order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing resting |
@@ -122,7 +122,10 @@ The engine itself has no notion of time or transport.
 
 | Command | Behaviour |
 |---|---|
-| `Limit` | Good-till-cancelled. Trades up to its price; the remainder rests at its price. |
+| `Limit`, GTC | Trades up to its price; the remainder rests at its price until cancelled. |
+| `Limit`, IOC | Trades up to its price; the remainder is cancelled (`ImmediateOrCancel`, or `SelfTrade` under `CancelIncoming`). Never rests. |
+| `Limit`, FOK | Trades its whole quantity up to its price, or nothing at all (`FillOrKill`). Never rests. |
+| `Limit`, post-only | Rests without trading. Refused (`PostOnlyWouldCross`) if it would trade on arrival, and so is any later modify that would make it trade. |
 | `Market` | Trades at any price within price protection. The remainder is cancelled with `NoLiquidity`, `PriceProtection` or `SelfTrade`. Never rests. |
 | `Cancel` | Removes the order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
@@ -143,6 +146,21 @@ The cases:
 | same price, `qty <= current total` | Open quantity shrinks in place; **queue priority is kept** |
 | anything else | Cancel/replace: back of the queue at the new price; may trade |
 
+A modify that re-enters the book works like a GTC order. A post-only order keeps its
+restriction, though: the flag is stored with the resting order and its snapshot, so a
+market maker's order can never take liquidity, whatever it is modified to.
+
+**Fill-or-kill decides before it trades.** "Fill completely or not at all" must hold under
+self-trade prevention too. Under `CancelResting`, the owner's own orders in the way would
+be cancelled, not traded, so they contribute nothing. Under `CancelIncoming`, matching
+would stop at the first of them, so nothing behind it counts. So the engine walks the
+opposite side in matching order, without changing anything, and sums what the order could
+really take. If that is enough it matches normally, otherwise it is killed and the book is
+untouched. The walk stops as soon as the quantity is covered, so it costs no more than the
+match it precedes. The reference book does not reimplement this rule: it runs the match on
+a copy of itself and keeps the copy only if every lot traded. The two must agree on every
+random sequence.
+
 ## 6. Risk controls in the core
 
 | Control | Rule |
@@ -156,9 +174,9 @@ The cases:
 
 ## 7. Capacity and admission
 
-The book holds at most `max_orders` resting orders. When it is full, a new limit order is
-refused with `BookFull` **only if it does not cross**. A crossing order always finds a
-slot:
+The book holds at most `max_orders` resting orders. When it is full, a new GTC or
+post-only order is refused with `BookFull` **only if it does not cross**. IOC and FOK
+orders never rest, so they are never refused. A crossing order always finds a slot:
 
 - Its first match either fills the taker completely (nothing needs to rest), or
 - it removes a resting order, by filling it or by self-trade prevention, which frees a
@@ -238,7 +256,6 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
 | Price protection is measured from the opposite best at arrival, not from a reference or last-trade price, so a stale order far from the market anchors the band, and orders priced at the market can be rejected as fat-finger orders. There are no dynamic bands for limit orders resting away from the market | Phase 7: reference price and dynamic bands |
-| Only GTC limit and market orders | Phase 7: IOC, FOK, post-only |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | No market states: trading halts, opening and closing auctions | Phase 7 |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |

@@ -28,6 +28,8 @@ pub struct SnapshotOrder {
     /// Quantity filled so far. Kept because a modify's new quantity is a total that
     /// includes it.
     pub filled: Qty,
+    /// Whether the order was entered post-only; it still restricts the order's modifies.
+    pub post_only: bool,
 }
 
 /// The complete state of a book.
@@ -132,6 +134,7 @@ impl OrderBook {
                 level,
                 order.leaves,
                 total,
+                order.post_only,
             ));
             // Orders arrive in book order, so each owner's list ends up in queue order
             // within every level, which is all that mass cancels depend on.
@@ -169,6 +172,7 @@ impl OrderBook {
                         price: level.price,
                         leaves: order.leaves,
                         filled: order.filled,
+                        post_only: order.post_only,
                     });
                 }
             }
@@ -215,6 +219,7 @@ impl Digest {
         self.u64(u64::from(order.owner));
         self.u64(order.leaves);
         self.u64(order.filled);
+        self.u64(u64::from(order.post_only));
     }
 
     fn i64(&mut self, value: i64) {

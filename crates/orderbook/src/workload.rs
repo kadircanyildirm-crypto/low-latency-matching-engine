@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     BookConfig, CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty,
-    RejectReason, SelfTradePolicy, Side,
+    RejectReason, SelfTradePolicy, Side, TimeInForce,
 };
 
 /// SplitMix64: tiny, fast and identical on every platform, so a seed fully determines a run.
@@ -56,6 +56,19 @@ pub struct Mix {
     pub modify: u8,
 }
 
+/// Time in force of generated limit orders, in percent; the rest are GTC. All zero by
+/// default, in which case the generator draws no extra random numbers, so adding this
+/// left every existing stream unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TifMix {
+    /// Share of aggressive limits sent immediate-or-cancel.
+    pub ioc: u8,
+    /// Share of aggressive limits sent fill-or-kill.
+    pub fok: u8,
+    /// Share of passive limits sent post-only.
+    pub post_only: u8,
+}
+
 /// Shape of the generated order flow.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkloadConfig {
@@ -78,6 +91,8 @@ pub struct WorkloadConfig {
     pub max_live: u32,
     /// Command mix.
     pub mix: Mix,
+    /// Time in force of limit orders.
+    pub tif: TifMix,
 }
 
 impl Default for WorkloadConfig {
@@ -99,6 +114,7 @@ impl Default for WorkloadConfig {
                 mass_cancel: 0,
                 modify: 5,
             },
+            tif: TifMix::default(),
         }
     }
 }
@@ -168,6 +184,11 @@ impl Workload {
         .map(|&p| u32::from(p))
         .sum();
         assert_eq!(total, 100, "mix must add up to 100");
+        let t = cfg.tif;
+        assert!(
+            u16::from(t.ioc) + u16::from(t.fok) <= 100 && t.post_only <= 100,
+            "time-in-force shares are percentages"
+        );
         assert!(cfg.max_live > 0 && cfg.max_qty > 0 && cfg.owners > 0 && cfg.passive_depth > 0);
         let margin = cfg.passive_depth + 8;
         assert!(
@@ -337,6 +358,25 @@ impl Workload {
         }
     }
 
+    /// Draws only when the relevant shares are non-zero, so a GTC-only flow is unchanged.
+    fn random_tif(&mut self, aggressive: bool) -> TimeInForce {
+        let t = self.cfg.tif;
+        if aggressive && t.ioc + t.fok > 0 {
+            let roll = self.rng.below(100) as u8;
+            if roll < t.ioc {
+                TimeInForce::Ioc
+            } else if roll < t.ioc + t.fok {
+                TimeInForce::Fok
+            } else {
+                TimeInForce::Gtc
+            }
+        } else if !aggressive && t.post_only > 0 && (self.rng.below(100) as u8) < t.post_only {
+            TimeInForce::PostOnly
+        } else {
+            TimeInForce::Gtc
+        }
+    }
+
     fn take_id(&mut self) -> OrderId {
         let id = self.next_id;
         self.next_id += 1;
@@ -352,12 +392,14 @@ impl Workload {
         };
         let qty = self.random_qty();
         let id = self.take_id();
+        let tif = self.random_tif(aggressive);
         let order = Command::Limit {
             id,
             owner: self.owner_of_new(id),
             side,
             price,
             qty,
+            tif,
         };
         if self.live.len() < self.cfg.max_live as usize {
             return order;
@@ -438,6 +480,10 @@ pub struct EventCounts {
     pub protection_cancels: u64,
     /// `Cancelled` events caused by a mass cancel.
     pub mass_cancelled_orders: u64,
+    /// Unfilled remainders of immediate-or-cancel orders.
+    pub ioc_cancels: u64,
+    /// Fill-or-kill orders that could not fill.
+    pub fok_kills: u64,
     /// `Modified` events.
     pub modified: u64,
     /// `MassCancelled` events.
@@ -466,6 +512,8 @@ impl EventSink for EventCounts {
                     CancelReason::SelfTrade => self.self_trade_cancels += 1,
                     CancelReason::PriceProtection => self.protection_cancels += 1,
                     CancelReason::MassCancel => self.mass_cancelled_orders += 1,
+                    CancelReason::ImmediateOrCancel => self.ioc_cancels += 1,
+                    CancelReason::FillOrKill => self.fok_kills += 1,
                     CancelReason::Requested | CancelReason::NoLiquidity => {}
                 }
             }

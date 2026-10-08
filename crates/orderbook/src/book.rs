@@ -11,7 +11,7 @@ use crate::owners::Owners;
 use crate::pool::{NIL, OrderNode, OrderPool};
 use crate::types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
-    SelfTradePolicy, Side, TradeId,
+    SelfTradePolicy, Side, TimeInForce, TradeId,
 };
 
 /// Static limits and policies of a book.
@@ -87,6 +87,8 @@ pub struct OrderInfo {
     pub leaves: Qty,
     /// Quantity filled so far.
     pub filled: Qty,
+    /// Whether the order was entered post-only, which still restricts its modifies.
+    pub post_only: bool,
 }
 
 /// One order in a level's queue, as yielded by [`OrderBook::queue`].
@@ -100,6 +102,8 @@ pub struct QueuedOrder {
     pub leaves: Qty,
     /// Quantity filled so far.
     pub filled: Qty,
+    /// Whether the order was entered post-only, which still restricts its modifies.
+    pub post_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,6 +230,20 @@ impl HalfBook {
         }
     }
 
+    /// The next occupied level after `level` in priority order: the next lower bid or the
+    /// next higher ask.
+    #[inline]
+    fn after(&self, level: u32) -> Option<u32> {
+        let i = level as usize;
+        match self.side {
+            Side::Buy => i
+                .checked_sub(1)
+                .and_then(|j| self.occupied.prev_at_or_before(j)),
+            Side::Sell => self.occupied.next_at_or_after(i + 1),
+        }
+        .map(|j| j as u32)
+    }
+
     #[inline]
     fn level_emptied(&mut self, level: u32) {
         self.occupied.remove(level as usize);
@@ -324,7 +342,8 @@ impl OrderBook {
                 side,
                 price,
                 qty,
-            } => (id, self.new_limit(id, owner, side, price, qty, sink)),
+                tif,
+            } => (id, self.new_limit(id, owner, side, price, qty, tif, sink)),
             Command::Market {
                 id,
                 owner,
@@ -349,6 +368,7 @@ impl OrderBook {
     // command leaves no trace besides the `Rejected` event. Stateless checks (owner,
     // quantity, price band) come before stateful ones (ids, protection, capacity).
 
+    #[allow(clippy::too_many_arguments)]
     fn new_limit<S: EventSink>(
         &mut self,
         id: OrderId,
@@ -356,6 +376,7 @@ impl OrderBook {
         side: Side,
         price: Price,
         qty: Qty,
+        tif: TimeInForce,
         sink: &mut S,
     ) -> Result<(), RejectReason> {
         self.check_owner(owner)?;
@@ -367,15 +388,84 @@ impl OrderBook {
         if self.outside_protection(side, level) {
             return Err(RejectReason::PriceOutsideProtection);
         }
+        if tif == TimeInForce::PostOnly && self.crosses(side, level) {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
         // A crossing order always finds room to rest: its first match either fills it or
         // removes a resting order (by filling it or by self-trade prevention), freeing a
-        // slot. So only an order that can do nothing but rest is refused when full.
-        if self.pool.is_full() && !self.crosses(side, level) {
+        // slot. So only an order that can do nothing but rest is refused when full, and
+        // orders that never rest are never refused.
+        let may_rest = matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly);
+        if may_rest && self.pool.is_full() && !self.crosses(side, level) {
             return Err(RejectReason::BookFull);
         }
         sink.on_event(Event::Accepted { id });
-        self.execute_limit(id, owner, side, level, qty, qty, sink);
+        match tif {
+            TimeInForce::Gtc | TimeInForce::PostOnly => {
+                let post_only = tif == TimeInForce::PostOnly;
+                self.execute_limit(id, owner, side, level, qty, qty, post_only, sink);
+            }
+            TimeInForce::Fok if !self.can_fill(owner, side, level, qty) => {
+                sink.on_event(Event::Cancelled {
+                    id,
+                    qty,
+                    reason: CancelReason::FillOrKill,
+                });
+            }
+            TimeInForce::Ioc | TimeInForce::Fok => {
+                let (unfilled, halt) = self.match_incoming(id, owner, side, qty, Some(level), sink);
+                debug_assert!(
+                    tif == TimeInForce::Ioc || unfilled == 0,
+                    "a fill-or-kill order that could fill did not"
+                );
+                if unfilled > 0 {
+                    let reason = match halt {
+                        Halt::SelfTrade => CancelReason::SelfTrade,
+                        _ => CancelReason::ImmediateOrCancel,
+                    };
+                    sink.on_event(Event::Cancelled {
+                        id,
+                        qty: unfilled,
+                        reason,
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether an order of `owner` on `side`, limited at `limit`, would fill `qty`
+    /// completely if it matched now. Walks the opposite side in the order `match_incoming`
+    /// would, without changing anything. Under `CancelResting` the owner's own orders would
+    /// be cancelled rather than traded, so they add nothing; under `CancelIncoming` matching
+    /// would stop at the first of them.
+    fn can_fill(&self, owner: OwnerId, side: Side, limit: u32, mut qty: Qty) -> bool {
+        let resting = self.half(side.opposite());
+        let mut next = resting.best;
+        while let Some(level) = next {
+            let crosses = match side {
+                Side::Buy => level <= limit,
+                Side::Sell => level >= limit,
+            };
+            if !crosses {
+                return false;
+            }
+            let mut slot = resting.levels[level as usize].head;
+            while slot != NIL {
+                let node = self.pool.get(slot);
+                if node.owner != owner {
+                    if node.remaining >= qty {
+                        return true;
+                    }
+                    qty -= node.remaining;
+                } else if self.config.self_trade == SelfTradePolicy::CancelIncoming {
+                    return false;
+                }
+                slot = node.next;
+            }
+            next = resting.after(level);
+        }
+        false
     }
 
     fn new_market<S: EventSink>(
@@ -509,6 +599,9 @@ impl OrderBook {
         if self.outside_protection(node.side, level) {
             return Err(RejectReason::PriceOutsideProtection);
         }
+        if node.post_only && self.crosses(node.side, level) {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
         self.remove(slot);
         sink.on_event(Event::Modified {
             id,
@@ -516,7 +609,16 @@ impl OrderBook {
             qty,
             leaves,
         });
-        self.execute_limit(id, owner, node.side, level, leaves, qty, sink);
+        self.execute_limit(
+            id,
+            owner,
+            node.side,
+            level,
+            leaves,
+            qty,
+            node.post_only,
+            sink,
+        );
         Ok(())
     }
 
@@ -532,6 +634,7 @@ impl OrderBook {
         level: u32,
         open: Qty,
         total: Qty,
+        post_only: bool,
         sink: &mut S,
     ) {
         let (remaining, halt) = self.match_incoming(id, owner, side, open, Some(level), sink);
@@ -546,9 +649,9 @@ impl OrderBook {
             });
             return;
         }
-        let slot = self
-            .pool
-            .alloc(OrderNode::new(id, owner, side, level, remaining, total));
+        let slot = self.pool.alloc(OrderNode::new(
+            id, owner, side, level, remaining, total, post_only,
+        ));
         self.place(slot);
         sink.on_event(Event::Rested {
             id,
@@ -811,6 +914,7 @@ impl OrderBook {
             price: self.price_of(node.level),
             leaves: node.remaining,
             filled: node.total - node.remaining,
+            post_only: node.post_only,
         })
     }
 
@@ -1021,15 +1125,8 @@ impl Iterator for Depth<'_> {
 
     fn next(&mut self) -> Option<LevelInfo> {
         let level = self.next?;
-        let i = level as usize;
-        self.next = match self.half.side {
-            Side::Buy => i
-                .checked_sub(1)
-                .and_then(|j| self.half.occupied.prev_at_or_before(j)),
-            Side::Sell => self.half.occupied.next_at_or_after(i + 1),
-        }
-        .map(|j| j as u32);
-        let lvl = &self.half.levels[i];
+        self.next = self.half.after(level);
+        let lvl = &self.half.levels[level as usize];
         Some(LevelInfo {
             price: self.min_price + Price::from(level),
             qty: lvl.total_qty,
@@ -1058,6 +1155,7 @@ impl Iterator for Queue<'_> {
             owner: node.owner,
             leaves: node.remaining,
             filled: node.total - node.remaining,
+            post_only: node.post_only,
         })
     }
 }
@@ -1090,6 +1188,7 @@ mod validate_tests {
                     side,
                     price,
                     qty,
+                    tif: TimeInForce::Gtc,
                 },
                 &mut events,
             );
@@ -1268,7 +1367,7 @@ mod validate_tests {
         assert_detects(
             |b| {
                 let l = level(b, 105) as u32;
-                let s = b.pool.alloc(OrderNode::new(9, 9, Buy, l, 1, 1));
+                let s = b.pool.alloc(OrderNode::new(9, 9, Buy, l, 1, 1, false));
                 b.place(s);
             },
             "crossed",

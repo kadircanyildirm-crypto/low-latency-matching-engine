@@ -43,8 +43,8 @@ impl Side {
 /// event sourcing and replay possible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
-    /// Good-till-cancelled limit order. Trades against the opposite side at `price` or
-    /// better; any remainder rests on the book at `price`.
+    /// Limit order. Trades against the opposite side at `price` or better; what happens to
+    /// the remainder depends on `tif`.
     Limit {
         /// New order's id; must not belong to a resting order.
         id: OrderId,
@@ -56,6 +56,8 @@ pub enum Command {
         price: Price,
         /// Order quantity, `1..=max_order_qty`.
         qty: Qty,
+        /// Time in force.
+        tif: TimeInForce,
     },
     /// Trades against the opposite side at any price within the book's price protection.
     /// Whatever cannot be filled is cancelled; market orders never rest.
@@ -128,13 +130,29 @@ impl Command {
     }
 }
 
+/// How long a limit order works, and whether it may take liquidity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TimeInForce {
+    /// Good till cancelled: trades what it can, and the remainder rests.
+    #[default]
+    Gtc,
+    /// Immediate or cancel: trades what it can, and the remainder is cancelled. Never rests.
+    Ioc,
+    /// Fill or kill: trades its whole quantity at once, or nothing at all. Never rests.
+    Fok,
+    /// Post only: only ever adds liquidity. Refused if it would trade on arrival; once
+    /// resting, a modify that would make it trade is refused too.
+    PostOnly,
+}
+
 /// Output of the matching engine.
 ///
 /// Per command the engine emits:
 /// - `Limit` / `Market`: either a single `Rejected`, or `Accepted` followed by any number
 ///   of `Trade`s (and `Cancelled { reason: SelfTrade }` for resting orders removed by
-///   self-trade prevention), then at most one of `Rested` (limit remainder) or `Cancelled`
-///   (remainder that may not rest).
+///   self-trade prevention), then at most one of `Rested` (a GTC or post-only remainder) or
+///   `Cancelled` (a remainder that may not rest). A fill-or-kill order that cannot fill
+///   emits `Accepted` and `Cancelled { reason: FillOrKill }` and nothing else.
 /// - `Cancel`: `Cancelled { reason: Requested }` or `Rejected`.
 /// - `Modify`: `Rejected`, or `Modified`. If the order lost priority, `Modified` is followed
 ///   by the same events a new limit order would produce after `Accepted`.
@@ -238,6 +256,8 @@ pub enum RejectReason {
     BookFull,
     /// The owner id is not below the book's `max_owners`.
     InvalidOwner,
+    /// A post-only order, or a modify of one, would have traded with the opposite side.
+    PostOnlyWouldCross,
 }
 
 /// Why open quantity left the book without trading.
@@ -253,6 +273,10 @@ pub enum CancelReason {
     SelfTrade,
     /// A `CancelAll` of the order's owner.
     MassCancel,
+    /// The unfilled remainder of an immediate-or-cancel order.
+    ImmediateOrCancel,
+    /// A fill-or-kill order that could not fill completely; it did not trade at all.
+    FillOrKill,
 }
 
 /// How the book prevents an owner from trading with themselves.

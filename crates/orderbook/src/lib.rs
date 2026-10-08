@@ -42,6 +42,7 @@
 
 mod bitset;
 mod book;
+mod owners;
 mod pool;
 mod types;
 pub mod workload;

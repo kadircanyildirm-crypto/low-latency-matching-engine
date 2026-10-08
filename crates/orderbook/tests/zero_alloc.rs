@@ -7,7 +7,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use orderbook::workload::{EventCounts, Workload, WorkloadConfig};
+use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
 use orderbook::{Event, EventSink, OrderBook};
 
 struct CountingAllocator;
@@ -111,6 +111,26 @@ fn a_permanently_full_book_never_allocates() {
         ..WorkloadConfig::default()
     };
     assert_no_allocations(cfg, 10_000, 1_000_000);
+}
+
+/// Mass cancels sort the owner's orders in a buffer reserved at construction, and churn the
+/// owner table, whose index has the same tombstone worst case as the order id index.
+#[test]
+fn mass_cancels_never_allocate() {
+    let cfg = WorkloadConfig {
+        owners: 8,
+        mix: Mix {
+            cancel: 23,
+            mass_cancel: 2,
+            ..WorkloadConfig::default().mix
+        },
+        ..WorkloadConfig::default()
+    };
+    let counts = assert_no_allocations(cfg, 100_000, 1_000_000);
+    assert!(
+        counts.mass_cancels > 10_000 && counts.mass_cancelled_orders > 100_000,
+        "{counts:?}"
+    );
 }
 
 /// A deep book (100k resting orders), where the index and the pool are large.

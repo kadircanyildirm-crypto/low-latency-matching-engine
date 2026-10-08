@@ -1,7 +1,7 @@
 //! Proptest strategies: a random book configuration plus a command sequence that fits it.
 //!
 //! Inputs are biased toward the places bugs live: ids from a small pool (duplicates and
-//! unknown ids), few owners (self-trades), prices near bitset word boundaries and band
+//! unknown ids), few owners (self-trades, and sometimes one outside the owner table), prices near bitset word boundaries and band
 //! edges or just outside the band, and quantities at zero, at `max_order_qty`, just above
 //! it, and at `u64::MAX`.
 
@@ -26,24 +26,42 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
         Just(SelfTradePolicy::CancelResting),
         Just(SelfTradePolicy::CancelIncoming),
     ];
-    (band, 1u32..=24, any::<bool>(), protection, policy).prop_map(
-        |((min_price, max_price), max_orders, huge_qty, price_protection, self_trade)| {
-            BookConfig {
-                min_price,
-                max_price,
+    // Owners are drawn from 0..4, so a table of 3 sometimes sees an owner it cannot hold.
+    let max_owners = prop_oneof![Just(3u32), Just(BookConfig::DEFAULT_MAX_OWNERS)];
+    (
+        band,
+        1u32..=24,
+        max_owners,
+        any::<bool>(),
+        protection,
+        policy,
+    )
+        .prop_map(
+            |(
+                (min_price, max_price),
                 max_orders,
-                // Either small, so `max_order_qty + 1` shows up often, or as large as the
-                // capacity allows, so level totals approach `u64::MAX`.
-                max_order_qty: if huge_qty {
-                    u64::MAX / u64::from(max_orders)
-                } else {
-                    50
-                },
+                max_owners,
+                huge_qty,
                 price_protection,
                 self_trade,
-            }
-        },
-    )
+            )| {
+                BookConfig {
+                    min_price,
+                    max_price,
+                    max_orders,
+                    max_owners,
+                    // Either small, so `max_order_qty + 1` shows up often, or as large as the
+                    // capacity allows, so level totals approach `u64::MAX`.
+                    max_order_qty: if huge_qty {
+                        u64::MAX / u64::from(max_orders)
+                    } else {
+                        50
+                    },
+                    price_protection,
+                    self_trade,
+                }
+            },
+        )
 }
 
 /// A config together with a command sequence for it.
@@ -61,6 +79,7 @@ pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
             .prop_map(|(id, owner)| Command::Cancel { id, owner }),
         3 => (id(), owner(), price(cfg), qty(cfg))
             .prop_map(|(id, owner, price, qty)| Command::Modify { id, owner, price, qty }),
+        1 => owner().prop_map(|owner| Command::CancelAll { owner }),
     ]
     .boxed()
 }

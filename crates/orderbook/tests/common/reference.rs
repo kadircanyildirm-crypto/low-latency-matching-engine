@@ -58,7 +58,7 @@ impl ReferenceBook {
     pub fn process(&mut self, command: Command, out: &mut Vec<Event>) {
         if let Err(reason) = self.apply(command, out) {
             out.push(Event::Rejected {
-                id: command.id(),
+                id: command.id().expect("only commands with an id are rejected"),
                 reason,
             });
         }
@@ -73,6 +73,7 @@ impl ReferenceBook {
                 price,
                 qty,
             } => {
+                self.check_owner(owner)?;
                 self.check_qty(qty)?;
                 self.check_band(price)?;
                 if self.orders.contains_key(&id) {
@@ -93,6 +94,7 @@ impl ReferenceBook {
                 side,
                 qty,
             } => {
+                self.check_owner(owner)?;
                 self.check_qty(qty)?;
                 if self.orders.contains_key(&id) {
                     return Err(RejectReason::DuplicateOrderId);
@@ -165,6 +167,40 @@ impl ReferenceBook {
                     self.execute_limit(id, owner, side, price, qty - filled, qty, out);
                 }
             }
+            Command::CancelAll { owner } => {
+                // Walk the whole book in priority order and take out the owner's orders.
+                let mut count = 0;
+                for side in [Side::Buy, Side::Sell] {
+                    let prices: Vec<Price> = match side {
+                        Side::Buy => self.bids.keys().rev().copied().collect(),
+                        Side::Sell => self.asks.keys().copied().collect(),
+                    };
+                    for price in prices {
+                        let ids: Vec<OrderId> = self.ladder_ref(side)[&price]
+                            .iter()
+                            .filter(|o| o.owner == owner)
+                            .map(|o| o.id)
+                            .collect();
+                        for id in ids {
+                            let order = self.take_out(id, side, price);
+                            out.push(Event::Cancelled {
+                                id,
+                                qty: order.leaves,
+                                reason: CancelReason::MassCancel,
+                            });
+                            count += 1;
+                        }
+                    }
+                }
+                out.push(Event::MassCancelled { owner, count });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_owner(&self, owner: OwnerId) -> Result<(), RejectReason> {
+        if owner >= self.cfg.max_owners {
+            return Err(RejectReason::InvalidOwner);
         }
         Ok(())
     }

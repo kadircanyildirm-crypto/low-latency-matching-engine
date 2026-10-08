@@ -23,6 +23,7 @@ fn scenarios() -> [(&'static str, WorkloadConfig); 2] {
                     aggressive_limit: 0,
                     market: 0,
                     cancel: 40,
+                    mass_cancel: 0,
                     modify: 0,
                 },
                 ..WorkloadConfig::default()

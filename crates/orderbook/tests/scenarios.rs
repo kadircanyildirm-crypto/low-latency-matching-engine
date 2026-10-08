@@ -4,7 +4,7 @@
 //! Unless a test is about owners, every order gets its own owner (`owner == id`), so
 //! self-trade prevention stays out of the way.
 
-use orderbook::CancelReason::{NoLiquidity, PriceProtection, Requested, SelfTrade};
+use orderbook::CancelReason::{MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade};
 use orderbook::Event::*;
 use orderbook::RejectReason::*;
 use orderbook::Side::{Buy, Sell};
@@ -398,17 +398,35 @@ fn invalid_commands_are_rejected_without_side_effects() {
         (modify(1, 100, 1_001), InvalidQuantity),
         (modify(1, 10_001, 1), PriceOutOfRange),
         (modify(7, 100, 1), UnknownOrder),
+        // Owner ids must be below max_owners; that check comes first.
+        (limit_by(1_024, 2, Buy, 0, 0), InvalidOwner),
+        (market_by(1_024, 2, Sell, 0), InvalidOwner),
+        // An owner outside the table owns nothing.
+        (
+            Command::Cancel {
+                id: 1,
+                owner: 1_024,
+            },
+            UnknownOrder,
+        ),
     ];
     for (command, reason) in cases {
         assert_eq!(
             run(&mut b, command),
-            [rejected(command.id(), reason)],
+            [rejected(command.id().unwrap(), reason)],
             "{command:?}"
         );
     }
     assert_eq!(queue(&b, Buy, 100), [(1, 5)]);
     assert_eq!(b.order_count(), 1);
     assert_eq!(b.trade_count(), 0);
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: u32::MAX }),
+        [MassCancelled {
+            owner: u32::MAX,
+            count: 0
+        }]
+    );
 }
 
 #[test]
@@ -532,6 +550,92 @@ fn cancel_incoming_stops_at_the_first_own_order() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Mass cancel
+
+#[test]
+fn mass_cancel_removes_only_the_owners_orders_in_book_order() {
+    let mut b = book();
+    // Owner 7 places its orders in an order unrelated to book order, interleaved with
+    // others; a cancel/replace also moves one of its bids to the back of its level.
+    run(&mut b, limit_by(7, 1, Sell, 106, 1));
+    run(&mut b, limit_by(7, 2, Buy, 99, 2));
+    run(&mut b, limit_by(8, 3, Buy, 100, 3));
+    run(&mut b, limit_by(7, 4, Buy, 100, 4));
+    run(&mut b, limit_by(7, 5, Sell, 105, 5));
+    run(&mut b, limit_by(7, 6, Buy, 100, 6));
+    run(&mut b, limit_by(9, 7, Sell, 105, 7));
+    run(
+        &mut b,
+        Command::Modify {
+            id: 4,
+            owner: 7,
+            price: 100,
+            qty: 8,
+        },
+    );
+    assert_eq!(queue(&b, Buy, 100), [(3, 3), (6, 6), (4, 8)]);
+
+    let events = run(&mut b, Command::CancelAll { owner: 7 });
+    assert_eq!(
+        events,
+        [
+            cancelled(6, 6, MassCancel),
+            cancelled(4, 8, MassCancel),
+            cancelled(2, 2, MassCancel),
+            cancelled(5, 5, MassCancel),
+            cancelled(1, 1, MassCancel),
+            MassCancelled { owner: 7, count: 5 },
+        ]
+    );
+    assert_eq!(queue(&b, Buy, 100), [(3, 3)]);
+    assert_eq!(queue(&b, Sell, 105), [(7, 7)]);
+    assert_eq!(b.order_count(), 2);
+}
+
+#[test]
+fn mass_cancel_of_an_owner_without_orders_reports_zero() {
+    let mut b = book();
+    run(&mut b, limit_by(8, 1, Buy, 100, 1));
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: 7 }),
+        [MassCancelled { owner: 7, count: 0 }]
+    );
+    // An owner whose orders all traded away has none left either.
+    run(&mut b, limit_by(7, 2, Sell, 100, 1));
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: 7 }),
+        [MassCancelled { owner: 7, count: 0 }]
+    );
+}
+
+#[test]
+fn mass_cancel_frees_capacity_and_the_owner_can_return() {
+    let mut b = OrderBook::new(BookConfig::new(1, 10_000, 2));
+    run(&mut b, limit_by(7, 1, Buy, 100, 1));
+    run(&mut b, limit_by(7, 2, Buy, 101, 1));
+    assert_eq!(
+        run(&mut b, limit_by(8, 3, Buy, 99, 1)),
+        [rejected(3, BookFull)]
+    );
+    run(&mut b, Command::CancelAll { owner: 7 });
+    assert_eq!(
+        run(&mut b, limit_by(8, 3, Buy, 99, 1))[0],
+        Accepted { id: 3 }
+    );
+    assert_eq!(
+        run(&mut b, limit_by(7, 1, Buy, 98, 1))[0],
+        Accepted { id: 1 }
+    );
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: 7 }),
+        [
+            cancelled(1, 1, MassCancel),
+            MassCancelled { owner: 7, count: 1 }
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Price protection
 
 fn protected_book() -> OrderBook {
@@ -606,8 +710,10 @@ fn commands_report_their_id_and_owner() {
         },
     ];
     for command in commands {
-        assert_eq!((command.id(), command.owner()), (1, 7), "{command:?}");
+        assert_eq!((command.id(), command.owner()), (Some(1), 7), "{command:?}");
     }
+    let mass_cancel = Command::CancelAll { owner: 7 };
+    assert_eq!((mass_cancel.id(), mass_cancel.owner()), (None, 7));
 }
 
 #[test]

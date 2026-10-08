@@ -19,8 +19,11 @@ The [verification](#10-verification) section says which one.
   The conversion from decimal prices belongs to the gateway (Phase 3).
 - **Order ids** are assigned upstream and must be unique among resting orders. An id can
   be reused once its order is gone.
-- **Owners** (`u32`) identify participants. They drive self-trade prevention and
-  cancel/modify authorization.
+- **Owners** identify participants. They drive self-trade prevention, cancel/modify
+  authorization and mass cancels. Owner ids are dense indices `0..max_owners` that the
+  gateway assigns, the way exchanges number their participants internally; a new order
+  from any other id is rejected (`InvalidOwner`). Dense ids let the book keep per-owner
+  state in plain arrays instead of hash maps (see §3).
 - **Trade ids** come from a per-book counter: 1, 2, 3, ... They are gap-free and part of
   the deterministic state.
 
@@ -37,16 +40,19 @@ The [verification](#10-verification) section says which one.
 
  occupancy bitset: 1 bit per level + 1 summary bit per 64 words
  id index: FxHashMap<OrderId, slot>, reserved at 2x capacity
+ owner lists: one list per owner, head/tail in a table indexed by owner id,
+              prev/next in a links array indexed by order slot
 ```
 
 | Operation | Cost | How |
 |---|---|---|
 | Find the level for a price | O(1) | `price - min_price` |
-| Add an order at a level | O(1) | append to the level's intrusive list |
-| Cancel an order anywhere in a queue | O(1) + hash lookup | doubly linked list |
+| Add an order at a level | O(1) | append to the level's queue and the owner's list |
+| Cancel an order anywhere in a queue | O(1) + hash lookup | doubly linked lists |
 | Fill against the best level | O(1) per order touched | pop from the head |
 | Find the next best level after one empties | O(levels / 4096) worst case | two-level bitset |
 | Best bid / ask | O(1) | cached index |
+| Cancel all of one owner's k orders | O(k log k) | walk the owner's list, sort into book order |
 
 **Why a dense ladder.** Near the touch, real books are dense. Indexing an array beats
 walking a tree: there is no pointer chasing and no rebalancing, and the hot levels share
@@ -66,6 +72,29 @@ With capacity reserved for `2 × max_orders`, live entries never exceed half the
 it always takes the in-place path. A test hammers a permanently full book to show this
 empirically.
 
+**Why owner lists, and why mass cancels sort.** Cancel-on-disconnect has to pull every
+order of one participant at once. Scanning the book would cost time proportional to the
+whole book, paid by every other participant waiting behind that command. With one list per
+owner, the cost depends only on that owner's orders.
+
+The lists are kept cheap in two ways, both measured on the baseline benchmark:
+
+- **No hashing.** A first version looked owners up in a hash map and cost 12 ns per
+  command at the median: 79 → 91 ns, and 17% less throughput. Dense owner ids make the
+  owner table a plain array, which brought the cost down to about 3 ns.
+- **Links outside the order node.** An order's owner links (8 bytes) sit in a separate
+  array indexed by its slot. Matching never reads them, so the 48-byte node stays as it
+  was.
+
+The events of a mass cancel come out in book order (bids best price first, then asks,
+each level in time priority), the same canonical order a snapshot uses. An owner's list
+holds its orders in the order they started resting, which is not book order. But an order
+joins its owner's list exactly when it joins the back of its level's queue, so within
+one level the two orders agree. Sorting the owner's orders by side and price, with list
+position as the tie-break, therefore gives book order, in a buffer reserved at
+construction. The cross-level order of an owner's list is never observable, so a snapshot
+does not need to record it.
+
 ## 4. Matching rules
 
 - An incoming order trades against the opposite side while it crosses its limit. Best
@@ -81,6 +110,7 @@ empirically.
 | `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention), then at most one of `Rested` or `Cancelled` for the remainder |
 | `Cancel` | `Cancelled{Requested}` or `Rejected` |
 | `Modify` | `Rejected`, or `Modified` followed, if priority is lost, by the events of a new limit order |
+| `CancelAll` | `Cancelled{MassCancel}` for each of the owner's orders in book order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing resting |
 
 Every `Trade` carries the trade id and both sides' remaining open quantity (`leaves`).
 A participant can therefore track its orders from events alone; the soak test checks
@@ -96,6 +126,7 @@ The engine itself has no notion of time or transport.
 | `Market` | Trades at any price within price protection. The remainder is cancelled with `NoLiquidity`, `PriceProtection` or `SelfTrade`. Never rests. |
 | `Cancel` | Removes the order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
+| `CancelAll` | Removes every resting order of one owner, as on a session disconnect. |
 
 **Modify uses total quantity, as FIX does.** Suppose a participant sends "reduce 10 to 8"
 while 5 lots are filling:
@@ -120,6 +151,7 @@ The cases:
 | Maximum order size | `qty` must be in `1..=max_order_qty` (`InvalidQuantity`). |
 | Price protection | Measured from the opposite best price when the order arrives. A market order stops trading `price_protection` ticks beyond it (`Cancelled{PriceProtection}`). A limit or modify priced further through is rejected (`PriceOutsideProtection`). If the opposite side is empty, there is nothing to protect against. |
 | Self-trade prevention | Two orders of the same owner never trade. `CancelResting` removes the resting order and keeps matching. `CancelIncoming` cancels the rest of the incoming order and leaves the book untouched. |
+| Owner ids | A new order must come from an owner id below `max_owners` (`InvalidOwner`). This is the first check, before quantity and price. |
 | Ownership | Cancels and modifies of someone else's order are rejected as `UnknownOrder`, exactly like a missing order, so others' order ids do not leak. |
 
 ## 7. Capacity and admission
@@ -188,7 +220,7 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
 | `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for two flows that between them cover both self-trade policies, protection stops and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
 | `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |
-| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), and in a deep book, and none when computing the digest. |
+| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), in a deep book, and under frequent mass cancels, and none when computing the digest. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
 | Mutation testing | `cargo mutants` injects 340 small faults into the engine. The tests detect every one of the 319 that compile ([results](../README.md#mutation-testing)). |
 
@@ -202,7 +234,6 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | Limitation | Plan |
 |---|---|
 | No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
-| No mass cancel: the book keeps no list of each owner's orders, so pulling all of them takes one `Cancel` per order | Phase 3: cancel-on-disconnect needs it |
 | The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |

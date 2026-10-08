@@ -29,6 +29,7 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 | `Market` | Trades at any price within price protection; the remainder is cancelled. Never rests. |
 | `Cancel` | Removes a resting order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity, so a modify that races a fill can never over-fill. Shrinking at the same price keeps queue priority; anything else re-enters at the back. Only the owner may modify. |
+| `CancelAll` | Cancels every resting order of one owner, as on a session disconnect. It costs O(k log k) in that owner's k orders, however large the rest of the book. |
 
 Risk controls built into the core:
 
@@ -38,7 +39,8 @@ Risk controls built into the core:
   opposite best price; limit orders priced further through are rejected.
 - **Self-trade prevention:** cancel the resting order, or cancel the incoming one.
 - **Ownership checks:** cancels and modifies of another participant's order are
-  rejected, in a way that does not reveal the order exists.
+  rejected, in a way that does not reveal the order exists. Owner ids are dense
+  participant indices assigned by the gateway, so per-owner state needs no hashing.
 
 Every trade carries a gap-free trade id and both sides' remaining open quantity, so
 participants can track their orders from events alone.
@@ -71,10 +73,10 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Scenario tests | One rule per test, with the exact expected event sequence. |
 | Differential property test | On random configurations and command sequences, the engine matches a deliberately naive reference book event for event and order for order. |
 | Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. |
-| Invariant checker tests | `validate()` itself is tested: each of 11 kinds of corrupted state must be detected. |
+| Invariant checker tests | `validate()` itself is tested: every corruption it checks for, from broken queue links to owner lists out of step with the book, must be detected. |
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
-| Zero-allocation tests | Normal flow, a permanently full book, a deep book, and computing the digest. |
+| Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, and computing the digest. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
@@ -95,10 +97,11 @@ points at behaviour the tests do not pin down.
 | Unviable | 21 | The mutant does not compile. |
 | **Missed** | **0** | |
 
-Every one of the 319 mutants that compile is detected. `src/workload.rs`, the benchmark's
-order-flow generator, is excluded because it is not part of the engine. A new module gets
-its own run when it lands (`cargo mutants -f <file>`), and the totals above include those
-runs.
+Every one of the 319 mutants that compile was detected in the last full run, which
+includes the snapshot module's own run. `src/workload.rs`, the benchmark's order-flow
+generator, is excluded because it is not part of the engine. Every change since has been
+mutation-tested on the lines it touches (`cargo mutants --in-diff`), and none has left a
+mutant alive. A full run is repeated at the end of each milestone.
 
 The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
 `protection_cap`. The clamp turned out to have no effect: the matcher compares levels
@@ -118,10 +121,10 @@ without per-command timers.
 
 | Scenario | Book after warm-up | p50 | p90 | p99 | p99.9 | p99.99 | Throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
-| baseline | 7.7k orders, 243 levels | 79 ns | 120 ns | 193 ns | 497 ns | 3.9 µs | 16–18M cmd/s |
-| sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 78 ns | 129 ns | 205 ns | 693 ns | 2.4 µs | 16–17M cmd/s |
-| deep | 1M orders, 10k levels | 343 ns | 794 ns | 2.3 µs | 4.7 µs | 41 µs | 3.0–3.3M cmd/s |
-| protected: 2-tick protection, 4 owners | 2.6k orders, 170 levels | 78 ns | 120 ns | 191 ns | 284 ns | 2.3 µs | 19–20M cmd/s |
+| baseline | 7.7k orders, 243 levels | 81 ns | 123 ns | 192 ns | 351 ns | 2.5 µs | 17.6–18.5M cmd/s |
+| sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 80 ns | 130 ns | 194 ns | 272 ns | 2.4 µs | 16.9–17.2M cmd/s |
+| deep | 1M orders, 10k levels | 261 ns | 526 ns | 1.1 µs | 3.8 µs | 15 µs | 3.6–3.9M cmd/s |
+| protected: 2-tick protection, 4 owners | 2.6k orders, 170 levels | 81 ns | 127 ns | 210 ns | 325 ns | 2.3 µs | 17.7–18.2M cmd/s |
 
 The protected scenario runs the paths the others never reach. About 5% of its commands are
 rejected, about a quarter of its market orders stop at the protection band, and
@@ -131,17 +134,19 @@ By command, in the baseline scenario:
 
 | Command | p50 | p99 | p99.9 |
 |---|---:|---:|---:|
-| limit | 71 ns | 171 ns | 334 ns |
-| market | 97 ns | 222 ns | 491 ns |
-| cancel | 94 ns | 199 ns | 698 ns |
-| modify | 129 ns | 268 ns | 798 ns |
+| limit | 73 ns | 176 ns | 281 ns |
+| market | 101 ns | 235 ns | 356 ns |
+| cancel | 95 ns | 169 ns | 563 ns |
+| modify | 133 ns | 251 ns | 695 ns |
 
 - **The deep book is slower because it does not fit in cache.** A million 48-byte order
   nodes take about 48 MB, on top of the id index, against a 12 MB L3. Cancels and
   modifies touch arbitrary orders and pay for the misses.
-- **The tail is the machine, not the engine.** p99.99 moves between 2.5 and 7 µs from run
-  to run in the baseline scenario, and the maximum reaches tens of milliseconds:
-  preemption by the OS. Measurements on an isolated Linux core are part of Phase 5.
+- **The tail is the machine, not the engine.** p99.99 moves between 2.4 and 7 µs from run
+  to run in the baseline scenario, and the maximum reaches milliseconds: preemption by
+  the OS. Even medians move by several percent between sessions on this laptop (the deep
+  scenario measured 343 ns in an earlier session), so only same-session comparisons are
+  meaningful. Measurements on an isolated Linux core are part of Phase 5.
 - **What this does not measure:** network, serialization, journaling or queueing. This
   is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
   coordinated-omission correction) arrives with the gateway and pipeline phases.

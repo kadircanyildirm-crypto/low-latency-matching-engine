@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::{BookConfig, NIL, OrderBook, OrderNode};
+use super::{BookConfig, OrderBook, OrderNode};
 use crate::types::{OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side};
 
 /// A resting order as recorded in a [`BookSnapshot`].
@@ -53,8 +53,8 @@ pub enum SnapshotError {
     TooManyOrders,
     /// Two orders share an id.
     DuplicateOrderId(OrderId),
-    /// The order's price is outside the band, its open quantity is zero, or its open plus
-    /// filled quantity exceeds `max_order_qty`.
+    /// The order's owner is not below `max_owners`, its price is outside the band, its open
+    /// quantity is zero, or its open plus filled quantity exceeds `max_order_qty`.
     InvalidOrder(OrderId),
     /// The best bid is at or above the best ask.
     Crossed,
@@ -115,6 +115,7 @@ impl OrderBook {
             .ok_or(SnapshotError::TradeCountExhausted)?;
         for order in &snapshot.orders {
             let invalid = SnapshotError::InvalidOrder(order.id);
+            book.check_owner(order.owner).map_err(|_| invalid)?;
             let level = book.level_of(order.price).ok_or(invalid)?;
             let total = order
                 .leaves
@@ -124,19 +125,17 @@ impl OrderBook {
             if book.index.contains_key(&order.id) {
                 return Err(SnapshotError::DuplicateOrderId(order.id));
             }
-            let slot = book.pool.alloc(OrderNode {
-                id: order.id,
-                remaining: order.leaves,
-                total,
+            let slot = book.pool.alloc(OrderNode::new(
+                order.id,
+                order.owner,
+                order.side,
                 level,
-                prev: NIL,
-                next: NIL,
-                owner: order.owner,
-                side: order.side,
-            });
-            book.index.insert(order.id, slot);
-            let (half, pool) = book.half_and_pool(order.side);
-            half.push_back(pool, slot);
+                order.leaves,
+                total,
+            ));
+            // Orders arrive in book order, so each owner's list ends up in queue order
+            // within every level, which is all that mass cancels depend on.
+            book.place(slot);
         }
         if let (Some(bid), Some(ask)) = (book.bids.best, book.asks.best) {
             if bid >= ask {
@@ -188,6 +187,7 @@ impl Digest {
         hash.i64(config.min_price);
         hash.i64(config.max_price);
         hash.u64(u64::from(config.max_orders));
+        hash.u64(u64::from(config.max_owners));
         hash.u64(config.max_order_qty);
         match config.price_protection {
             None => hash.u64(0),

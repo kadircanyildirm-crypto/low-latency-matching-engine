@@ -27,7 +27,7 @@ use hdrhistogram::Histogram;
 use orderbook::workload::{EventCounts, Mix, Workload, WorkloadConfig};
 use orderbook::{BookConfig, Command, Event, EventSink, OrderBook, Side};
 
-const KINDS: [&str; 5] = ["all", "limit", "market", "cancel", "modify"];
+const KINDS: [&str; 6] = ["all", "limit", "market", "cancel", "modify", "mass"];
 
 struct Scenario {
     name: &'static str,
@@ -63,6 +63,7 @@ fn scenarios() -> Vec<Scenario> {
             aggressive_limit: 5,
             market: 20,
             cancel: 20,
+            mass_cancel: 0,
             modify: 5,
         },
         ..WorkloadConfig::default()
@@ -94,6 +95,7 @@ fn scenarios() -> Vec<Scenario> {
                     aggressive_limit: 20,
                     market: 20,
                     cancel: 15,
+                    mass_cancel: 0,
                     modify: 5,
                 },
                 ..WorkloadConfig::default()
@@ -308,6 +310,7 @@ fn kind_index(command: &Command) -> usize {
         Command::Market { .. } => 2,
         Command::Cancel { .. } => 3,
         Command::Modify { .. } => 4,
+        Command::CancelAll { .. } => 5,
     }
 }
 

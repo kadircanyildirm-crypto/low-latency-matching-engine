@@ -25,6 +25,8 @@ allocates on the hot path.
 - Commands: GTC limit, market, cancel, and modify with FIX cancel/replace semantics on
   total quantity. Shrinking at the same price keeps queue priority; any other change goes
   to the back of the queue.
+- Mass cancel: `CancelAll` pulls every order of one owner in O(k log k) in that owner's
+  orders, through per-owner lists keyed by dense owner ids.
 - Risk controls in the core: static price band, maximum order size, price protection,
   self-trade prevention (`CancelResting` / `CancelIncoming`), owner checks on cancel and
   modify, and a capacity limit that never refuses an order that can trade.
@@ -79,10 +81,10 @@ exactly the same state through replay; the cost of journal writes measured.
 - Fixed-length, little-endian messages: `NewOrder`, `Cancel`, `Modify`,
   `ExecutionReport`, `Reject`, `Heartbeat`.
 - Framing, sessions (login / heartbeat / logout), mapping client order ids to exchange
-  order ids, and accounts.
+  order ids, and accounts, each mapped to one of the book's dense owner ids.
 - Exchange-assigned sequential order ids, which let the book replace its hash-map id index
   with a directly indexed table.
-- Mass cancel and cancel-on-disconnect: pulling all of a session's orders at once.
+- Cancel-on-disconnect: the gateway sends the book's `CancelAll` when a session drops.
 - Per-session pre-trade risk: order count limits and throttling, so one participant cannot
   fill the book.
 - Fuzzing the protocol decoder with `cargo-fuzz`.

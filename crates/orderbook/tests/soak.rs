@@ -66,8 +66,9 @@ fn synthetic_flow_matches_reference() {
     assert!(counts.self_trade_cancels > 100, "{counts:?}");
 }
 
-/// Few owners for frequent self-trades under `CancelIncoming`, and many market orders against
-/// a one-tick protection band for frequent protection stops and rejections.
+/// Few owners for frequent self-trades under `CancelIncoming`, many market orders against
+/// a one-tick protection band for frequent protection stops and rejections, and mass
+/// cancels.
 fn protected_config() -> (WorkloadConfig, BookConfig) {
     let cfg = WorkloadConfig {
         owners: 4,
@@ -76,7 +77,8 @@ fn protected_config() -> (WorkloadConfig, BookConfig) {
             passive_limit: 50,
             aggressive_limit: 5,
             market: 20,
-            cancel: 20,
+            cancel: 19,
+            mass_cancel: 1,
             modify: 5,
         },
         ..config()
@@ -97,6 +99,8 @@ fn synthetic_flow_matches_reference_under_cancel_incoming() {
     assert!(counts.protection_cancels > 100, "{counts:?}");
     // Aggressive limits priced more than a tick through the opposite best.
     assert!(counts.rejected > 100, "{counts:?}");
+    assert!(counts.mass_cancels > 100, "{counts:?}");
+    assert!(counts.mass_cancelled_orders > 1_000, "{counts:?}");
 }
 
 /// Fingerprint of every event and the final book after 100k commands of synthetic flow,
@@ -162,6 +166,6 @@ fn output_matches_the_golden_fingerprints() {
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
-const GOLDEN_DEFAULT_DIGEST: u64 = 0x81af_9e3f_bb93_84c6;
-const GOLDEN_PROTECTED: u64 = 0x3c49_10ff_8e00_3caa;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0xc0c3_b878_27a9_adc9;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x1069_1cd1_ccfd_aea6;
+const GOLDEN_PROTECTED: u64 = 0xaabb_7b6c_8feb_f4b2;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0x2fab_76d9_4590_5299;

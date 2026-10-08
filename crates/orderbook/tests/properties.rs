@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use common::strategies::scenario;
 use common::{Snapshot, snapshot};
-use orderbook::CancelReason::{NoLiquidity, PriceProtection, Requested, SelfTrade};
+use orderbook::CancelReason::{MassCancel, NoLiquidity, PriceProtection, Requested, SelfTrade};
 use orderbook::{
     BookConfig, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder, RejectReason,
     SelfTradePolicy, Side,
@@ -163,7 +163,7 @@ fn check(
 
     if let Event::Rejected { id, reason } = first {
         ensure(events.len() == 1, "a rejection must be the only event")?;
-        ensure(id == command.id(), "rejection carries the wrong id")?;
+        ensure(Some(id) == command.id(), "rejection carries the wrong id")?;
         ensure(
             after.snapshot == before.snapshot && after.trade_count == before.trade_count,
             "a rejected command changed the book",
@@ -287,6 +287,38 @@ fn check(
                 filled_before: order.filled,
             };
             check_execution(cfg, &before.without(id), &after, taker, &events[1..])
+        }
+        Command::CancelAll { owner } => {
+            // Exactly the owner's orders, in book order, then the count; nothing else moves.
+            let mine: Vec<QueuedOrder> = [Side::Buy, Side::Sell]
+                .into_iter()
+                .flat_map(|side| before.priority(side))
+                .map(|(_, order)| order)
+                .filter(|order| order.owner == owner)
+                .collect();
+            let mut expected: Vec<Event> = mine
+                .iter()
+                .map(|order| Event::Cancelled {
+                    id: order.id,
+                    qty: order.leaves,
+                    reason: MassCancel,
+                })
+                .collect();
+            expected.push(Event::MassCancelled {
+                owner,
+                count: mine.len() as u32,
+            });
+            ensure(
+                events == expected,
+                "a mass cancel must cancel exactly the owner's orders, in book order, then report the count",
+            )?;
+            let rest = mine
+                .iter()
+                .fold(before.clone(), |state, order| state.without(order.id));
+            ensure(
+                after.snapshot == rest.snapshot,
+                "a mass cancel changed more than the owner's orders",
+            )
         }
     }
 }
@@ -497,7 +529,7 @@ fn check_execution(
                         "PriceProtection although the next order is within the cap",
                     )?;
                 }
-                Requested => return Err("a Cancel reason on a new order".into()),
+                Requested | MassCancel => return Err("a Cancel reason on a new order".into()),
             }
         }
         rest => return Err(format!("unexpected trailing events: {rest:?}")),
@@ -539,14 +571,16 @@ fn check_execution(
 
 /// The rejection the rules require for `command` against the book before it, or `None` if
 /// the command must be accepted. When several rules apply, the first one listed for the
-/// command wins: stateless checks (quantity, price band) before stateful ones (ids,
-/// ownership, protection, capacity).
+/// command wins: stateless checks (owner, quantity, price band) before stateful ones (ids,
+/// ownership, protection, capacity). An owner outside the table owns nothing, so its
+/// cancels and modifies fail as `UnknownOrder` and its mass cancels find nothing.
 ///
 /// Checking acceptance as well as rejection matters: a command that should have been
 /// refused but was not can leave a book that looks perfectly healthy, such as a limit order
 /// priced through the protection band that simply trades.
 fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Option<RejectReason> {
     use RejectReason::*;
+    let owner_invalid = |owner: OwnerId| owner >= cfg.max_owners;
     let qty_invalid = |qty: Qty| qty == 0 || qty > cfg.max_order_qty;
     let out_of_band = |price: Price| price < cfg.min_price || price > cfg.max_price;
     let owned = |id: OrderId, owner: OwnerId| before.find(id).filter(|(_, _, o)| o.owner == owner);
@@ -571,12 +605,14 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
     match command {
         Command::Limit {
             id,
+            owner,
             side,
             price,
             qty,
-            ..
         } => {
-            if qty_invalid(qty) {
+            if owner_invalid(owner) {
+                Some(InvalidOwner)
+            } else if qty_invalid(qty) {
                 Some(InvalidQuantity)
             } else if out_of_band(price) {
                 Some(PriceOutOfRange)
@@ -591,8 +627,10 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 None
             }
         }
-        Command::Market { id, qty, .. } => {
-            if qty_invalid(qty) {
+        Command::Market { id, owner, qty, .. } => {
+            if owner_invalid(owner) {
+                Some(InvalidOwner)
+            } else if qty_invalid(qty) {
                 Some(InvalidQuantity)
             } else if before.find(id).is_some() {
                 Some(DuplicateOrderId)
@@ -623,5 +661,6 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             let replaces = leaves > 0 && !in_place;
             (replaces && beyond_protection(side, price)).then_some(PriceOutsideProtection)
         }
+        Command::CancelAll { .. } => None,
     }
 }

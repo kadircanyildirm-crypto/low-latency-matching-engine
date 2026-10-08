@@ -111,6 +111,7 @@ fn the_digest_covers_every_field() {
     vary("min_price", |s| s.config.min_price -= 1);
     vary("max_price", |s| s.config.max_price += 1);
     vary("max_orders", |s| s.config.max_orders += 1);
+    vary("max_owners", |s| s.config.max_owners += 1);
     vary("max_order_qty", |s| s.config.max_order_qty -= 1);
     vary("protection off", |s| s.config.price_protection = None);
     vary("protection width", |s| s.config.price_protection = Some(4));
@@ -135,11 +136,12 @@ fn the_digest_covers_every_field() {
 
 #[test]
 fn the_digest_of_an_empty_book_is_pinned() {
-    // Fixed forever, like the encoding it hashes; CI checks it on every platform.
+    // Pinned so that any change to the encoding is deliberate: once Phase 2 persists
+    // digests, changing it breaks every stored one. CI checks it on every platform.
     let book = OrderBook::new(BookConfig::new(-5, 5, 3));
     assert_eq!(
         book.digest(),
-        0xb40c_8595_4855_4e47,
+        0xd2c4_aca9_b478_14fb,
         "got {:#018x}",
         book.digest()
     );
@@ -172,6 +174,13 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
         ),
         (
             vec![order(1, Side::Buy, 0, 1, 0)],
+            SnapshotError::InvalidOrder(1),
+        ),
+        (
+            vec![SnapshotOrder {
+                owner: cfg.max_owners,
+                ..order(1, Side::Buy, 10, 1, 0)
+            }],
             SnapshotError::InvalidOrder(1),
         ),
         (
@@ -215,7 +224,10 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
 
     // The limits themselves are fine.
     let edge = vec![
-        order(1, Side::Buy, 49, max - 1, 1),
+        SnapshotOrder {
+            owner: cfg.max_owners - 1,
+            ..order(1, Side::Buy, 49, max - 1, 1)
+        },
         order(2, Side::Sell, 50, 1, 0),
     ];
     assert_eq!(restore(edge, u64::MAX - 1), Ok(2));

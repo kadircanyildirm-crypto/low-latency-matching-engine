@@ -24,6 +24,30 @@ pub(crate) struct OrderNode {
 // The node's size is part of the cache budget; growing it should be a deliberate decision.
 const _: () = assert!(size_of::<OrderNode>() == 48);
 
+impl OrderNode {
+    /// An order about to rest. Its links are set when the book places it.
+    #[inline]
+    pub fn new(
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        level: u32,
+        remaining: Qty,
+        total: Qty,
+    ) -> Self {
+        Self {
+            id,
+            remaining,
+            total,
+            level,
+            prev: NIL,
+            next: NIL,
+            owner,
+            side,
+        }
+    }
+}
+
 /// Slab of order nodes addressed by `u32` slot, allocated once up front.
 ///
 /// Free slots form a LIFO list threaded through `next`, so the most recently freed slot
@@ -62,6 +86,16 @@ impl OrderPool {
     #[inline]
     pub fn is_full(&self) -> bool {
         self.free_head == NIL
+    }
+
+    /// Slots in the slab, free or not.
+    pub fn capacity(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// First free slot, or `NIL`. Free slots are linked through `next`.
+    pub fn free_head(&self) -> u32 {
+        self.free_head
     }
 
     #[inline]

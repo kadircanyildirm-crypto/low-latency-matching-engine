@@ -83,6 +83,9 @@ impl Fnv {
             } => [5, id, price as u64, qty, leaves]
                 .iter()
                 .for_each(|&v| self.write_u64(v)),
+            MassCancelled { owner, count } => [6, u64::from(owner), u64::from(count)]
+                .iter()
+                .for_each(|&v| self.write_u64(v)),
         }
     }
 

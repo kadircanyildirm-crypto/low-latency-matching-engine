@@ -50,6 +50,8 @@ pub struct Mix {
     pub market: u8,
     /// Cancels of resting orders.
     pub cancel: u8,
+    /// Mass cancels of a random participant's orders, as on a session disconnect.
+    pub mass_cancel: u8,
     /// Modifies of resting orders.
     pub modify: u8,
 }
@@ -94,6 +96,7 @@ impl Default for WorkloadConfig {
                 aggressive_limit: 10,
                 market: 5,
                 cancel: 25,
+                mass_cancel: 0,
                 modify: 5,
             },
         }
@@ -108,6 +111,7 @@ impl WorkloadConfig {
             min_price: self.min_price,
             max_price: self.max_price,
             max_orders: self.max_live,
+            max_owners: self.owners,
             max_order_qty: 1_000_000,
             price_protection: Some((self.passive_depth * 4) as u32),
             self_trade: SelfTradePolicy::CancelResting,
@@ -157,6 +161,7 @@ impl Workload {
             m.aggressive_limit,
             m.market,
             m.cancel,
+            m.mass_cancel,
             m.modify,
         ]
         .iter()
@@ -210,6 +215,12 @@ impl Workload {
         if roll < m.cancel {
             return self.cancel();
         }
+        roll -= m.cancel;
+        if roll < m.mass_cancel {
+            return Command::CancelAll {
+                owner: self.rng.below(u64::from(self.cfg.owners)) as OwnerId,
+            };
+        }
         self.modify()
     }
 
@@ -258,7 +269,7 @@ impl Workload {
                     }
                 }
             }
-            Event::Accepted { .. } | Event::Rejected { .. } => {}
+            Event::Accepted { .. } | Event::Rejected { .. } | Event::MassCancelled { .. } => {}
         }
     }
 
@@ -425,8 +436,12 @@ pub struct EventCounts {
     pub self_trade_cancels: u64,
     /// `Cancelled` events caused by price protection.
     pub protection_cancels: u64,
+    /// `Cancelled` events caused by a mass cancel.
+    pub mass_cancelled_orders: u64,
     /// `Modified` events.
     pub modified: u64,
+    /// `MassCancelled` events.
+    pub mass_cancels: u64,
 }
 
 impl EventSink for EventCounts {
@@ -450,10 +465,12 @@ impl EventSink for EventCounts {
                 match reason {
                     CancelReason::SelfTrade => self.self_trade_cancels += 1,
                     CancelReason::PriceProtection => self.protection_cancels += 1,
+                    CancelReason::MassCancel => self.mass_cancelled_orders += 1,
                     CancelReason::Requested | CancelReason::NoLiquidity => {}
                 }
             }
             Event::Modified { .. } => self.modified += 1,
+            Event::MassCancelled { .. } => self.mass_cancels += 1,
         }
     }
 }

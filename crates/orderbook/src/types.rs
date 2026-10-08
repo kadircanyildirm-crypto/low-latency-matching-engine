@@ -94,17 +94,24 @@ pub enum Command {
         /// New total quantity (filled + open), `1..=max_order_qty`.
         qty: Qty,
     },
+    /// Cancels every resting order of `owner`, for example when its session disconnects.
+    /// Costs O(k log k) in the owner's k orders, independent of the rest of the book.
+    CancelAll {
+        /// Participant whose orders to cancel.
+        owner: OwnerId,
+    },
 }
 
 impl Command {
-    /// The order this command creates or refers to.
+    /// The order this command creates or refers to; `None` for a mass cancel.
     #[inline]
-    pub const fn id(&self) -> OrderId {
+    pub const fn id(&self) -> Option<OrderId> {
         match *self {
             Command::Limit { id, .. }
             | Command::Market { id, .. }
             | Command::Cancel { id, .. }
-            | Command::Modify { id, .. } => id,
+            | Command::Modify { id, .. } => Some(id),
+            Command::CancelAll { .. } => None,
         }
     }
 
@@ -115,7 +122,8 @@ impl Command {
             Command::Limit { owner, .. }
             | Command::Market { owner, .. }
             | Command::Cancel { owner, .. }
-            | Command::Modify { owner, .. } => owner,
+            | Command::Modify { owner, .. }
+            | Command::CancelAll { owner } => owner,
         }
     }
 }
@@ -130,6 +138,9 @@ impl Command {
 /// - `Cancel`: `Cancelled { reason: Requested }` or `Rejected`.
 /// - `Modify`: `Rejected`, or `Modified`. If the order lost priority, `Modified` is followed
 ///   by the same events a new limit order would produce after `Accepted`.
+/// - `CancelAll`: `Cancelled { reason: MassCancel }` for each of the owner's orders in book
+///   order (bids best price first, then asks best price first, each level in time
+///   priority), then `MassCancelled`. It is never rejected.
 ///
 /// "Leaves" quantity is the open quantity still working on the book; zero means the order
 /// is done.
@@ -199,6 +210,13 @@ pub enum Event {
         /// new total did not exceed what was already filled, and the order is done.
         leaves: Qty,
     },
+    /// A mass cancel finished; it follows the `Cancelled` events of the orders it removed.
+    MassCancelled {
+        /// The owner whose orders were cancelled.
+        owner: OwnerId,
+        /// How many orders were cancelled; zero if the owner had none.
+        count: u32,
+    },
 }
 
 /// Why a command was refused.
@@ -218,6 +236,8 @@ pub enum RejectReason {
     UnknownOrder,
     /// The book holds its maximum number of resting orders and this order could only rest.
     BookFull,
+    /// The owner id is not below the book's `max_owners`.
+    InvalidOwner,
 }
 
 /// Why open quantity left the book without trading.
@@ -231,6 +251,8 @@ pub enum CancelReason {
     PriceProtection,
     /// Self-trade prevention: the order would have traded with an order of the same owner.
     SelfTrade,
+    /// A `CancelAll` of the order's owner.
+    MassCancel,
 }
 
 /// How the book prevents an owner from trading with themselves.

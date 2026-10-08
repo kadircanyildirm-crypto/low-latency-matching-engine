@@ -7,6 +7,7 @@ pub use snapshot::{BookSnapshot, SnapshotError, SnapshotOrder};
 use rustc_hash::FxHashMap;
 
 use crate::bitset::LevelBitset;
+use crate::owners::Owners;
 use crate::pool::{NIL, OrderNode, OrderPool};
 use crate::types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
@@ -26,6 +27,10 @@ pub struct BookConfig {
     pub max_price: Price,
     /// Maximum number of resting orders.
     pub max_orders: u32,
+    /// Owner ids run from 0 to `max_owners - 1`. The gateway assigns these dense indices to
+    /// participants, so the book can keep per-owner state in plain arrays. New orders from
+    /// any other owner id are rejected.
+    pub max_owners: u32,
     /// Largest accepted order quantity. `max_orders * max_order_qty` must fit in a `u64`,
     /// which makes every quantity sum inside the book overflow-free by construction.
     pub max_order_qty: Qty,
@@ -38,14 +43,19 @@ pub struct BookConfig {
 }
 
 impl BookConfig {
-    /// A config with the given band and capacity, the largest `max_order_qty` the capacity
-    /// allows, no price protection, and `CancelResting` self-trade prevention.
+    /// Owners allowed by [`BookConfig::new`].
+    pub const DEFAULT_MAX_OWNERS: u32 = 1_024;
+
+    /// A config with the given band and capacity, [`Self::DEFAULT_MAX_OWNERS`] owners, the
+    /// largest `max_order_qty` the capacity allows, no price protection, and
+    /// `CancelResting` self-trade prevention.
     pub const fn new(min_price: Price, max_price: Price, max_orders: u32) -> Self {
         let max_orders_nonzero = if max_orders == 0 { 1 } else { max_orders };
         Self {
             min_price,
             max_price,
             max_orders,
+            max_owners: Self::DEFAULT_MAX_OWNERS,
             max_order_qty: u64::MAX / max_orders_nonzero as u64,
             price_protection: None,
             self_trade: SelfTradePolicy::CancelResting,
@@ -114,9 +124,16 @@ impl Level {
     /// Removes the order at the head of the queue and frees its slot. The caller has
     /// already taken its quantity out of `total_qty`.
     #[inline]
-    fn pop_front(&mut self, pool: &mut OrderPool, index: &mut FxHashMap<OrderId, u32>) {
+    fn pop_front(
+        &mut self,
+        pool: &mut OrderPool,
+        index: &mut FxHashMap<OrderId, u32>,
+        owners: &mut Owners,
+    ) {
         let slot = self.head;
-        let OrderNode { id, next, .. } = *pool.get(slot);
+        let OrderNode {
+            id, next, owner, ..
+        } = *pool.get(slot);
         self.head = next;
         if next == NIL {
             self.tail = NIL;
@@ -125,6 +142,7 @@ impl Level {
         }
         self.order_count -= 1;
         index.remove(&id);
+        owners.unlink(slot, owner);
         pool.free(slot);
     }
 }
@@ -247,8 +265,17 @@ pub struct OrderBook {
     /// Order id -> pool slot. Reserved at twice `max_orders` so that clearing out deleted
     /// entries is always an in-place rehash, never a reallocation.
     index: FxHashMap<OrderId, u32>,
+    /// Each owner's resting orders, for mass cancels.
+    owners: Owners,
+    /// Sort buffer for mass cancels, sized for every resting order up front.
+    scratch: Vec<MassCancelKey>,
     next_trade_id: TradeId,
 }
+
+/// Sort key that puts an owner's orders in book order: side (bids first), price priority,
+/// then position in the owner's list, which within a level is queue order. The last field
+/// is the slot.
+type MassCancelKey = (u8, u32, u32, u32);
 
 impl OrderBook {
     /// Builds an empty book, reserving all memory it will ever use.
@@ -267,6 +294,7 @@ impl OrderBook {
             "max_orders out of range"
         );
         assert!(config.max_order_qty > 0, "max_order_qty must be positive");
+        assert!(config.max_owners > 0, "max_owners must be positive");
         assert!(
             u128::from(config.max_orders) * u128::from(config.max_order_qty)
                 <= u128::from(u64::MAX),
@@ -281,45 +309,45 @@ impl OrderBook {
             asks: HalfBook::new(Side::Sell, levels),
             pool: OrderPool::with_capacity(config.max_orders),
             index,
+            owners: Owners::new(config.max_owners, config.max_orders),
+            scratch: Vec::with_capacity(config.max_orders as usize),
             next_trade_id: 1,
         }
     }
 
     /// Applies one command, reporting its outcome to `sink`.
     pub fn process<S: EventSink>(&mut self, command: Command, sink: &mut S) {
-        let result = match command {
+        let (id, result) = match command {
             Command::Limit {
                 id,
                 owner,
                 side,
                 price,
                 qty,
-            } => self.new_limit(id, owner, side, price, qty, sink),
+            } => (id, self.new_limit(id, owner, side, price, qty, sink)),
             Command::Market {
                 id,
                 owner,
                 side,
                 qty,
-            } => self.new_market(id, owner, side, qty, sink),
-            Command::Cancel { id, owner } => self.cancel(id, owner, sink),
+            } => (id, self.new_market(id, owner, side, qty, sink)),
+            Command::Cancel { id, owner } => (id, self.cancel(id, owner, sink)),
             Command::Modify {
                 id,
                 owner,
                 price,
                 qty,
-            } => self.modify(id, owner, price, qty, sink),
+            } => (id, self.modify(id, owner, price, qty, sink)),
+            Command::CancelAll { owner } => return self.cancel_all(owner, sink),
         };
         if let Err(reason) = result {
-            sink.on_event(Event::Rejected {
-                id: command.id(),
-                reason,
-            });
+            sink.on_event(Event::Rejected { id, reason });
         }
     }
 
     // Each handler validates everything before emitting its first event, so a rejected
-    // command leaves no trace besides the `Rejected` event. Stateless checks (quantity,
-    // price band) come before stateful ones (ids, protection, capacity).
+    // command leaves no trace besides the `Rejected` event. Stateless checks (owner,
+    // quantity, price band) come before stateful ones (ids, protection, capacity).
 
     fn new_limit<S: EventSink>(
         &mut self,
@@ -330,6 +358,7 @@ impl OrderBook {
         qty: Qty,
         sink: &mut S,
     ) -> Result<(), RejectReason> {
+        self.check_owner(owner)?;
         self.check_qty(qty)?;
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
         if self.index.contains_key(&id) {
@@ -357,6 +386,7 @@ impl OrderBook {
         qty: Qty,
         sink: &mut S,
     ) -> Result<(), RejectReason> {
+        self.check_owner(owner)?;
         self.check_qty(qty)?;
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
@@ -394,6 +424,41 @@ impl OrderBook {
             reason: CancelReason::Requested,
         });
         Ok(())
+    }
+
+    /// Cancels all of `owner`'s resting orders in book order. The owner's list holds them in
+    /// the order they started resting; sorting by side, price priority and list position
+    /// turns that into book order, because within one level list order is queue order.
+    fn cancel_all<S: EventSink>(&mut self, owner: OwnerId, sink: &mut S) {
+        let mut keys = std::mem::take(&mut self.scratch);
+        keys.clear();
+        let mut slot = self.owners.list(owner).head;
+        let mut position = 0;
+        while slot != NIL {
+            let node = self.pool.get(slot);
+            let key = match node.side {
+                Side::Buy => (0, u32::MAX - node.level, position, slot),
+                Side::Sell => (1, node.level, position, slot),
+            };
+            keys.push(key);
+            position += 1;
+            slot = self.owners.link_of(slot).next;
+        }
+        keys.sort_unstable();
+        for &(.., slot) in &keys {
+            let OrderNode { id, remaining, .. } = *self.pool.get(slot);
+            self.remove(slot);
+            sink.on_event(Event::Cancelled {
+                id,
+                qty: remaining,
+                reason: CancelReason::MassCancel,
+            });
+        }
+        sink.on_event(Event::MassCancelled {
+            owner,
+            count: position,
+        });
+        self.scratch = keys;
     }
 
     fn modify<S: EventSink>(
@@ -481,19 +546,10 @@ impl OrderBook {
             });
             return;
         }
-        let slot = self.pool.alloc(OrderNode {
-            id,
-            remaining,
-            total,
-            level,
-            prev: NIL,
-            next: NIL,
-            owner,
-            side,
-        });
-        self.index.insert(id, slot);
-        let (half, pool) = self.half_and_pool(side);
-        half.push_back(pool, slot);
+        let slot = self
+            .pool
+            .alloc(OrderNode::new(id, owner, side, level, remaining, total));
+        self.place(slot);
         sink.on_event(Event::Rested {
             id,
             side,
@@ -523,6 +579,7 @@ impl OrderBook {
             asks,
             pool,
             index,
+            owners,
             next_trade_id,
             ..
         } = self;
@@ -556,7 +613,7 @@ impl OrderBook {
                     }
                     let (maker_id, maker_leaves) = (maker.id, maker.remaining);
                     lvl.total_qty -= maker_leaves;
-                    lvl.pop_front(pool, index);
+                    lvl.pop_front(pool, index, owners);
                     sink.on_event(Event::Cancelled {
                         id: maker_id,
                         qty: maker_leaves,
@@ -582,7 +639,7 @@ impl OrderBook {
                     maker_leaves: maker.remaining,
                 });
                 if maker.remaining == 0 {
-                    lvl.pop_front(pool, index);
+                    lvl.pop_front(pool, index, owners);
                 }
             }
 
@@ -593,13 +650,29 @@ impl OrderBook {
         (0, Halt::Filled)
     }
 
+    /// Puts an allocated order on the book: into the id index, at the back of its level's
+    /// queue, and at the back of its owner's list.
+    #[inline]
+    fn place(&mut self, slot: u32) {
+        let OrderNode {
+            id, owner, side, ..
+        } = *self.pool.get(slot);
+        self.index.insert(id, slot);
+        let (half, pool) = self.half_and_pool(side);
+        half.push_back(pool, slot);
+        self.owners.link(slot, owner);
+    }
+
     /// Unlinks and frees a resting order.
     #[inline]
     fn remove(&mut self, slot: u32) {
-        let OrderNode { id, side, .. } = *self.pool.get(slot);
+        let OrderNode {
+            id, side, owner, ..
+        } = *self.pool.get(slot);
         let (half, pool) = self.half_and_pool(side);
         half.unlink(pool, slot);
-        pool.free(slot);
+        self.owners.unlink(slot, owner);
+        self.pool.free(slot);
         self.index.remove(&id);
     }
 
@@ -609,6 +682,15 @@ impl OrderBook {
         match self.index.get(&id) {
             Some(&slot) if self.pool.get(slot).owner == owner => Ok(slot),
             _ => Err(RejectReason::UnknownOrder),
+        }
+    }
+
+    #[inline]
+    fn check_owner(&self, owner: OwnerId) -> Result<(), RejectReason> {
+        if owner < self.config.max_owners {
+            Ok(())
+        } else {
+            Err(RejectReason::InvalidOwner)
         }
     }
 
@@ -843,6 +925,8 @@ impl OrderBook {
                 self.index.len()
             ));
         }
+        self.validate_owners()?;
+        self.validate_free_list()?;
         if let (Some(bid), Some(ask)) = (self.bids.best, self.asks.best) {
             if bid >= ask {
                 return Err(format!(
@@ -851,6 +935,75 @@ impl OrderBook {
                     self.price_of(ask)
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The owner lists: links, membership and counts, and that together they hold every
+    /// resting order exactly once.
+    fn validate_owners(&self) -> Result<(), String> {
+        let mut listed = 0usize;
+        for (owner, list) in self.owners.lists() {
+            let (mut count, mut prev, mut cur) = (0u32, NIL, list.head);
+            while cur != NIL {
+                let node = self.pool.get(cur);
+                let link = self.owners.link_of(cur);
+                let id = node.id;
+                if link.prev != prev {
+                    return Err(format!("owner {owner}: broken back link at #{id}"));
+                }
+                if node.owner != owner {
+                    return Err(format!("owner {owner}: #{id} is misfiled"));
+                }
+                count += 1;
+                prev = cur;
+                cur = link.next;
+            }
+            if prev != list.tail {
+                return Err(format!("owner {owner}: tail does not point at last order"));
+            }
+            if count != list.count {
+                return Err(format!(
+                    "owner {owner}: count says {} but list holds {count}",
+                    list.count
+                ));
+            }
+            listed += count as usize;
+        }
+        if listed != self.pool.live() {
+            return Err(format!(
+                "{listed} orders in owner lists, {} in pool",
+                self.pool.live()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The order pool's free list holds exactly the unused slots, ends in `NIL`, and points
+    /// only inside the slab. Allocation trusts all three.
+    fn validate_free_list(&self) -> Result<(), String> {
+        let unused = self.pool.capacity() - self.pool.live();
+        let (mut listed, mut cur) = (0usize, self.pool.free_head());
+        while cur != NIL {
+            if cur as usize >= self.pool.capacity() {
+                return Err("free list points outside the order pool".to_string());
+            }
+            if listed == unused {
+                return Err(format!(
+                    "free list holds more than the {unused} unused slots"
+                ));
+            }
+            let node = self.pool.get(cur);
+            if node.remaining != 0 {
+                return Err(format!("free slot {cur} still holds #{}", node.id));
+            }
+            listed += 1;
+            cur = node.next;
+        }
+        if listed != unused {
+            return Err(format!(
+                "free list holds {listed} of the {unused} unused slots"
+            ));
         }
         Ok(())
     }
@@ -918,6 +1071,7 @@ mod validate_tests {
     use crate::types::Side::{Buy, Sell};
 
     /// Bids 100: #1 (5), #2 (7); bids 99: #3 (1); asks 105: #4 (3); asks 106: #5 (4).
+    /// Owner 1 has #1 and #3; every other order has its own owner.
     fn healthy() -> OrderBook {
         let mut book = OrderBook::new(BookConfig::new(1, 1_000, 16));
         let mut events = Vec::new();
@@ -928,7 +1082,7 @@ mod validate_tests {
             (4, Sell, 105, 3),
             (5, Sell, 106, 4),
         ] {
-            let owner = id as OwnerId;
+            let owner = if id == 3 { 1 } else { id as OwnerId };
             book.process(
                 Command::Limit {
                     id,
@@ -1114,38 +1268,99 @@ mod validate_tests {
         assert_detects(
             |b| {
                 let l = level(b, 105) as u32;
-                let s = b.pool.alloc(OrderNode {
-                    id: 9,
-                    remaining: 1,
-                    total: 1,
-                    level: l,
-                    prev: NIL,
-                    next: NIL,
-                    owner: 9,
-                    side: Buy,
-                });
-                b.index.insert(9, s);
-                b.bids.push_back(&mut b.pool, s);
+                let s = b.pool.alloc(OrderNode::new(9, 9, Buy, l, 1, 1));
+                b.place(s);
             },
             "crossed",
         );
     }
 
+    /// The fixture has 16 slots, 5 of them in use.
     #[test]
-    fn level_total_overflow_is_reported_not_wrapped() {
-        // Two orders whose open quantities sum past u64::MAX. Lifting the per-order limit
-        // lets them past the per-order check, so the sum itself must catch it.
+    fn corrupted_free_list() {
         assert_detects(
             |b| {
-                b.config.max_order_qty = u64::MAX;
-                for id in [1, 2] {
-                    let s = slot(b, id);
-                    let node = b.pool.get_mut(s);
-                    node.remaining = u64::MAX / 2 + 1;
-                    node.total = u64::MAX / 2 + 1;
-                }
+                let s = b.pool.free_head();
+                b.pool.get_mut(s).next = NIL;
             },
-            "overflows",
+            "free list holds 1 of the 11 unused slots",
+        );
+        assert_detects(
+            |b| {
+                let s = b.pool.free_head();
+                b.pool.get_mut(s).next = 16;
+            },
+            "free list points outside the order pool",
+        );
+        assert_detects(
+            |b| {
+                let s = b.pool.free_head();
+                b.pool.get_mut(s).next = s;
+            },
+            "free list holds more than the 11 unused slots",
+        );
+        assert_detects(
+            |b| {
+                let s = b.pool.free_head();
+                b.pool.get_mut(s).next = slot(b, 2);
+            },
+            "free slot 1 still holds #2",
+        );
+    }
+
+    #[test]
+    fn broken_owner_links() {
+        assert_detects(
+            |b| {
+                let s = slot(b, 3);
+                b.owners.link_mut(s).prev = NIL;
+            },
+            "owner 1: broken back link",
+        );
+        assert_detects(
+            |b| {
+                let s = slot(b, 1);
+                b.owners.list_mut(1).tail = s;
+            },
+            "owner 1: tail does not point",
+        );
+        // An empty list whose tail still points somewhere.
+        assert_detects(
+            |b| {
+                let s = slot(b, 1);
+                b.owners.list_mut(9).tail = s;
+            },
+            "owner 9: tail does not point",
+        );
+    }
+
+    #[test]
+    fn misfiled_owner_membership() {
+        assert_detects(
+            |b| {
+                let s = slot(b, 3);
+                b.pool.get_mut(s).owner = 2;
+            },
+            "owner 1: #3 is misfiled",
+        );
+    }
+
+    #[test]
+    fn owner_lists_out_of_step_with_the_book() {
+        assert_detects(
+            |b| b.owners.list_mut(1).count += 1,
+            "owner 1: count says 3 but list holds 2",
+        );
+        // #3 dropped from its owner's list, consistently: only the totals can tell.
+        assert_detects(
+            |b| {
+                let first = slot(b, 1);
+                b.owners.link_mut(first).next = NIL;
+                let list = b.owners.list_mut(1);
+                list.tail = first;
+                list.count = 1;
+            },
+            "4 orders in owner lists, 5 in pool",
         );
     }
 }

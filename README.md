@@ -219,45 +219,52 @@ replaying the journal rebuilds its exact state; snapshots bound how much has to 
 replayed.
 
 ```rust
-let (mut engine, report) = Engine::open("data", EngineConfig::new(book_config))?;
-let seq = engine.submit(command, &mut events)?; // journaled, synced, then applied
+let mut events: Vec<(Seq, Event)> = Vec::new();
+let (mut engine, report) = Engine::open("data", EngineConfig::new(book_config), &mut events)?;
+let seq = engine.submit(command, &mut events)?; // journaled, synced, applied; events tagged
 ```
 
 | Property | How |
 |---|---|
-| Write-ahead | The book never sees a command the journal lacks. Opening an engine loads the newest intact snapshot and replays the journal after it. |
-| Checksummed, fixed-size records | 64-byte records with a CRC-32 in preallocated segment files; the record for `seq` sits at a computed slot. Commands use a strict 40-byte encoding that decodes only what the encoder writes. |
-| Crash or damage, never confused | Each record carries the highest sequence number synced when it was written. A bad record that nothing later vouches for is the torn tail of a crash: recovery cuts the log there and zeroes what follows, so stale records cannot return after the next crash. If a later record shows the bad one had been synced, recovery refuses rather than drop acknowledged commands. |
-| Atomic snapshots | Written to a temporary file, synced, renamed. Loading checks two checksums, the decoding, the book's restore rules and its digest; a damaged snapshot is set aside and the previous one used. Old snapshots and the journal only they needed are deleted. |
-| Sync policies | `Always` syncs before `submit` returns, once per batch with `submit_batch` (group commit); `Os` leaves write-back to the OS. A failed write or sync poisons the engine until it is reopened. |
+| Write-ahead, with sequenced output | The book never sees a command the journal lacks. Every event carries its command's sequence number, and recovery delivers the events of replayed commands again under the same numbers, so a consumer that tracks the last number it handled loses nothing. |
+| Checksummed, fixed-size records | 64-byte records with a CRC-32, the record for `seq` at a computed slot, in segment files written full of zeros before use (prepared ahead, so rolling over does not stall). Commands use a strict 40-byte encoding that decodes only what the encoder writes. |
+| Crash or damage, never confused | Each record carries the highest sequence number synced when it was written. A bad record that nothing later vouches for is the torn tail of a crash: recovery cuts the log there and zeroes what follows. If a later record shows the bad one had been synced, recovery refuses rather than drop acknowledged commands. |
+| Recovery that changes nothing until it has checked everything | It reads and checks every file it relies on first, never deletes a file that could hold a record, refuses files from a newer format or written under other matching rules, writes again what a failed sync may have left unwritten, and syncs the directory before anything new is appended. |
+| Verified snapshots | Written to a temporary file, synced, renamed, then read back and checked before anything older is deleted. Every start replays the journal from the snapshot before the newest and checks that it reaches the newest one's digest. A failed snapshot does not stop trading. |
+| One writer | An OS lock on the directory keeps a second engine out; the OS releases it however the process ends. |
+| Sync policies | `Always` syncs before `submit` returns, once per batch with `submit_batch` (group commit); `Os` syncs only at segment rolls, on request and before snapshots. A failed write or sync, or a panic in the book, poisons the engine until it is reopened. |
 | No allocation | Journaling, syncing and applying commands allocate nothing, shown with a counting allocator on the real file system. |
 
-**What a failure costs**: a killed process loses nothing it submitted; a power failure
+**What a failure costs**: a killed process loses nothing it acknowledged; a power failure
 loses nothing acknowledged under `Always`, and only what came after the last sync under
 `Os`. In every case recovery keeps a prefix of the commands and rebuilds exactly the state
 after it.
 
-**Verification.** The acceptance test kills a real process 48 times at random points, in
-writes, syncs, segment rolls and snapshots, on Linux, Windows and macOS: each time, recovery
-keeps everything the process had reported durable and rebuilds exactly the state after it.
-A simulated disk that loses power (torn writes, reordered write-back, lost directory
-changes) drives 1,600 failures over 400 random configurations, and flips a bit anywhere in
-any file 300 times; a fuzz target combines all of these with any command stream. Removing
-any one of the four safety mechanisms in recovery fails a test.
+**Verification.** The acceptance test kills a real process 48 times at random points on
+Linux, Windows and macOS: each time, recovery keeps every command the process had reported
+applied and rebuilds exactly the state after it. On a simulated disk that loses power
+(torn writes, reordered write-back, lost directory changes, failed syncs that drop pages),
+a test lets the process die at every single change a run makes, inside segment rolls,
+snapshot writes and recovery itself, then chains two more failures; others damage every
+kind of file in every way, and a fuzz target combines all of it with any command stream.
+Removing any one of seven safety mechanisms fails a test. An adversarial review of the
+first version of this phase found six defects; the tests above exist because the earlier
+ones could not see them.
 
-**Cost** (`cargo bench -p engine --bench journal`, same laptop, P-core, Windows):
+**Cost** (`cargo bench -p engine --bench journal`, same laptop, P-core, Windows; ranges
+over four runs, since syncing on this drive varies a lot from run to run):
 
 | | Throughput | p50 per command |
 |---|---:|---:|
-| Book alone | 8.7M cmd/s | 100 ns |
-| Journal, `Os`, 64 commands per write | 5.3M cmd/s | 122 ns |
-| Journal, `Os`, one command per write | 377k cmd/s | 2.1 µs |
-| Journal, `Always`, 512 commands per sync (group commit) | 366k cmd/s | 2.8 µs |
-| Journal, `Always`, one command per sync | about 500 cmd/s | 2.2 ms |
+| Book alone | 8.0–9.3M cmd/s | 100 ns |
+| Journal, `Os`, 64 commands per write | 2.4M–3.2M cmd/s | 113–152 ns |
+| Journal, `Os`, one command per write | 330k–395k cmd/s | 1.9–2.1 µs |
+| Journal, `Always`, 512 commands per sync (group commit) | 94k–370k cmd/s | 2.4–10 µs |
+| Journal, `Always`, one command per sync | 0.9k–1.0k cmd/s | 1.0 ms |
 
-A sync costs one to two milliseconds on this consumer NVMe drive however little it
-writes, so durability is affordable only with group commit. Replay runs at 11.9M cmd/s.
-Formats, the recovery algorithm and the reasoning are in
+A sync costs about a millisecond on this consumer NVMe drive however little it writes, so
+durability is affordable only with group commit; Phase 4 moves the journal to a core of
+its own. Formats, the recovery algorithm, the trade-offs and the reasoning are in
 [DESIGN.md §14](docs/DESIGN.md#14-the-journal-and-recovery).
 
 ## Running

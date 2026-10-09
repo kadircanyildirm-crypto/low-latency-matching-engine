@@ -75,27 +75,37 @@ path, latency report in the README. All met.
 
 **Delivered** (`crates/engine`, [DESIGN.md §14](DESIGN.md#14-the-journal-and-recovery))
 - A sequencer: `Engine::submit` gives every command the next sequence number, journals it,
-  syncs as the policy says, and only then applies it to the book.
-- An append-only journal of preallocated segment files: a checksummed header per segment,
-  and 64-byte records, each with its length, CRC-32, sequence number and a strict 40-byte
-  encoding of the command.
+  syncs as the policy says, and only then applies it to the book. Events carry their
+  command's sequence number, and recovery delivers the events of replayed commands again,
+  so a consumer that tracks the last number it handled loses nothing.
+- An append-only journal of segment files written full of zeros before use and prepared
+  ahead under a temporary name: a checksummed header per segment, and 64-byte records,
+  each with its length, CRC-32, sequence number and a strict 40-byte encoding of the
+  command. An OS lock keeps a second engine out of the directory.
 - Crash recovery: a torn or half-written tail is cut and zeroed, so stale records cannot
   return after a later crash. Each record carries the highest sequence number synced when
   it was written, so recovery tells a crash from damage to synced data and refuses the
-  latter instead of dropping acknowledged commands.
-- Snapshots written atomically (temporary file, sync, rename) on a schedule or on request;
-  recovery loads the newest intact one, falls back to an older one if it is damaged, and
-  replays the journal after it. Old snapshots and the journal only they needed are
-  deleted.
-- State hash: every snapshot records the book's digest, checked after loading; every
-  recovery test compares the recovered digest with a run that never failed.
+  latter instead of dropping acknowledged commands. Records the last sync may not have
+  written are written again, the directory is synced, and nothing is changed on disk until
+  everything recovery relies on has been checked.
+- Snapshots written atomically (temporary file, sync, rename) on a schedule or on request,
+  read back and checked before anything older is deleted; recovery loads the newest intact
+  one, falls back to an older one if it is damaged, and replays the journal after it.
+- State hash: every snapshot records the book's digest, checked after loading, and every
+  start replays the journal from the snapshot before the newest and checks that it
+  reaches the newest one's digest.
+- Format and matching-rules versions in every file: a newer format or other rules are
+  refused, never deleted.
 - Sync policies: every call (`Always`; with `submit_batch`, group commit) or left to the OS
-  (`Os`), with a benchmark of each one's cost. A failed write or sync poisons the engine.
+  (`Os`), with a benchmark of each one's cost. A failed write or sync, or a panic in the
+  book, poisons the engine; a failed snapshot does not stop trading.
 - Zero allocation on the journaling path, shown with a counting allocator.
-- Verification: a simulated disk that loses power (torn and reordered writes, lost
-  directory changes) and flips bits, 1,600 failures over 400 random configurations, a
-  test per way the files can be damaged, a fuzz target combining all of it, and fault
-  injection showing that each safety mechanism is needed.
+- Verification: the process killed at every single change a run makes to the disk, on a
+  simulated disk that loses power (torn and reordered writes, lost directory changes,
+  failed syncs that drop pages) and flips bits; a test per way the files can be damaged;
+  a fuzz target combining all of it; and fault injection showing that each safety
+  mechanism is needed. An adversarial review of the first version found six defects,
+  fixed with the tests that would have caught them.
 
 **Acceptance criteria:** a test proving that a process killed at a random point returns to
 exactly the same state through replay (`crates/engine/tests/kill.rs`: 48 kills on Linux,

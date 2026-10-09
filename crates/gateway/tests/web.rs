@@ -344,6 +344,11 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let mut other = Browser::connect(gateway.web);
     other.send(json!({"type": "nonsense"}));
     assert_eq!(other.expect("error")["type"], "error");
+    // Every browser is told how the exchange is doing, once a second.
+    let stats = Browser::connect(gateway.web).expect("stats");
+    assert!(stats["sessions"].as_u64().unwrap() >= 1, "{stats}");
+    assert!(stats["turn_max_ns"].as_u64().unwrap() >= stats["turn_p50_ns"].as_u64().unwrap());
+
     // A second guest gets the next id, and the third finds none left.
     let mut second = Browser::connect(gateway.web);
     second.send(json!({"type": "register"}));

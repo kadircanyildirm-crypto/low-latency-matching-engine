@@ -87,6 +87,15 @@
   </section>
 </main>
 
+<section class="panel stats" aria-label="How the exchange is doing">
+  <span><b id="cps">—</b> commands/s</span>
+  <span>engine turn p50 <b id="p50">—</b></span>
+  <span>p99 <b id="p99">—</b></span>
+  <span>max <b id="max">—</b></span>
+  <span><b id="sessions">—</b> sessions</span>
+  <span><b id="resting">—</b> orders on the book</span>
+</section>
+
 <footer class="muted">
   A Rust exchange matching engine: price-time priority, a write-ahead journal with crash
   recovery, a lock-free pipeline. The other traders are bots. Prices in dollars and cents.

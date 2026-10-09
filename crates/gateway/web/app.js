@@ -131,6 +131,9 @@ function receive(message) {
     case "error":
       notice(message.message, true);
       break;
+    case "stats":
+      stats(message);
+      break;
     default:
       break;
   }
@@ -352,6 +355,17 @@ function renderOrders() {
       return row;
     }),
   );
+}
+
+const duration = (ns) => (ns >= 1_000_000 ? `${(ns / 1_000_000).toFixed(2)} ms` : `${Math.round(ns / 1_000)} µs`);
+
+function stats(message) {
+  $("cps").textContent = message.commands_per_second.toLocaleString("en-US");
+  $("p50").textContent = duration(message.turn_p50_ns);
+  $("p99").textContent = duration(message.turn_p99_ns);
+  $("max").textContent = duration(message.turn_max_ns);
+  $("sessions").textContent = message.sessions;
+  $("resting").textContent = message.orders.toLocaleString("en-US");
 }
 
 function setSide(side) {

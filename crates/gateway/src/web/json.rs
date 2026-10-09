@@ -431,6 +431,32 @@ pub fn outbound(message: &Outbound) -> String {
     serde_json::to_string(&web).expect("a message serialises")
 }
 
+/// How the exchange is doing, as browsers are told every second.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Stats {
+    /// Commands numbered per second.
+    pub commands_per_second: u64,
+    /// How long a turn of the server that handed commands to the engine took: journaling,
+    /// syncing, matching and routing a round's commands with the engine on the server's
+    /// thread, handing them over and routing what came back with a pipeline.
+    pub turn_p50_ns: u64,
+    /// See `turn_p50_ns`.
+    pub turn_p99_ns: u64,
+    /// See `turn_p50_ns`.
+    pub turn_max_ns: u64,
+    /// Connections with a session.
+    pub sessions: u64,
+    /// Orders resting on the book.
+    pub orders: u64,
+}
+
+/// The JSON for `stats`, with `"type": "stats"`.
+pub fn stats(stats: &Stats) -> String {
+    let mut value = serde_json::to_value(stats).expect("statistics serialise");
+    value["type"] = serde_json::Value::from("stats");
+    value.to_string()
+}
+
 /// The JSON telling a browser its new account.
 pub fn registered(account: u32, token: u64) -> String {
     let web = WebOut::Registered {
@@ -622,5 +648,19 @@ mod tests {
             r#"{"type":"registered","account":4,"token":"00000000000000ff"}"#
         );
         assert_eq!(error("full"), r#"{"type":"error","message":"full"}"#);
+        let stats: serde_json::Value = serde_json::from_str(&super::stats(&Stats {
+            commands_per_second: 3,
+            turn_p50_ns: 4,
+            turn_p99_ns: 5,
+            turn_max_ns: 6,
+            sessions: 7,
+            orders: 8,
+        }))
+        .unwrap();
+        assert_eq!(
+            stats,
+            serde_json::json!({"type": "stats", "commands_per_second": 3, "turn_p50_ns": 4,
+                "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8})
+        );
     }
 }

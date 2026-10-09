@@ -81,6 +81,11 @@ impl Depth {
         depth
     }
 
+    /// How many orders rest on the book.
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
+    }
+
     /// The levels of `side`, best price first.
     pub fn levels(&self, side: Side) -> Box<dyn Iterator<Item = (Price, Level)> + '_> {
         match side {

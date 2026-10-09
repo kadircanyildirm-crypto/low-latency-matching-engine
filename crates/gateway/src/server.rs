@@ -229,6 +229,7 @@ pub struct Server<C: Core> {
     ready: Vec<SessionId>,
     scratch: Box<[u8]>,
     started: Instant,
+    stats: Stats,
     last_tick: u64,
 }
 
@@ -263,6 +264,7 @@ impl<C: Core> Server<C> {
             ready: Vec::new(),
             scratch: vec![0; READ_CHUNK].into_boxed_slice(),
             started: Instant::now(),
+            stats: Stats::default(),
             last_tick: 0,
         })
     }
@@ -392,9 +394,18 @@ impl<C: Core> Server<C> {
                 self.unread.push(session);
             }
         }
+        let handing = self.exchange.has_batch();
+        let turned = Instant::now();
         if let Err(error) = self.core.turn(&mut self.exchange, &mut self.wires) {
             self.exchange.shut_down(&mut self.wires);
             return Err(ServerError::Engine(error));
+        }
+        if handing {
+            let took = u64::try_from(turned.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.stats.turns.push(took);
+        }
+        if now.saturating_sub(self.stats.since) >= 1_000_000_000 {
+            self.publish_stats(now);
         }
         self.exchange.publish(&mut self.wires);
         if now.saturating_sub(self.last_tick) >= self.config.tick.as_nanos() as u64 {
@@ -615,6 +626,48 @@ impl<C: Core> Server<C> {
         }
     }
 
+    /// Tells the browsers how the exchange is doing: commands per second over the last
+    /// period, how long the turns that handed commands to the engine took, and how many
+    /// sessions and orders there are.
+    fn publish_stats(&mut self, now: u64) {
+        let seconds = now.saturating_sub(self.stats.since) as f64 / 1e9;
+        let commands = self.exchange.last_seq() - self.stats.seq;
+        let mut turns = std::mem::take(&mut self.stats.turns);
+        turns.sort_unstable();
+        let at = |q: f64| {
+            turns
+                .get(((turns.len() as f64 - 1.0) * q).round() as usize)
+                .copied()
+        };
+        let sessions = self
+            .wires
+            .slots
+            .iter()
+            .flatten()
+            .filter(|c| !matches!(c.kind, Kind::Http { .. }))
+            .count();
+        let stats = json::Stats {
+            commands_per_second: (commands as f64 / seconds.max(1e-9)).round() as u64,
+            turn_p50_ns: at(0.5).unwrap_or(0),
+            turn_p99_ns: at(0.99).unwrap_or(0),
+            turn_max_ns: turns.last().copied().unwrap_or(0),
+            sessions: sessions as u64,
+            orders: self.exchange.depth().order_count() as u64,
+        };
+        let text = json::stats(&stats);
+        for connection in self.wires.slots.iter_mut().flatten() {
+            if matches!(connection.kind, Kind::WebSocket { .. }) && !connection.closing {
+                ws::encode_text(&text, &mut connection.output);
+            }
+        }
+        turns.clear();
+        self.stats = Stats {
+            since: now,
+            seq: self.exchange.last_seq(),
+            turns,
+        };
+    }
+
     /// Creates an account for the browser on `session`: one per connection.
     fn register(&mut self, session: SessionId) {
         let registered = self.wires.slots[session]
@@ -740,6 +793,16 @@ impl<C: Core> Server<C> {
         }
         self.unread.clear();
     }
+}
+
+/// What the server measures for its statistics, since `since`.
+#[derive(Debug, Default)]
+struct Stats {
+    since: u64,
+    /// The last sequence number at `since`.
+    seq: u64,
+    /// How long each turn that handed commands to the engine took, in nanoseconds.
+    turns: Vec<u64>,
 }
 
 /// Writes as much of the connection's output as the socket takes.

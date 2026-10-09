@@ -220,3 +220,38 @@ fn snapshots_with_invalid_configurations_are_refused() {
         ))
     );
 }
+
+/// Every configuration field round-trips, including the other self-trade policy; bytes
+/// that are valid field by field but not what the encoder writes are refused.
+#[test]
+fn snapshot_fields_round_trip_and_bytes_are_canonical() {
+    let config = BookConfig {
+        self_trade: orderbook::SelfTradePolicy::CancelIncoming,
+        price_protection: Some(3),
+        price_band: Some(9),
+        reference_price: Some(50),
+        auction_on_band: true,
+        ..BookConfig::new(1, 100, 4)
+    };
+    let book = OrderBook::new(config);
+    let mut bytes = Vec::new();
+    encode_snapshot(&book.snapshot(), &mut bytes);
+    assert_eq!(decode_snapshot(&bytes), Ok(book.snapshot()));
+    // The self-trade policy is the byte before the trade count (8 bytes), the reference
+    // price (9) and the phase (1), and the two counts (4 each).
+    let policy = bytes.len() - 8 - 9 - 1 - 4 - 4 - 1;
+    let mut invalid = bytes.clone();
+    invalid[policy] = 2;
+    assert_eq!(
+        decode_snapshot(&invalid),
+        Err(DecodeError::InvalidField("self-trade policy"))
+    );
+    // The snapshot's own reference price (absent) followed by a value.
+    let mut non_canonical = OrderBook::new(BookConfig::new(1, 100, 4)).snapshot();
+    non_canonical.reference_price = None;
+    let mut bytes = Vec::new();
+    encode_snapshot(&non_canonical, &mut bytes);
+    let value = bytes.len() - 4 - 4 - 1 - 8;
+    bytes[value] = 1;
+    assert_eq!(decode_snapshot(&bytes), Err(DecodeError::NonCanonical));
+}

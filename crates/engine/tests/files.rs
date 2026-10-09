@@ -1,0 +1,367 @@
+//! One test per way the files on disk can disagree with what the engine expects: leftover
+//! temporary files, snapshots that lie about themselves, segments that are missing, short or
+//! damaged in particular places, and a journal that ends before its snapshot.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use engine::sim::SimStorage;
+use engine::storage::{FsStorage, Storage, StorageFile};
+use engine::{Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport};
+use orderbook::{BookConfig, Command, Event};
+
+const DIR: &str = "data";
+
+fn open(
+    storage: &SimStorage,
+    config: EngineConfig,
+) -> Result<(Engine<SimStorage>, RecoveryReport), Error> {
+    Engine::open_with(storage.clone(), Path::new(DIR), config)
+}
+
+fn run(storage: &SimStorage, config: EngineConfig, commands: &[Command]) {
+    let (mut engine, _) = open(storage, config).unwrap();
+    let mut events: Vec<Event> = Vec::new();
+    for &command in commands {
+        engine.submit(command, &mut events).unwrap();
+        events.clear();
+    }
+}
+
+fn segment(first_seq: u64) -> PathBuf {
+    Path::new(DIR).join(format!("journal-{first_seq:020}.log"))
+}
+
+fn snapshot(seq: u64) -> PathBuf {
+    Path::new(DIR).join(format!("snapshot-{seq:020}.snap"))
+}
+
+/// Bit `bit` of the record in `slot` of a segment.
+fn record_bit(slot: u64, bit: u64) -> u64 {
+    (64 + slot * RECORD_SIZE as u64) * 8 + bit
+}
+
+fn small(book: BookConfig) -> EngineConfig {
+    EngineConfig {
+        segment_capacity: 10,
+        ..EngineConfig::new(book)
+    }
+}
+
+#[test]
+fn leftover_temporary_snapshots_are_deleted() {
+    let (book, commands) = common::flow(20, 30);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    let mut fs = storage.clone();
+    let partial = Path::new(DIR).join("snapshot-00000000000000000030.tmp");
+    fs.create(&partial)
+        .unwrap()
+        .write_at(0, b"half a snapshot")
+        .unwrap();
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 30);
+    assert!(storage.files().iter().all(|(path, _)| *path != partial));
+}
+
+#[test]
+fn a_snapshot_is_taken_once_per_state() {
+    let (book, commands) = common::flow(21, 30);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.config().segment_capacity, 10);
+    let mut events = Vec::new();
+    engine.submit_batch(&commands, &mut events).unwrap();
+    engine.snapshot().unwrap();
+    let files = storage.files();
+    engine.snapshot().unwrap();
+    assert_eq!(storage.files(), files);
+    assert_eq!(engine.last_snapshot(), 30);
+}
+
+/// A snapshot whose header, length, digest or configuration does not match its file name or
+/// its contents is set aside, or, for another configuration, refused.
+#[test]
+fn snapshots_that_contradict_themselves_are_not_used() {
+    let (book, commands) = common::flow(22, 40);
+    let digests = common::digests(book, &commands);
+    let config = EngineConfig {
+        snapshot_every: Some(20),
+        ..small(book)
+    };
+    let fresh = || {
+        let storage = SimStorage::new();
+        run(&storage, config, &commands);
+        // A snapshot at 20; the one at 40 would come before a 41st command.
+        storage
+    };
+    let check = |storage: &SimStorage, reason: &str| {
+        let (engine, report) = open(storage, config).unwrap();
+        assert_eq!(report.snapshot, None, "{reason}");
+        assert_eq!(report.damaged_snapshots.len(), 1, "{reason}");
+        assert!(report.damaged_snapshots[0].1.contains(reason), "{report:?}");
+        assert_eq!(engine.book().digest(), digests[40]);
+    };
+
+    // Another snapshot's file under this name.
+    let storage = fresh();
+    let mut fs = storage.clone();
+    fs.rename(&snapshot(20), &snapshot(19)).unwrap();
+    check(&storage, "sequence number");
+
+    // Longer than its header says.
+    let storage = fresh();
+    let mut fs = storage.clone();
+    let mut file = fs.open(&snapshot(20)).unwrap();
+    let size = file.size().unwrap();
+    file.set_len(size + 1).unwrap();
+    check(&storage, "length");
+
+    // A header that checks out, with the wrong digest.
+    let storage = fresh();
+    let mut fs = storage.clone();
+    let mut file = fs.open(&snapshot(20)).unwrap();
+    let mut header = [0; 64];
+    file.read_at(0, &mut header).unwrap();
+    header[24] ^= 1;
+    let crc = crc32fast::hash(&header[..60]);
+    header[60..].copy_from_slice(&crc.to_le_bytes());
+    file.write_at(0, &header).unwrap();
+    check(&storage, "digest");
+
+    // Shorter than a header.
+    let storage = fresh();
+    let mut fs = storage.clone();
+    fs.open(&snapshot(20)).unwrap().set_len(10).unwrap();
+    check(&storage, "header");
+
+    // Another configuration: refused outright, since the engine is opened with the wrong one.
+    let storage = fresh();
+    let other = BookConfig {
+        max_owners: book.max_owners + 1,
+        ..book
+    };
+    assert!(matches!(
+        open(
+            &storage,
+            EngineConfig {
+                book: other,
+                ..config
+            }
+        ),
+        Err(Error::ConfigMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_missing_segment_in_the_middle_is_refused() {
+    let (book, commands) = common::flow(23, 35);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage.clone().remove(&segment(11)).unwrap();
+    assert!(matches!(
+        open(&storage, small(book)),
+        Err(Error::Corrupt { .. })
+    ));
+    // Without the first segment, replay cannot start.
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage.clone().remove(&segment(1)).unwrap();
+    assert!(matches!(
+        open(&storage, small(book)),
+        Err(Error::MissingJournal { from: 1 })
+    ));
+}
+
+/// The journal can only end before its snapshot through damage to synced data; the
+/// snapshot then stands, and the journal starts afresh after it.
+#[test]
+fn a_journal_that_ends_before_its_snapshot_is_replaced() {
+    let (book, commands) = common::flow(24, 35);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    let config = EngineConfig {
+        snapshot_every: Some(30),
+        ..small(book)
+    };
+    run(&storage, config, &commands);
+    // Segments 1, 11, 21 and 31 hold commands 1 to 35; lose the two that reach past 20.
+    let mut fs = storage.clone();
+    fs.remove(&segment(31)).unwrap();
+    fs.remove(&segment(21)).unwrap();
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.snapshot, Some(30));
+    assert_eq!(engine.last_seq(), 30);
+    assert_eq!(engine.book().digest(), digests[30]);
+    let names: Vec<_> = storage.files().into_iter().map(|(path, _)| path).collect();
+    assert!(names.contains(&segment(31)));
+}
+
+/// Damage to the last record of a full segment, when the next segment holds nothing valid,
+/// cannot be told from a crash: the record is cut, and the empty segment goes.
+#[test]
+fn damage_before_an_empty_segment_cuts_the_log() {
+    let (book, commands) = common::flow(25, 11);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage.flip_bit(&segment(1), record_bit(9, 100));
+    storage.flip_bit(&segment(11), record_bit(0, 100));
+    let (engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 9);
+    assert_eq!(engine.book().digest(), digests[9]);
+    assert_eq!(report.journal.removed_segments, 1);
+    assert_eq!(report.journal.cleared_records, 1);
+    assert!(storage.files().iter().all(|(path, _)| *path != segment(11)));
+}
+
+/// A damaged header in the newest segment is a crash during its creation when no record
+/// stands behind it, and damage when one does.
+#[test]
+fn a_damaged_newest_header_is_removed_only_if_nothing_follows_it() {
+    let (book, commands) = common::flow(26, 15);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage.flip_bit(&segment(11), 3);
+    assert!(matches!(
+        open(&storage, small(book)),
+        Err(Error::Corrupt { .. })
+    ));
+
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands[..11]);
+    storage.flip_bit(&segment(11), 3);
+    storage.flip_bit(&segment(11), record_bit(0, 7));
+    let (engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!(report.journal.removed_segments, 1);
+    assert_eq!(engine.last_seq(), 10);
+    assert_eq!(engine.book().digest(), digests[10]);
+}
+
+/// A segment file that lost its preallocated tail, or ends inside a record, reads as empty
+/// from there.
+#[test]
+fn a_short_segment_reads_as_empty_past_its_end() {
+    let (book, commands) = common::flow(27, 15);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    // Records 11 to 15 are slots 0 to 4; cut the file inside slot 6.
+    let len = 64 + 6 * RECORD_SIZE as u64 + 10;
+    storage
+        .clone()
+        .open(&segment(11))
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 15);
+    assert_eq!(engine.book().digest(), digests[15]);
+    // Appending grows the file again.
+    let (_, more) = common::flow(27, 20);
+    let mut events = Vec::new();
+    engine.submit_batch(&more[15..], &mut events).unwrap();
+    drop(engine);
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 20);
+
+    // Cut right after the last record: replay ends exactly at the end of the file.
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    let len = 64 + 5 * RECORD_SIZE as u64;
+    storage
+        .clone()
+        .open(&segment(11))
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 15);
+
+    // A damaged header in front of a file that ends inside its first record.
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands[..11]);
+    let mut file = storage.clone().open(&segment(11)).unwrap();
+    file.set_len(64 + 10).unwrap();
+    storage.flip_bit(&segment(11), 3);
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.last_seq(), 10);
+}
+
+/// Segments larger than recovery reads at once.
+#[test]
+fn large_segments_replay_across_reads() {
+    let (book, commands) = common::flow(28, 17_000);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    let config = EngineConfig {
+        segment_capacity: 20_000,
+        ..EngineConfig::new(book)
+    };
+    {
+        let (mut engine, _) = open(&storage, config).unwrap();
+        let mut events = Vec::new();
+        for chunk in commands.chunks(1_000) {
+            engine.submit_batch(chunk, &mut events).unwrap();
+            events.clear();
+        }
+    }
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.journal.replayed, 17_000);
+    assert_eq!(engine.book().digest(), digests[17_000]);
+}
+
+#[test]
+#[should_panic(expected = "max_price must be >= min_price")]
+fn an_invalid_book_configuration_panics() {
+    let book = BookConfig {
+        max_price: 0,
+        ..BookConfig::new(1, 100, 10)
+    };
+    let _ = open(&SimStorage::new(), EngineConfig::new(book));
+}
+
+#[test]
+fn errors_explain_themselves() {
+    let file = PathBuf::from("data/x");
+    for error in [
+        Error::Io(std::io::Error::other("disk")),
+        Error::Corrupt {
+            file: file.clone(),
+            detail: "bad".into(),
+        },
+        Error::ConfigMismatch { file },
+        Error::MissingJournal { from: 7 },
+        Error::Poisoned,
+    ] {
+        assert!(!error.to_string().is_empty());
+        let _ = std::error::Error::source(&error);
+    }
+}
+
+/// The real file system's storage lists only files, and syncs directories.
+#[test]
+fn the_file_system_storage_lists_files_only() {
+    let dir = std::env::temp_dir().join(format!("engine-fs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut fs = FsStorage;
+    fs.create_dir_all(&dir.join("nested")).unwrap();
+    let mut file = fs.create(&dir.join("a")).unwrap();
+    file.write_at(0, b"abc").unwrap();
+    file.write_at(5, b"z").unwrap();
+    file.sync().unwrap();
+    let mut read = [0; 6];
+    file.read_at(0, &mut read).unwrap();
+    assert_eq!(&read, b"abc\0\0z");
+    assert!(file.read_at(4, &mut read).is_err());
+    assert_eq!(file.size().unwrap(), 6);
+    drop(file);
+    fs.rename(&dir.join("a"), &dir.join("b")).unwrap();
+    fs.sync_dir(&dir).unwrap();
+    assert_eq!(fs.list(&dir).unwrap(), ["b"]);
+    fs.remove(&dir.join("b")).unwrap();
+    assert!(fs.open(&dir.join("b")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

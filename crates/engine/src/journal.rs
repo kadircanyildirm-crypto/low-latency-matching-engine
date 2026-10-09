@@ -394,9 +394,6 @@ impl<S: Storage> Journal<S> {
         let mut stale = Vec::new();
         while slot < segment.capacity {
             let filled = read_slots(&mut self.file, &segment, slot, &mut chunk)?;
-            if filled == 0 {
-                break;
-            }
             for (i, bytes) in chunk[..filled * RECORD_SIZE]
                 .chunks_exact(RECORD_SIZE)
                 .enumerate()
@@ -419,9 +416,6 @@ impl<S: Storage> Journal<S> {
             let mut slot = 0;
             while slot < header.capacity {
                 let filled = read_slots(&mut file, header, slot, &mut chunk)?;
-                if filled == 0 {
-                    break;
-                }
                 for bytes in chunk[..filled * RECORD_SIZE].chunks_exact(RECORD_SIZE) {
                     if let Slot::Record { durable, .. } = decode_record(bytes) {
                         if durable >= next_seq {
@@ -584,7 +578,7 @@ fn covers(segment: &Header, seq: Seq) -> bool {
 }
 
 /// Reads slots from `first` on into `chunk`, as many as fit and the segment holds, and
-/// returns how many. Slots past the end of a file that was not fully preallocated read as
+/// returns how many: at least one while `first` is below the capacity. Slots past the end of a file that was not fully preallocated read as
 /// empty.
 fn read_slots<F: StorageFile>(
     file: &mut F,
@@ -634,6 +628,17 @@ mod tests {
             assert_eq!(decode_record(&damaged), Slot::Invalid, "bit {bit}");
         }
         assert_eq!(decode_record(&[0; RECORD_SIZE]), Slot::Empty);
+    }
+
+    /// A record whose checksum holds but whose command is not a canonical encoding.
+    #[test]
+    fn records_need_a_canonical_command() {
+        let mut bytes = [0; RECORD_SIZE];
+        encode_record(1, 0, &Command::CancelAll { owner: 1 }, &mut bytes);
+        bytes[24 + 8] = 1; // the id field, unused by a mass cancel
+        let crc = crc32fast::hash(&bytes[4..]);
+        bytes[..4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_record(&bytes), Slot::Invalid);
     }
 
     #[test]

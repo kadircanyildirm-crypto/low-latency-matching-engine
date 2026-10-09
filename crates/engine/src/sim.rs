@@ -376,3 +376,109 @@ impl StorageFile for SimFile {
 fn not_found() -> io::Error {
     io::Error::from(io::ErrorKind::NotFound)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contents(storage: &mut SimStorage, path: &str) -> Option<Vec<u8>> {
+        let mut file = storage.open(Path::new(path)).ok()?;
+        let mut bytes = vec![0; file.size().unwrap() as usize];
+        file.read_at(0, &mut bytes).unwrap();
+        Some(bytes)
+    }
+
+    /// Synced data and directory entries always survive; unsynced ones survive as the
+    /// model allows; a torn write leaves part of one write.
+    #[test]
+    fn a_crash_keeps_what_was_synced() {
+        let dir = Path::new("d");
+        let mut seen_torn = false;
+        let mut seen_reordered = false;
+        for seed in 0..500 {
+            let mut disk = SimStorage::new();
+            let mut file = disk.create(&dir.join("f")).unwrap();
+            file.write_at(0, b"synced").unwrap();
+            file.sync().unwrap();
+            disk.sync_dir(dir).unwrap();
+            file.write_at(6, b"-one").unwrap();
+            file.write_at(10, b"-two").unwrap();
+            let model = if seed % 2 == 0 {
+                CrashModel::InOrder
+            } else {
+                CrashModel::AnyOrder
+            };
+            let mut after = disk.crash(&mut SplitMix64::new(seed), model);
+            let bytes = contents(&mut after, "d/f").expect("a synced file survives");
+            assert!(bytes.starts_with(b"synced"), "{bytes:?}");
+            let tail = &bytes[6..];
+            let one = tail.get(..4) == Some(b"-one");
+            let two = tail.get(4..8) == Some(b"-two");
+            if model == CrashModel::InOrder && two {
+                assert!(
+                    one,
+                    "in order, the second write survives only after the first"
+                );
+            }
+            seen_reordered |= two && !one;
+            seen_torn |= !tail.is_empty() && !one && !two;
+        }
+        assert!(seen_torn && seen_reordered);
+    }
+
+    /// Unsynced creations, renames and removals survive as an ordered prefix.
+    #[test]
+    fn directory_changes_survive_in_order() {
+        let dir = Path::new("d");
+        let mut outcomes = std::collections::BTreeSet::new();
+        for seed in 0..200 {
+            let mut disk = SimStorage::new();
+            disk.create(&dir.join("a")).unwrap().sync().unwrap();
+            disk.sync_dir(dir).unwrap();
+            disk.create(&dir.join("b")).unwrap().sync().unwrap();
+            disk.rename(&dir.join("a"), &dir.join("c")).unwrap();
+            disk.remove(&dir.join("b")).unwrap();
+            // A change in another directory is not made durable by syncing this one.
+            disk.create(Path::new("e/x")).unwrap();
+            disk.sync_dir(Path::new("other")).unwrap();
+            let mut after = disk.crash(&mut SplitMix64::new(seed), CrashModel::InOrder);
+            let names = after.list(dir).unwrap().join(",");
+            assert!(
+                ["a", "a,b", "b,c", "c"].contains(&names.as_str()),
+                "{names}"
+            );
+            outcomes.insert(names);
+        }
+        assert_eq!(outcomes.len(), 4);
+    }
+
+    #[test]
+    fn flipped_bits_reach_every_copy_and_failures_are_injected() {
+        let path = Path::new("d/f");
+        let mut disk = SimStorage::new();
+        let mut file = disk.create(path).unwrap();
+        file.write_at(0, &[0; 4]).unwrap();
+        file.sync().unwrap();
+        disk.sync_dir(Path::new("d")).unwrap();
+        file.write_at(2, &[0; 2]).unwrap();
+        disk.flip_bit(path, 3 * 8 + 1);
+        disk.flip_bit(Path::new("d/missing"), 0);
+        disk.create(Path::new("d/empty")).unwrap();
+        disk.flip_bit(Path::new("d/empty"), 0);
+        // A crash that keeps the unsynced write keeps its flipped bit too.
+        for seed in 0..20 {
+            let mut after = disk.crash(&mut SplitMix64::new(seed), CrashModel::InOrder);
+            assert_eq!(contents(&mut after, "d/f").unwrap()[3], 2);
+        }
+        assert_eq!(disk.files().len(), 2);
+        disk.set_failing(true);
+        assert!(file.write_at(0, &[1]).is_err());
+        assert!(file.set_len(0).is_err());
+        assert!(file.sync().is_err());
+        assert!(disk.open(Path::new("d/missing")).is_err());
+        assert!(disk.rename(Path::new("d/missing"), path).is_err());
+        assert!(disk.remove(Path::new("d/missing")).is_err());
+        let mut short = [0; 8];
+        assert!(file.read_at(0, &mut short).is_err());
+    }
+}

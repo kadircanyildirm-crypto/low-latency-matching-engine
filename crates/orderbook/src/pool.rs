@@ -286,3 +286,139 @@ impl OrderPool {
         &mut self.icebergs[slot as usize]
     }
 }
+
+/// Kani proofs over every input within the stated bounds. Run with
+/// `cargo kani -p orderbook`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Slots in the pool of the free-list proof.
+    const CAPACITY: u32 = 3;
+
+    /// Allocations and frees in the free-list proof.
+    const STEPS: usize = 6;
+
+    fn order(id: OrderId) -> OrderNode {
+        OrderNode::new(id, 0, Side::Buy, 0, 1, 1, false)
+    }
+
+    /// Any interleaving of allocations and frees of live slots, on a pool of [`CAPACITY`]
+    /// slots: the free slots form a LIFO stack. `alloc` returns the slot freed most
+    /// recently (initially slot 0, then 1, ...), the free list holds exactly the free slots
+    /// in stack order, each with no quantity, and ends in `NIL`, and `is_full` and `live`
+    /// agree with the stack. `validate()` and `alloc` both rely on this. The capacity is
+    /// fixed: a symbolic one makes the slab symbolic in size, which exhausts the model
+    /// checker's memory.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn free_slots_form_a_lifo_stack() {
+        let capacity = CAPACITY;
+        let mut pool = OrderPool::with_capacity(capacity);
+        // The model: free slots bottom to top, and which slots are live.
+        let mut stack = [NIL; CAPACITY as usize];
+        let mut depth = capacity as usize;
+        for (k, slot) in stack.iter_mut().enumerate().take(depth) {
+            *slot = capacity - 1 - k as u32;
+        }
+        let mut live = [false; CAPACITY as usize];
+
+        for step in 0..STEPS {
+            if kani::any() {
+                if depth > 0 {
+                    let slot = pool.alloc(order(step as OrderId));
+                    depth -= 1;
+                    assert_eq!(slot, stack[depth]);
+                    live[slot as usize] = true;
+                }
+            } else {
+                let slot: u32 = kani::any();
+                if slot < capacity && live[slot as usize] {
+                    pool.free(slot);
+                    live[slot as usize] = false;
+                    stack[depth] = slot;
+                    depth += 1;
+                }
+            }
+
+            assert_eq!(pool.capacity(), capacity as usize);
+            assert_eq!(pool.live(), capacity as usize - depth);
+            assert_eq!(pool.is_full(), depth == 0);
+            let mut cur = pool.free_head();
+            for k in (0..CAPACITY as usize).rev() {
+                if k < depth {
+                    assert_eq!(cur, stack[k]);
+                    assert_eq!(pool.get(cur).remaining, 0);
+                    cur = pool.get(cur).next;
+                }
+            }
+            assert_eq!(cur, NIL);
+        }
+        kani::cover!(depth == 0 && capacity == CAPACITY, "the pool fills up");
+    }
+
+    /// A pool holding one order with any quantities a resting order can have: plain, or an
+    /// iceberg showing between one lot and the smaller of its display and its open
+    /// quantity.
+    fn one_order() -> (OrderPool, u32, Option<IcebergPart>) {
+        let mut pool = OrderPool::with_capacity(1);
+        let remaining: Qty = kani::any_where(|&remaining| remaining > 0);
+        let total: Qty = kani::any_where(|&total| total >= remaining);
+        let slot = pool.alloc(OrderNode::new(1, 0, Side::Sell, 0, remaining, total, false));
+        let iceberg = kani::any::<bool>().then(|| {
+            let display: Qty = kani::any();
+            let visible: Qty = kani::any_where(|&visible| {
+                visible > 0 && visible <= display && visible <= remaining
+            });
+            pool.make_iceberg(slot, display, visible);
+            IcebergPart { display, visible }
+        });
+        (pool, slot, iceberg)
+    }
+
+    /// A fill trades the smaller of the quantity asked for and what the order shows, takes
+    /// it from both the open and the shown quantity, and never underflows. An iceberg whose
+    /// tranche runs out shows its next one: the smaller of its display and what is left,
+    /// at least one lot while anything is left.
+    #[kani::proof]
+    fn fills_trade_what_the_order_shows() {
+        let (mut pool, slot, iceberg) = one_order();
+        let remaining = pool.get(slot).remaining;
+        let shown = pool.visible(slot);
+        assert_eq!(shown, iceberg.map_or(remaining, |part| part.visible));
+        assert_eq!(pool.iceberg(slot), iceberg);
+
+        let qty: Qty = kani::any();
+        let (fill, leaves) = pool.fill(slot, qty);
+        assert_eq!(fill, qty.min(shown));
+        assert_eq!(leaves, remaining - fill);
+        assert_eq!(pool.get(slot).remaining, leaves);
+        assert_eq!(pool.visible(slot), shown - fill);
+
+        if let Some(part) = iceberg {
+            if leaves > 0 && pool.visible(slot) == 0 {
+                let next = pool.replenish(slot);
+                assert_eq!(next, part.display.min(leaves));
+                assert!(next > 0 && next <= leaves);
+                assert_eq!(pool.visible(slot), next);
+            }
+        }
+    }
+
+    /// Shrinking an order's open quantity, as a modify that keeps priority does, takes the
+    /// cut from the hidden part first and reports exactly how much less the order shows.
+    #[kani::proof]
+    fn shrinking_takes_the_cut_from_the_hidden_part_first() {
+        let (mut pool, slot, _) = one_order();
+        let remaining = pool.get(slot).remaining;
+        let shown = pool.visible(slot);
+        let leaves: Qty = kani::any_where(|&leaves| leaves > 0 && leaves <= remaining);
+        let total: Qty = kani::any();
+
+        let shown_less = pool.shrink(slot, leaves, total);
+        assert_eq!(pool.visible(slot), shown.min(leaves));
+        assert_eq!(shown_less, shown - shown.min(leaves));
+        assert_eq!(pool.get(slot).remaining, leaves);
+        assert_eq!(pool.get(slot).total, total);
+    }
+}

@@ -17,6 +17,10 @@ criterion = "0.7.0"
 hdrhistogram = { version = "7.5.4", default-features = false }
 proptest = "1.11.0"
 
+# `cargo kani` compiles the proof harnesses in `src/` with `--cfg kani`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [[bench]]
 name = "throughput"
 harness = false

@@ -218,9 +218,7 @@ impl SimStorage {
         let mut survivor = |inode: &Shared<Inode>, rng: &mut SplitMix64| {
             contents
                 .entry(Shared::as_ptr(inode))
-                .or_insert_with(|| {
-                    Shared::new(Inode::survivor(&inode.borrow(), rng, model))
-                })
+                .or_insert_with(|| Shared::new(Inode::survivor(&inode.borrow(), rng, model)))
                 .clone()
         };
         for (name, inode) in &disk.durable_names {

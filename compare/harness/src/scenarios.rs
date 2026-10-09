@@ -6,8 +6,23 @@
 //! limits and mass cancels are left out, and the book that records a stream has price
 //! protection and the price band switched off.
 
-use orderbook::workload::{Mix, WorkloadConfig};
+use orderbook::workload::{Mix, SplitMix64, WorkloadConfig};
 use orderbook::{BookConfig, SelfTradePolicy};
+
+/// Participants the generator spreads orders over (`WorkloadConfig::default().owners`).
+pub const PARTICIPANTS: u32 = 64;
+
+/// The participant, in `0..PARTICIPANTS`, the generator assigned order `id` to in a stream
+/// recorded with `seed`, exactly as `Workload` derives it.
+///
+/// The streams themselves give each side its own owner, so that self-trade prevention can
+/// never fire. An engine with self-trade prevention off can use this instead, where the
+/// owner matters for something else: OrderBook-rs keeps a list of order ids per user, and
+/// lumping every order under one user would make each removal from it scan the whole book.
+#[inline]
+pub fn participant(id: u64, seed: u64) -> u32 {
+    (SplitMix64::new(id ^ seed).next_u64() % u64::from(PARTICIPANTS)) as u32
+}
 
 /// One order flow.
 #[derive(Clone, Copy, Debug)]
@@ -102,5 +117,30 @@ pub fn book_config(workload: &WorkloadConfig) -> BookConfig {
         price_band: None,
         reference_price: None,
         self_trade: SelfTradePolicy::CancelResting,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use orderbook::Command;
+    use orderbook::workload::Workload;
+
+    use super::*;
+
+    #[test]
+    fn participant_is_the_generators_owner() {
+        let cfg = WorkloadConfig::default();
+        assert_eq!(cfg.owners, PARTICIPANTS);
+        let mut workload = Workload::new(cfg);
+        let mut checked = 0;
+        for _ in 0..1_000 {
+            if let Command::Limit { id, owner, .. } | Command::Market { id, owner, .. } =
+                workload.next_command()
+            {
+                assert_eq!(owner, participant(id, cfg.seed));
+                checked += 1;
+            }
+        }
+        assert!(checked > 500);
     }
 }

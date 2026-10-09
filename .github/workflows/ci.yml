@@ -46,3 +46,100 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+
+  # Line and branch coverage of the engine by the whole test suite. Branch coverage needs
+  # nightly. `src/workload.rs` is the benchmarks' order-flow generator, not engine code.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Run the tests with coverage instrumentation
+        run: >
+          cargo llvm-cov --package orderbook --locked --branch
+          --ignore-filename-regex 'workload\.rs'
+          --lcov --output-path lcov.info
+      - name: Report line and branch coverage
+        run: |
+          cargo llvm-cov report --branch --ignore-filename-regex 'workload\.rs' --summary-only \
+            | tee coverage.txt
+          { echo '### Coverage of crates/orderbook'; echo '```'; cat coverage.txt; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: lcov
+          path: lcov.info
+
+  # Each fuzz target runs for 30 seconds, starting from the corpus earlier runs left in the
+  # cache plus a few long random inputs, so every push adds to the fuzzing done so far.
+  # The library forbids `unsafe`, so the targets run without a sanitizer; debug assertions
+  # and overflow checks stay on. The prebuilt cargo-fuzz is a static musl binary, which
+  # would otherwise build for musl.
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_FLAGS: --sanitizer none --debug-assertions --target x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+      - uses: actions/cache@v5
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz each target for 30 seconds
+        run: |
+          for target in $(cargo fuzz list); do
+            mkdir -p "fuzz/corpus/$target"
+            for i in 1 2 3 4; do head -c 4096 /dev/urandom > "fuzz/corpus/$target/random-$i"; done
+            cargo fuzz run "$target" $FUZZ_FLAGS -- \
+              -max_total_time=30 -len_control=0 -max_len=4096
+            rm -f "fuzz/corpus/$target"/random-*
+          done
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  # Bounded proofs of the bitset's helpers, the order pool and the owner lists, one job
+  # per group of harnesses, so they run in parallel and each reports on its own. Each
+  # takes under a minute; the bitset search proofs take up to half an hour or more each
+  # and run in the scheduled workflow. Kani does not run on Windows.
+  kani:
+    name: kani (${{ matrix.proofs }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - proofs: bit helpers
+            harnesses: --harness low_bits_through --harness highest_bit
+          - proofs: order pool
+            harnesses: --harness pool::proofs
+          - proofs: owner lists
+            harnesses: --harness owners::proofs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: model-checking/kani-github-action@v1.1
+        with:
+          kani-version: '0.68.0'
+          working-directory: crates/orderbook
+          args: --output-format=terse ${{ matrix.harnesses }}

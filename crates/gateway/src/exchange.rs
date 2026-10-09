@@ -641,6 +641,30 @@ impl Exchange {
         if let Some(wallet) = self.wallet(account) {
             self.send(session, Outbound::Balance(wallet.balance()), mail);
         }
+        // The account's open orders, as if they had just rested, so that a client that
+        // comes back, or a gateway that restarted, does not lose sight of them. Pending
+        // stops have no price to rest at, and are not told.
+        let mut orders: Vec<(OrderId, Live)> = self
+            .live
+            .iter()
+            .filter(|(_, live)| live.account == account && live.price.is_some())
+            .map(|(&id, &live)| (id, live))
+            .collect();
+        orders.sort_unstable_by_key(|&(id, _)| id);
+        for (id, live) in orders {
+            let report = Report {
+                seq: last_seq,
+                order_id: id,
+                client_ref: live.client_ref,
+                kind: ReportKind::Rested {
+                    side: live.side,
+                    price: live.price.expect("a limit order"),
+                    qty: live.leaves,
+                    visible: live.leaves,
+                },
+            };
+            self.send(session, Outbound::Report(report), mail);
+        }
     }
 
     fn limits(&self, account: u32) -> Account {

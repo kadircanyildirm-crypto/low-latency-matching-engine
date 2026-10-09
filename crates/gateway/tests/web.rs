@@ -383,7 +383,29 @@ fn a_guests_money_survives_a_restart() {
     let balance = browser.expect("balance");
     assert_eq!(balance["cash"], 100_000 + 12 * 120, "{balance}");
     assert_eq!(balance["position"], 88);
-    // Its orders came back with their references: cancelling one tells which.
+    // Its orders came back with their references, and it is told them on login.
+    let first = browser.expect("report");
+    assert_eq!(
+        (
+            first["kind"].clone(),
+            first["id"].clone(),
+            first["ref"].clone()
+        ),
+        (json!("rested"), json!(1), json!(1))
+    );
+    assert_eq!(
+        (first["price"].clone(), first["qty"].clone()),
+        (json!(120), json!(18))
+    );
+    let second = browser.expect("report");
+    assert_eq!(
+        (
+            second["id"].clone(),
+            second["ref"].clone(),
+            second["qty"].clone()
+        ),
+        (json!(2), json!(2), json!(10))
+    );
     browser.send(json!({"type": "cancel", "id": 2}));
     let cancelled = browser.expect("report");
     assert_eq!(

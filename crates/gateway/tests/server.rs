@@ -379,9 +379,12 @@ fn stopping_logs_everyone_out_and_keeps_the_orders() {
     let reason = LogoutReason::Shutdown;
     assert_eq!(until_closed(&mut client), [Outbound::Logout { reason }]);
     assert_eq!(gateway.stop(), 1);
-    // The next start finds the order, and the client its id.
+    // The next start finds the order, and tells the client of it as it logs in.
     let gateway = Gateway::start(&dir, ServerConfig::default());
     let mut client = gateway.login(1);
+    let told = report(&mut client);
+    assert_eq!((told.seq, told.order_id), (1, 1));
+    assert!(matches!(told.kind, ReportKind::Rested { qty: 1, .. }));
     client.send(&Inbound::Cancel { order_id: 1 }).unwrap();
     let cancelled = report(&mut client);
     assert_eq!((cancelled.seq, cancelled.order_id), (2, 1));

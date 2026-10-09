@@ -1,0 +1,43 @@
+[package]
+name = "orderbook-fuzz"
+version = "0.0.0"
+description = "cargo-fuzz (libFuzzer) targets for the order book."
+edition = "2024"
+# The workspace's MSRV, so that clippy judges the shared reference book the same way here.
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4.13"
+orderbook = { path = "../crates/orderbook" }
+
+# A workspace of its own, so that building or testing the main workspace never compiles
+# libFuzzer, and the fuzz build's sanitizer flags never reach it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_roundtrip"
+path = "fuzz_targets/snapshot_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore"
+path = "fuzz_targets/restore.rs"
+test = false
+doc = false
+bench = false

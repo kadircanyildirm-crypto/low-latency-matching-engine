@@ -34,8 +34,10 @@ pub struct EngineConfig {
     /// Take a snapshot whenever this many commands have been journaled since the last one.
     /// `None` takes snapshots only on [`Engine::snapshot`].
     pub snapshot_every: Option<u64>,
-    /// Snapshots to keep, at least one. Older ones are deleted, and so are the journal
-    /// segments that only the deleted ones needed.
+    /// Snapshots to keep, at least one. Older ones are deleted. Once there are this many,
+    /// so are the journal segments that hold nothing after the oldest kept one; until then
+    /// the whole journal stays. With more than one, a damaged newest snapshot can always fall
+    /// back to an older one.
     pub keep_snapshots: usize,
 }
 
@@ -237,7 +239,11 @@ impl<S: Storage> Engine<S> {
         if keep_from > 0 {
             storage.sync_dir(&self.dir)?;
         }
-        self.journal.remove_through(seqs[keep_from])?;
+        // Until there are as many snapshots as are kept, the whole journal stays, so a
+        // damaged newest snapshot can always fall back to an older one or to the start.
+        if seqs.len() - keep_from == self.config.keep_snapshots {
+            self.journal.remove_through(seqs[keep_from])?;
+        }
         Ok(())
     }
 

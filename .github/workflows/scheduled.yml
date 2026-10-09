@@ -50,6 +50,9 @@ jobs:
             echo "$outcome: $(cat mutants.out/$outcome.txt 2>/dev/null | wc -l)"
           done | tee -a "$GITHUB_STEP_SUMMARY"
           cat mutants.out/missed.txt 2>/dev/null || true
+          # cargo-mutants exits with 3 when any mutant timed out, even if others were
+          # missed, so the missed list decides.
+          if [ -s mutants.out/missed.txt ]; then exit 2; fi
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
       - uses: actions/upload-artifact@v6
         if: always()

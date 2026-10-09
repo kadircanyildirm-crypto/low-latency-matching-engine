@@ -37,6 +37,12 @@ allocates on the hot path.
   the queue; the number of tranches per order is bounded.
 - Price band around the last trade price, alongside price protection; a committed
   experiment measures how each behaves under a harsh flow.
+- Market states: continuous trading, call phases that end in a single-price uncross (most
+  volume, least surplus, market pressure, closest to the reference price), trading halts
+  and the close, switched by commands from the sequencer. Optionally a volatility
+  interruption: a band breach starts a call whose uncross re-anchors the band; the
+  experiment measures that it keeps a banded book alive, and what it costs in time spent
+  in calls.
 - Snapshots and a state digest: `snapshot()` / `restore()` rebuild an identical book
   without replay, and `digest()` is a platform-independent hash of the complete state.
 - Data structures: a dense price ladder per side with a two-level occupancy bitset,
@@ -52,7 +58,8 @@ allocates on the hot path.
   - Soak tests under both self-trade policies, and golden fingerprints that CI checks on
     Linux, Windows and macOS.
   - Zero-allocation tests with a counting global allocator.
-  - Mutation testing: every mutant that compiles is detected.
+  - Mutation testing: every mutant that compiles is detected (market states await
+    their run).
 - Measurement: per-command latency with the TSC and HdrHistogram over four scenarios
   (`.hgrm` output), and Criterion throughput tracking.
 
@@ -149,7 +156,7 @@ primary's.
 
 ## Phase 7 — Extensions (optional)
 
-- Market states: trading halts, opening and closing auctions.
+- Auction extensions: market orders in calls, published imbalances, auction price collars.
 - Per-order self-trade prevention instructions.
 - Multiple instruments (a shard / thread per instrument).
 - A network layer on `io_uring`.

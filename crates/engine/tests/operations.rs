@@ -276,6 +276,8 @@ fn damage_to_files_recovery_does_not_need_is_harmless() {
         ("snapshot-00000000000000000040.snap", 5_000),
         ("journal-00000000000000000041.log", 3),
         ("journal-00000000000000000061.log", 64 * 8 + 100),
+        // It ends exactly at the snapshot.
+        ("journal-00000000000000000071.log", 3),
     ] {
         let storage = SimStorage::new();
         let (mut engine, _) = open(&storage, config).unwrap();
@@ -593,4 +595,26 @@ fn a_missing_older_segment_only_skips_verification() {
     assert_eq!(report.verified, None);
     assert!(report.unverified.is_some());
     assert_eq!(engine.book().digest(), digests[100]);
+}
+
+/// A snapshot at the end of the first segment: replay starts at the beginning of the second,
+/// and the first is not read at all.
+#[test]
+fn a_snapshot_at_the_end_of_a_segment() {
+    let (book, commands) = common::flow(69, 25);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    engine.submit_batch(&commands[..10], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    for &command in &commands[10..] {
+        engine.submit(command, &mut events).unwrap();
+    }
+    drop(engine);
+    storage.flip_bit(&Path::new(DIR).join("journal-00000000000000000001.log"), 3);
+    let (engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!(report.snapshot, Some(10));
+    assert_eq!(report.journal.replayed, 15);
+    assert_eq!(engine.book().digest(), digests[25]);
 }

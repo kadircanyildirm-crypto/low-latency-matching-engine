@@ -312,36 +312,25 @@ impl<S: Storage> Journal<S> {
         let names = segment_names(&mut storage, dir)?;
         let clean = read_clean(&mut storage, dir)?;
 
-        // Read the headers. Those of segments wholly before `after + 1` only serve older
-        // snapshots: damage to them, or a read error, must not stop recovery from a newer
-        // one, so their extent is then taken from the names. Nothing is changed yet.
+        // Read the headers. Segments wholly before `after + 1` only serve older snapshots:
+        // recovery from this one never reads them, and damage to them must not stop it, so
+        // their extent is taken from the names. Nothing is changed yet.
         let mut segments = Vec::with_capacity(names.len());
         let mut torn_newest = None;
         for (index, &seq) in names.iter().enumerate() {
             let path = dir.join(segment_name(seq));
             let next = names.get(index + 1).copied();
-            let opened = storage
-                .open(&path)
-                .map_err(Error::from)
-                .and_then(|mut file| Ok((read_header(&mut file)?, file)));
             if let Some(next) = next.filter(|&next| next <= after + 1) {
-                segments.push(match opened {
-                    Ok((Ok(header), _))
-                        if header.first_seq == seq && header.fingerprint == expect.fingerprint =>
-                    {
-                        header
-                    }
-                    _ => Header {
-                        first_seq: seq,
-                        fingerprint: expect.fingerprint,
-                        capacity: u32::try_from(next - seq).unwrap_or(u32::MAX),
-                        rules: expect.rules,
-                    },
+                segments.push(Header {
+                    first_seq: seq,
+                    fingerprint: expect.fingerprint,
+                    capacity: u32::try_from(next - seq).unwrap_or(u32::MAX),
+                    rules: expect.rules,
                 });
                 continue;
             }
-            let (header, mut file) = opened?;
-            match header {
+            let mut file = storage.open(&path)?;
+            match read_header(&mut file)? {
                 Ok(header) if header.first_seq != seq => {
                     return Err(Error::Corrupt {
                         file: path,
@@ -376,13 +365,9 @@ impl<S: Storage> Journal<S> {
             }
         }
 
-        // The segments replay needs are contiguous: each starts where the one before ends.
-        // A gap among older ones only costs an older snapshot its journal.
-        let first_needed = names
-            .iter()
-            .position(|&seq| seq > after + 1)
-            .map_or(segments.len().saturating_sub(1), |i| i.saturating_sub(1));
-        for pair in segments[first_needed.min(segments.len())..].windows(2) {
+        // The segments are contiguous: each starts where the one before ends. Older ones
+        // are by construction, so a gap among them only costs an older snapshot its journal.
+        for pair in segments.windows(2) {
             if pair[0].first_seq + u64::from(pair[0].capacity) != pair[1].first_seq {
                 return Err(Error::Corrupt {
                     file: dir.join(segment_name(pair[1].first_seq)),

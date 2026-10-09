@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+version = "0.1.0"
+description = "The order book behind a sequencer and a write-ahead journal: crash recovery by replay."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crc32fast = "1.5.2"
+orderbook = { path = "../orderbook" }
+
+[dev-dependencies]
+proptest = "1.11.0"

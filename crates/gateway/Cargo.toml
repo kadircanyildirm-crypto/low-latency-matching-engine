@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
+# Pinned to a release more than two weeks old.
+mio = { version = "=1.2.3", features = ["net", "os-poll"] }
 orderbook = { path = "../orderbook" }
 protocol = { path = "../protocol" }
 

@@ -547,11 +547,11 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
 | Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 6: a standby holds a second copy to compare against |
-| Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, and under `SyncPolicy::Always` a sync costs about a millisecond on this laptop's drive (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 5: measure Linux, `io_uring` and drives with power-loss protection |
+| Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, a segment roll stalls one call for 8 to 23 ms on this laptop, and under `SyncPolicy::Always` a sync costs about a millisecond (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 5: measure Linux, `io_uring` and drives with power-loss protection |
 | Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 4 or 6: take snapshots from a copy, such as the standby's book |
 | Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 3/4, with the gateway's receive time: a second record format version |
 | A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 6's standby to compare against |
-| Damaged snapshots are renamed `.damaged` and kept until someone removes them | Operational tooling |
+| Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal` | Phase 4: the publisher tracks its consumers and holds retention back |
 
 ## 13. Performance work
 
@@ -596,9 +596,13 @@ too; the log records inputs, not outcomes.
 
 The book's events go to an `Output`, each tagged with the sequence number of its command.
 They are emitted after the command is journaled, so a crash in between loses them with the
-process. Recovery therefore delivers the events of every replayed command again, under the
-same numbers: a consumer that remembers the last number it has fully handled skips what it
-has seen and loses nothing.
+process, and recovery delivers the events of replayed commands again under the same
+numbers. A consumer that remembers the last number it has fully handled says so through
+`Output::resume_after`: recovery then starts from a snapshot no later than that, so it can
+deliver exactly the events after it, and returns `Error::ConsumerAhead` if the consumer
+has handled commands the journal no longer holds. That can only happen under
+`SyncPolicy::Os`, where a power failure takes back commands whose events were already
+delivered. The journal and snapshots must reach back to where the slowest consumer stands.
 
 `Engine::open` takes an exclusive OS lock on a `LOCK` file in the directory (`flock`,
 `LockFileEx`), held while the engine is open and released by the OS however the process
@@ -608,7 +612,7 @@ the second gets `Error::Locked`.
 ### The journal format
 
 The journal is a series of segment files, `journal-<first seq>.log`: a 64-byte header, then
-`capacity` slots of 64 bytes, 2²⁰ by default (64 MiB).
+`capacity` slots of 64 bytes, 2¹⁶ by default (4 MiB).
 
 | Bytes | Record field |
 |---|---|
@@ -632,73 +636,86 @@ matching rules, and its own CRC.
   than only setting the length, makes the file system allocate every block in advance
   (a length alone makes a sparse file on Linux, and on NTFS leaves the valid data length
   to be advanced by every append): appends then overwrite allocated blocks, and a data sync
-  has no metadata to commit. It halves the cost of a sync on the development laptop
-  (below), finds a full disk a segment ahead, and overwrites whatever an earlier file left
-  in those blocks, so stale records cannot reappear. PostgreSQL fills its WAL segments with
-  zeros for the same reasons.
+  has no metadata to commit. It brought a sync on the development laptop from about 2 ms
+  down to about 1 in most runs (below), and it overwrites whatever an earlier file left in those blocks, so stale
+  records cannot reappear. PostgreSQL fills its WAL segments with zeros for the same
+  reasons.
 - **Prepared ahead.** The next segment is created as `journal-<seq>.next` when the current
   one takes its first record, and filled with zeros 64 KiB at a time, twice as fast as
-  records arrive. Rolling over finishes it, writes the header, syncs, renames it into
-  place and syncs the directory, all before a record goes in. Filling a 64 MiB segment in
-  one go stalled the matching thread for about 180 ms.
+  records arrive. Rolling over finishes it, writes the header, syncs it, renames it into
+  place and syncs the directory, all before a record goes in. The sync still has to write
+  whatever zeros the OS has not written back yet, which is why segments are small: with
+  64 MiB segments the slowest call, the one that rolled over, took 130 to 147 ms under the
+  OS policy; with 4 MiB, 8 to 23 ms. A failure to prepare, such as a full disk, does not
+  stop trading: `Engine::take_failure` reports it, and the roll prepares the segment
+  again, failing then only if it still cannot.
 - **Strict decoding.** A record is valid only if its checksum matches and its command
   decodes canonically (`engine::codec`: unused fields and padding must be zero), so damage
   that happened to keep the checksum would still have to produce a canonical encoding.
 - **Configuration fingerprint and rules version.** A journal written for another book
-  configuration is refused (`Error::ConfigMismatch`), and so is replaying segments written
+  configuration is refused (`Error::ConfigMismatch`), and so is replaying records written
   under another version of the matching rules (`orderbook::RULES_VERSION`,
   `Error::RulesMismatch`): the same commands could reach another state.
 
 ### Recovery
 
 1. Take the directory lock; delete leftover temporary snapshot files.
-2. Try snapshots newest first. A read error stops recovery (`Error::Io`): the disk's
-   problem, not the file's. A snapshot of another format version stops it too
+2. Choose the starting snapshot: the newest that loads and is no later than what the
+   consumer has handled. A read error stops recovery (`Error::Io`): the disk's problem,
+   not the file's. A snapshot of another format version stops it too
    (`Error::Unsupported`), untouched. A damaged one is noted and the next older is tried;
    with none left, recovery starts from an empty book.
-3. Read the headers of the segments replay needs: the one that holds the record after the
-   snapshot, and those after it. Older segments only serve older snapshots, and damage to
-   them must not stop recovery from a newer one. A header that fails its checksum, in the
-   newest segment with no valid record behind it, is a crash during creation. A header
-   whose checksum holds but which this version does not write is `Error::Unsupported`; one
-   under the wrong name, or of a foreign file, is damage.
-4. Check that the segments follow each other and reach the snapshot. A journal that ends
-   before its snapshot can only be damaged, since the journal is synced before every
-   snapshot: recovery refuses.
+3. With `verify_replay` (the default), load the snapshot before that one, or start from an
+   empty book, replay the journal up to the starting snapshot without changing anything,
+   and compare digests: a mismatch is `Error::Divergence`, before anything is repaired or
+   delivered. Every start where the journal still reaches back that far thus proves that
+   replay is deterministic and that the files belong together; when it does not,
+   `RecoveryReport::unverified` says why.
+4. Read the segment headers. A header that fails its checksum, in the newest segment with
+   no valid record behind it, is damage that cost nothing, since a segment gets its final
+   name only once its header is synced. A header whose checksum holds but which this
+   version does not write is `Error::Unsupported`; one under the wrong name, or of a
+   foreign file, is damage. Headers of segments wholly before the starting point only
+   serve older snapshots: damage to them, a read error, or a gap among them does not stop
+   recovery.
+5. Check that the segments replay needs follow each other and reach the snapshot. A
+   journal that ends before its snapshot can only be damaged, since the journal is synced
+   before every snapshot: recovery refuses. A segment written under other rules may only
+   hold nothing after the snapshot; then the journal is ended at the snapshot and goes on
+   in a new segment, which is the upgrade path (below).
 
    Up to here recovery has changed nothing. From here on it repairs.
 
-5. Delete the segment found torn in creation, and any segment still being prepared.
-6. Replay from the record after the snapshot while each record holds the next sequence
+6. Delete the segment found torn, any segment still being prepared, and the clean-shutdown
+   record; end an old-rules segment at the snapshot.
+7. Replay from the record after the snapshot while each record holds the next sequence
    number, delivering each command's events.
-7. Cut the log where replay stopped. First read everything after the cut, in this segment
+8. Cut the log where replay stopped. First read everything after the cut, in this segment
    and the later ones. If any valid record there says it was written after the cut point
    had been synced, the bad record was durable and is now damaged: recovery stops with
    `Error::Corrupt` rather than continue without commands that were acknowledged.
    Otherwise everything after the cut belongs to the unsynced tail of a crash, where a
    power failure may tear writes or drop them in any order: zero those slots and delete
    the later segments.
-8. Write again every record no later record vouches for, then sync the file, then the
-   directory.
-9. Rename the damaged snapshots `snapshot-<seq>.damaged`, kept for inspection.
-10. With `verify_replay` (the default), load the snapshot before the newest, or start from
-    an empty book if the journal still begins at 1, replay the journal up to the newest
-    snapshot without changing anything, and compare digests (`Error::Divergence`). Every
-    start thus proves that replay is deterministic and that the files belong together.
+9. Write again every record nothing vouches for: no later record, and no clean-shutdown
+   record (`Engine::close` leaves one, saying everything was synced). Then sync the file,
+   then the directory.
+10. Rename the damaged snapshots `snapshot-<seq>.damaged`; retention deletes them once
+    they are older than every kept snapshot.
 
 Each repair guards against the next failure, not the current one, and each is shown to be
 needed by a test that fails without it:
 
-- **Zeroing the cut tail (7).** A stale record from a lost tail could, after the next
+- **Zeroing the cut tail (8).** A stale record from a lost tail could, after the next
   crash, sit right where a new record was expected and replay a command that was never
   acknowledged.
-- **Syncing what was recovered (8).** Records that survived only in the OS cache of a
+- **Syncing what was recovered (9).** Records that survived only in the OS cache of a
   killed process would be vouched for by new records; a power failure would then lose
   them while the journal says they were durable.
-- **Writing the unvouched tail again (8).** After a failed sync, Linux marks the pages
+- **Writing the unvouched tail again (9).** After a failed sync, Linux marks the pages
   clean although they never reached the disk; a process that reopens the journal without a
   reboot reads them from the cache, and a plain sync does nothing for them.
-- **Syncing the directory (8).** A segment a killed process created may exist only in the
+- **Syncing the directory (9).** A segment a killed process created may exist only in the
   OS cache; adopted and filled with acknowledged records, it would vanish whole in a power
   failure.
 
@@ -706,13 +723,14 @@ needed by a test that fails without it:
 |---|---|
 | The process was killed, in whatever it was doing | Every command it acknowledged, and possibly part of the batch it was journaling |
 | Power failed, `SyncPolicy::Always` | Every acknowledged command |
-| Power failed, `SyncPolicy::Os` | Every command up to the last sync (a segment roll, `Engine::sync` or `close`, a snapshot), and possibly more |
+| Power failed, `SyncPolicy::Os` | Every command up to the last sync (a segment roll, `Engine::sync` or `close`, a snapshot), and possibly more; a consumer that handled lost commands gets `ConsumerAhead` |
 | A sync failed, and the process reopened the engine without a reboot | The same as above: the records the failed sync left behind are written again before they count |
 | A synced record was damaged and a later record vouches for it | Nothing silently: recovery refuses with `Error::Corrupt` |
-| The last synced batch was damaged, and nothing was written after it | The commands before it: such damage cannot be told from a torn write, and is cut like one |
+| The last synced batch was damaged, and nothing was written after it | After a clean shutdown, nothing silently: the shutdown record vouches for it. Otherwise, the commands before it: such damage cannot be told from a torn write, and is cut like one |
 | The newest snapshot was damaged | Everything, from the previous snapshot if one is kept, or from the start if the journal still begins there; otherwise `Error::MissingJournal` |
-| Files only older snapshots need were damaged | Everything: recovery does not read them, and verification is skipped |
-| Files from a newer format, or a journal written under other rules | Nothing changes: recovery refuses (`Unsupported`, `RulesMismatch`) |
+| Files only older snapshots need were damaged or missing | Everything: recovery does not need them; verification reports that it could not run |
+| Files from a newer format | Nothing changes: recovery refuses (`Unsupported`) |
+| A journal written under other rules | The state at the old version's last snapshot, if nothing after it needs replaying; otherwise recovery refuses (`RulesMismatch`) |
 
 In every case recovery keeps a prefix of the submitted commands and rebuilds exactly the
 state after it: it never invents, reorders or half-applies a command.
@@ -729,9 +747,8 @@ deletes anything older. Loading checks the header, the checksums, the decoding,
 
 With `snapshot_every: Some(n)`, a snapshot is taken before the first batch after `n` more
 commands. If it fails, for example on a full disk, the batch goes ahead, the next attempt
-waits another `n` commands, and `take_snapshot_failure` reports why: a snapshot is an
-optimisation, and its failure must not stop trading. Only a failed journal sync poisons
-the engine.
+waits another `n` commands, and `take_failure` reports why: a snapshot is an optimisation,
+and its failure must not stop trading. Only a failed journal sync poisons the engine.
 
 Only the newest `keep_snapshots` are kept. Once there are that many, journal segments that
 hold nothing after the oldest kept snapshot are deleted; until then the whole journal
@@ -749,45 +766,47 @@ snapshot falls back to an older one.
 
 `cargo bench -p engine --bench journal`, on the development laptop (i5-12450H, Windows 11,
 consumer NVMe SSD, P-core 2), the baseline flow, measured with `Instant` (100 ns
-resolution on Windows). The ranges span four runs in one session: on this drive,
-consecutive runs of the syncing configurations differ by up to four times.
+resolution on Windows). Syncing on this drive varies a lot between runs, so the figures
+are ranges: over five runs of this session for the configurations that sync on every
+call, whose cost the syncs dominate whatever the segment size; over the runs with the
+current 4 MiB segments for the others, where the size of a segment matters.
 
-| Configuration | Throughput | p50 per command | p50 per call |
-|---|---:|---:|---:|
-| Book alone, no journal | 8.0–9.3M cmd/s | 100 ns | 100 ns |
-| `Os`, one command per call | 330k–395k cmd/s | 1.9–2.1 µs | 1.9–2.1 µs |
-| `Os`, 64 commands per call | 2.4M–3.2M cmd/s | 113–152 ns | 7.2–9.7 µs |
-| `Always`, one command per call | 0.9k–1.0k cmd/s | 0.97–1.03 ms | 0.97–1.03 ms |
-| `Always`, 8 per call | 3k–8k cmd/s | 121–282 µs | 0.97–2.3 ms |
-| `Always`, 64 per call | 18k–57k cmd/s | 17–43 µs | 1.1–2.7 ms |
-| `Always`, 512 per call | 94k–370k cmd/s | 2.4–10 µs | 1.2–5.1 ms |
+| Configuration | Throughput | p50 per command | p50 per call | Slowest call |
+|---|---:|---:|---:|---:|
+| Book alone, no journal | 10.1–10.5M cmd/s | 100 ns | 100 ns | 0.4 ms |
+| `Os`, one command per call | 433k–461k cmd/s | 1.8–1.9 µs | 1.8–1.9 µs | 8–23 ms |
+| `Os`, 64 commands per call | 2.5M–4.0M cmd/s | 109–116 ns | 7.0–7.4 µs | 10–19 ms |
+| `Always`, one command per call | 0.4k–1.0k cmd/s | 0.97–2.3 ms | 0.97–2.3 ms | |
+| `Always`, 8 per call | 3k–8k cmd/s | 121–282 µs | 0.97–2.3 ms | |
+| `Always`, 64 per call | 18k–57k cmd/s | 17–43 µs | 1.1–2.7 ms | |
+| `Always`, 512 per call | 94k–370k cmd/s | 2.4–10 µs | 1.2–5.1 ms | |
 
-Recovery replayed a million journaled commands in 145–256 ms, from the page cache right
-after they were written, which includes writing all of them again: that run synced only at
-the end, so no record vouches for another. Recovery after a reboot reads from the disk and
-was not measured. A snapshot of the resulting book, 10,000 orders, took 21–31 ms to write,
-sync and read back, and opening the engine from it 88–164 ms, which includes replaying the
-million commands from the start to verify it.
+Recovery replayed a million journaled commands in 94 ms in the run with 4 MiB segments
+(138–256 ms with 64 MiB ones), from the page cache right after they were written, which
+includes writing again those no record vouches for. Recovery after a reboot reads from the
+disk and was not measured. A snapshot of the resulting book, 10,000 orders, took 11–31 ms
+to write, sync and read back, and opening the engine from it 88–164 ms, which includes
+replaying the million commands from the start to verify it.
 
 What the numbers say:
 
-- **A sync costs about a millisecond on this drive**, however little it writes. It cost
-  about two before segments were written full of zeros (2.1–2.2 ms per single-command
-  sync, measured the same way), consistent with NTFS committing the file's valid data
-  length, which every append into a merely sized file advances, on each sync. A consumer NVMe drive without power-loss
-  protection really writes to flash on every flush; drives with power-loss protection
-  acknowledge flushes from their protected cache much faster, which Phase 5 measures, on
-  Linux.
+- **A sync costs about a millisecond on this drive**, however little it writes, and two or
+  more in a bad run. It cost about two in every run before segments were written full of
+  zeros (2.1–2.2 ms per single-command sync, measured the same way), consistent with NTFS
+  committing the file's valid data length, which every append into a merely sized file
+  advances, on each sync. A consumer NVMe drive without power-loss protection really writes
+  to flash on every flush; drives with power-loss protection acknowledge flushes from their
+  protected cache much faster, which Phase 5 measures, on Linux.
 - **Group commit is what makes durability affordable**: at 512 commands per sync, durable
   journaling costs a few microseconds per command instead of a millisecond. In Phase 4 the
   journal stage takes whatever the ring buffer holds, so batches grow with load by
   themselves.
 - **Without syncs, the system call dominates**: about 2 µs per `WriteFile`, twenty times
-  the matching. Batching 64 commands per write brings throughput to 2.4–3.2M commands a
-  second. Writing every segment full of zeros first halves that: with segments that were
-  only sized, the same configuration ran at 5.3M. It is the price of the cheaper sync and
-  of finding a full disk early, and it moves off the matching thread with the journal
-  stage in Phase 4.
+  the matching. Batching 64 commands per write brings throughput to 2.5–4.0M commands a
+  second. Writing every segment full of zeros costs part of that: with segments that were
+  only sized, the same configuration ran at 5.3M. It is the price of the cheaper sync, and
+  it moves off the matching thread with the journal stage in Phase 4, along with the
+  slowest calls, the ones that roll over.
 
 ### When something fails
 
@@ -795,30 +814,32 @@ A failed write or sync poisons the engine: every later call returns `Error::Pois
 until it is reopened, because the journal may not hold what the engine believes it does.
 A failed command was not applied; but if its record reached the disk, recovery will apply
 it, so a client must treat an error as an unknown outcome and reconcile through the
-sequence numbers of the events it has seen. A panic while the book applies a command
-poisons the engine too. Preparing the next segment fails early on a full disk, a segment
-before the journal would actually run out of room.
+sequence numbers of the events it has seen. A panic while a command is applied, in the
+book or in the `Output`, poisons the engine too. A failed snapshot, or a failure to prepare
+the next segment, does not: `Engine::take_failure` reports it.
 
 ### Upgrades
 
 The journal's format version and the rules version change independently. A binary refuses
 segments and snapshots of a format it does not know, and changes nothing. A change to the
 matching rules raises `orderbook::RULES_VERSION`; to move to it, the old binary takes a
-snapshot as it stops, and the new one starts from that snapshot with nothing to replay.
-Snapshots load under any rules version, since they hold state rather than commands.
+snapshot and closes, and the new one starts from that snapshot: it ends the old journal
+there and continues in a new segment under the new rules. Snapshots load under any rules
+version, since they hold state rather than commands. Verification cannot replay across the
+change, and says so.
 
 ### How it is verified
 
 | Test | What it shows |
 |---|---|
 | `tests/codec.rs` | Every command, over the full range of each field, and snapshots of real books round-trip; arbitrary and altered bytes decode canonically or not at all. |
-| `tests/interrupted.rs` | The process dies at every single change a run makes to the disk, in turn (in appends, segment rolls, snapshot writes and checks, retention and recovery itself), then a kill or a power failure, and two more rounds of the same at random points. Each recovery keeps what was durable (everything acknowledged, after a kill), invents nothing, and rebuilds exactly the state after what it kept; the stream then finishes in the uncrashed state. |
-| `tests/recovery.rs` | 400 runs of random settings with four failures each between batches, power failures (in-order or reordered write-back, torn writes, lost directory changes) or kills; and 300 runs with a bit flipped anywhere: recovery refuses or rebuilds a prefix that lacks at most the last command. |
-| `tests/files.rs` | One test per way the files can contradict the engine: leftover temporary files, snapshots that lie about their sequence number, length, digest, format or configuration, missing, misnamed, short or damaged segments, a journal that ends before its snapshot, two engines on one directory. |
-| `tests/operations.rs` | Events with their sequence numbers, redelivered on replay; replay verified against snapshots, and a mismatch detected; failing snapshots that do not stop trading; a failing segment roll; a failed sync followed by a reopen and a power failure; settings that change between runs; a rules mismatch; damage to files recovery does not need; read errors; panics. |
+| `tests/interrupted.rs` | The process dies at every single change a run makes to the disk, in turn (in appends, segment preparation and rolls, snapshot writes and checks, retention), then a kill or a power failure, a recovery that may itself die and be followed by another power failure, and two more rounds of the same at random points. A second test does the same at sampled points with segments prepared in several pieces. Each recovery keeps what was durable (everything acknowledged, after a kill), invents nothing, and rebuilds exactly the state after what it kept; the stream then finishes in the uncrashed state. |
+| `tests/recovery.rs` | 400 runs of random settings with four failures each between batches, power failures (in-order or reordered write-back, sectors torn out of writes, lost directory changes) or kills; and 300 runs with a bit flipped anywhere: recovery refuses or rebuilds a prefix that lacks at most the last command. |
+| `tests/files.rs` | One test per way the files can contradict the engine: leftover temporary files, snapshots that lie about their sequence number, length, digest, format or configuration, missing, misnamed, short, cut or damaged segments, records in the wrong slot, a journal that ends before its snapshot, two engines on one directory, the exact pace of segment preparation. |
+| `tests/operations.rs` | Events with their sequence numbers, redelivered on replay, and consumers resuming where they stood or told they are ahead; replay verified against snapshots before anything changes; failing snapshots and segment preparations that do not stop trading; a failing roll; a failed sync followed by a reopen and a power failure; a clean shutdown; settings that change between runs; the upgrade to new rules and commands under old ones; damage to files recovery does not need; read errors; panics. |
 | `tests/kill.rs` | The acceptance test: a child process on the real file system, killed 48 times at random points under 16 combinations of sync policy, segment size and snapshot interval, recovers every command it had reported applied, and exactly the state after them. CI runs it on Linux, Windows and macOS. |
-| `tests/zero_alloc.rs` | Journaling, syncing and applying commands on the real file system allocate nothing once the next segment is being prepared. |
-| `fuzz/fuzz_targets/recovery.rs` | Any sequence of commands, syncs, snapshots, power failures, kills, deaths after any number of changes and flipped bits, under book configurations the fuzzer picks, segments of 1 to 32 records, any snapshot interval and either sync policy. |
+| `tests/zero_alloc.rs` | Journaling, syncing and applying commands on the real file system allocate nothing between segment rolls. |
+| `fuzz/fuzz_targets/recovery.rs` | Any sequence of commands, syncs, snapshots, power failures, kills, deaths after any number of changes, recoveries that die, and flipped bits, under book configurations the fuzzer picks, segments of 1 to 32 or of 1,024 to 2,816 records, any snapshot interval and either sync policy. |
 
 Each safety mechanism was removed in turn to check that a test notices: zeroing the cut
 tail, syncing recovered records, writing the unvouched tail again, syncing the directory at
@@ -833,6 +854,13 @@ too strongly. An adversarial review then found six more: a header from a newer v
 or under the wrong name, made recovery delete the newest segment with its records;
 recovery never synced the directory; a reopen after a failed sync called unwritten records
 durable; read errors set good snapshots aside; snapshots were deleted before their
-successor was known to load; and a failing snapshot blocked every later command. Each is
-fixed, and `interrupted.rs` and `operations.rs` exist because the earlier tests could not
-see them: they only failed between batches, never inside an operation.
+successor was known to load; and a failing snapshot blocked every later command. A second
+review of the reworked code found that the documented upgrade path could not work, that
+verification could loop forever on a missing old segment and ran only after recovery had
+already repaired files and delivered events, that the consumer promise failed behind a
+snapshot and after a power failure under the OS policy, that a failure to prepare a
+segment stopped trading, that every start under the OS policy wrote a whole segment again,
+and that preparing segments ahead had moved the stall at a roll rather than removed it.
+Each is fixed, with a test that fails without the fix; `interrupted.rs` and
+`operations.rs` exist because the earlier tests could not see these: they only failed
+between batches, never inside an operation.

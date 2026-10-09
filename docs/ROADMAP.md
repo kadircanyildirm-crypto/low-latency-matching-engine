@@ -76,8 +76,8 @@ path, latency report in the README. All met.
 **Delivered** (`crates/engine`, [DESIGN.md §14](DESIGN.md#14-the-journal-and-recovery))
 - A sequencer: `Engine::submit` gives every command the next sequence number, journals it,
   syncs as the policy says, and only then applies it to the book. Events carry their
-  command's sequence number, and recovery delivers the events of replayed commands again,
-  so a consumer that tracks the last number it handled loses nothing.
+  command's sequence number; a consumer that says where it stands gets exactly the events
+  after that on recovery, or is told it has seen commands a power failure took back.
 - An append-only journal of segment files written full of zeros before use and prepared
   ahead under a temporary name: a checksummed header per segment, and 64-byte records,
   each with its length, CRC-32, sequence number and a strict 40-byte encoding of the
@@ -104,8 +104,8 @@ path, latency report in the README. All met.
   simulated disk that loses power (torn and reordered writes, lost directory changes,
   failed syncs that drop pages) and flips bits; a test per way the files can be damaged;
   a fuzz target combining all of it; and fault injection showing that each safety
-  mechanism is needed. An adversarial review of the first version found six defects,
-  fixed with the tests that would have caught them.
+  mechanism is needed. Two adversarial reviews found thirteen defects, each fixed with a
+  test that fails without the fix.
 
 **Acceptance criteria:** a test proving that a process killed at a random point returns to
 exactly the same state through replay (`crates/engine/tests/kill.rs`: 48 kills on Linux,

@@ -319,6 +319,27 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert_eq!(browser.expect("logout")["reason"], "requested");
     assert_eq!(browser.expect("closed")["type"], "closed");
 
+    // A browser that goes away keeps its orders, and is told them when it comes back.
+    let mut again = Browser::connect(gateway.web);
+    again.send(json!({"type": "login", "account": 10, "token": token}));
+    again.send(json!({"type": "order", "ref": 9, "side": "sell", "qty": 1, "price": 150}));
+    let kept = again.expect("report");
+    assert_eq!(kept["kind"], "accepted");
+    drop(again);
+    std::thread::sleep(Duration::from_millis(100));
+    let mut back = Browser::connect(gateway.web);
+    back.send(json!({"type": "login", "account": 10, "token": token}));
+    let told = back.expect("report");
+    assert_eq!(
+        (
+            told["kind"].clone(),
+            told["id"].clone(),
+            told["ref"].clone()
+        ),
+        (json!("rested"), kept["id"].clone(), json!(9))
+    );
+    drop(back);
+
     // Garbage ends a session with an error first.
     let mut other = Browser::connect(gateway.web);
     other.send(json!({"type": "nonsense"}));

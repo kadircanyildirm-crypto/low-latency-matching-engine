@@ -5,7 +5,7 @@
 //! commands of one round share a journal sync, delivers the events that have come back, and
 //! writes the replies. A connection that sends bytes that do not decode is logged out; one
 //! that falls too far behind reading its replies is dropped. Dropping or losing a
-//! connection cancels its account's orders.
+//! connection cancels its account's orders, unless it is a browser's.
 //!
 //! Stopping the server leaves the orders on the book, as a crash would: the next start
 //! finds them.
@@ -700,7 +700,13 @@ impl<C: Core> Server<C> {
     fn drop_connection(&mut self, session: SessionId) {
         if let Some(mut connection) = self.wires.slots[session].take() {
             let _ = self.poll.registry().deregister(&mut connection.stream);
-            self.exchange.disconnect(session);
+            // A program that loses its connection has its orders cancelled; a browser's
+            // stay, since it may well come back, and is told them when it logs in.
+            if matches!(connection.kind, Kind::WebSocket { .. }) {
+                self.exchange.detach(session);
+            } else {
+                self.exchange.disconnect(session);
+            }
             self.free.push(session);
         }
     }

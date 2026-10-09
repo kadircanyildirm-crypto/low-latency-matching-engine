@@ -98,6 +98,13 @@ pub trait Output {
     /// Called once per event, in order.
     fn on_event(&mut self, seq: Seq, event: Event);
 
+    /// Called with each command before its events, for consumers that keep state about
+    /// commands, such as who placed an order, and must rebuild it on recovery. Does nothing
+    /// unless implemented.
+    fn on_command(&mut self, seq: Seq, command: Command) {
+        let _ = (seq, command);
+    }
+
     /// The sequence number of the last command whose events this consumer has fully
     /// handled, or `None` if it does not keep track: then recovery starts from the newest
     /// snapshot and delivers the events of the commands after it.
@@ -292,6 +299,7 @@ impl<S: Storage> Engine<S> {
         let (journal, journal_report) =
             Journal::open(storage, dir, expect, after, |seq, command| {
                 if resume.is_none_or(|resume| seq > resume) {
+                    out.on_command(seq, command);
                     book.process(
                         command,
                         &mut Tagged {
@@ -553,6 +561,7 @@ impl<S: Storage> Matcher<S> {
         assert_eq!(seq, self.last_seq + 1, "commands are applied in sequence");
         // Poisoned until the command is applied: a panic in the book leaves it so.
         self.poisoned = true;
+        out.on_command(seq, command);
         self.book.process(command, &mut Tagged { seq, out });
         self.poisoned = false;
         self.last_seq = seq;

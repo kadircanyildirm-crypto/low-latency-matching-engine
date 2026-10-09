@@ -757,3 +757,60 @@ fn damaged_snapshots_go_with_the_snapshots_of_their_age() {
     // Now at 20 and 30.
     assert_eq!([present(10), present(15)], [false, false]);
 }
+
+/// Records commands and events in the order they come.
+#[derive(Default)]
+struct Log {
+    resume: Option<Seq>,
+    entries: Vec<(Seq, Option<Command>)>,
+}
+
+impl engine::Output for Log {
+    fn on_event(&mut self, seq: Seq, _: Event) {
+        self.entries.push((seq, None));
+    }
+
+    fn on_command(&mut self, seq: Seq, command: Command) {
+        self.entries.push((seq, Some(command)));
+    }
+
+    fn resume_after(&self) -> Option<Seq> {
+        self.resume
+    }
+}
+
+/// A consumer that keeps state about commands gets each one before its events, live and
+/// on replay from where it stands.
+#[test]
+fn commands_come_before_their_events() {
+    let (book, commands) = common::flow(73, 30);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut live = Log::default();
+    engine.submit_batch(&commands[..10], &mut live).unwrap();
+    engine.snapshot().unwrap();
+    engine.submit_batch(&commands[10..], &mut live).unwrap();
+    drop(engine);
+    let check = |log: &Log, from: Seq| {
+        let mut expected = from;
+        for &(seq, command) in &log.entries {
+            if let Some(command) = command {
+                expected += 1;
+                assert_eq!(seq, expected);
+                assert_eq!(command, commands[seq as usize - 1]);
+            } else {
+                assert_eq!(seq, expected, "an event after its command");
+            }
+        }
+        assert_eq!(expected, 30);
+    };
+    check(&live, 0);
+    for resume in [5, 20] {
+        let mut replayed = Log {
+            resume: Some(resume),
+            ..Log::default()
+        };
+        Engine::open_with(storage.clone(), Path::new(DIR), small(book), &mut replayed).unwrap();
+        check(&replayed, resume);
+    }
+}

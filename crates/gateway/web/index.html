@@ -1,5 +1,96 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Exchange</title><link rel="stylesheet" href="/style.css"></head>
-<body><main id="app">Loading</main><script src="/app.js"></script></body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matching Engine · Live Demo</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <strong>Low-Latency Matching Engine</strong>
+    <span class="muted">live demo · paper money only</span>
+  </div>
+  <div class="status">
+    <span id="phase" class="pill" hidden></span>
+    <span id="connection" class="pill off">connecting</span>
+    <span id="account" class="muted"></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel book" aria-label="Order book">
+    <h2>Order book</h2>
+    <div class="book-head"><span>Price</span><span>Size</span><span>Orders</span></div>
+    <div id="asks" class="levels asks"></div>
+    <div id="spread" class="spread">—</div>
+    <div id="bids" class="levels bids"></div>
+  </section>
+
+  <section class="panel chart" aria-label="Price chart">
+    <div class="chart-head">
+      <h2>Last price <span id="last" class="big">—</span></h2>
+      <span id="change" class="muted"></span>
+    </div>
+    <canvas id="canvas" width="800" height="320"></canvas>
+  </section>
+
+  <section class="panel tape" aria-label="Trades">
+    <h2>Trades</h2>
+    <div class="tape-head"><span>Time</span><span>Price</span><span>Size</span></div>
+    <div id="trades" class="rows"></div>
+  </section>
+
+  <section class="panel ticket" aria-label="Place an order">
+    <h2>Trade</h2>
+    <div class="sides" role="group" aria-label="Side">
+      <button id="buy-side" class="side buy active" type="button">Buy</button>
+      <button id="sell-side" class="side sell" type="button">Sell</button>
+    </div>
+    <label>Price <input id="price" type="number" step="0.01" min="0.01" inputmode="decimal"></label>
+    <label>Quantity <input id="qty" type="number" step="1" min="1" value="10" inputmode="numeric"></label>
+    <label>Time in force
+      <select id="tif">
+        <option value="gtc">Good till cancelled</option>
+        <option value="ioc">Immediate or cancel</option>
+        <option value="post_only">Post only</option>
+      </select>
+    </label>
+    <button id="submit" class="submit buy" type="button">Buy</button>
+    <button id="now" class="secondary" type="button">Buy now at the best price</button>
+    <p id="notice" class="notice" role="status"></p>
+  </section>
+
+  <section class="panel wallet" aria-label="Your account">
+    <h2>Your paper account</h2>
+    <dl>
+      <dt>Cash</dt><dd id="cash">—</dd>
+      <dt>Shares</dt><dd id="position">—</dd>
+      <dt>Held for orders</dt><dd id="held">—</dd>
+      <dt>Value at last price</dt><dd id="value">—</dd>
+      <dt>Profit since you opened this page</dt><dd id="pnl">—</dd>
+    </dl>
+  </section>
+
+  <section class="panel orders" aria-label="Your orders">
+    <h2>Your open orders <button id="cancel-all" class="link" type="button">cancel all</button></h2>
+    <table>
+      <thead><tr><th>Id</th><th>Side</th><th>Price</th><th>Open</th><th></th></tr></thead>
+      <tbody id="open-orders"></tbody>
+    </table>
+    <h2>Your trades</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Size</th></tr></thead>
+      <tbody id="fills"></tbody>
+    </table>
+  </section>
+</main>
+
+<footer class="muted">
+  A Rust exchange matching engine: price-time priority, a write-ahead journal with crash
+  recovery, a lock-free pipeline. The other traders are bots. Prices in dollars and cents.
+</footer>
+<script src="/app.js"></script>
+</body>
 </html>

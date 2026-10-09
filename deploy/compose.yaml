@@ -1,0 +1,57 @@
+# The public demo: the exchange, its bots, and Caddy in front for HTTPS.
+#
+#   DOMAIN=demo.example.com docker compose -f deploy/compose.yaml up -d --build
+#
+# Only Caddy is reachable from outside, on ports 80 and 443; the binary protocol's port
+# stays on the compose network, for the bots. deploy/bots.txt holds the bots' accounts:
+# make it with deploy/make-accounts.sh before the first start.
+services:
+  exchange:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command:
+      - --dir
+      - /data
+      - --accounts
+      - /etc/exchange/bots.txt
+      - --listen
+      - 0.0.0.0:9000
+      - --web
+      - 0.0.0.0:8080
+      - --max-orders
+      - "200000"
+    volumes:
+      - exchange-data:/data
+      - ./bots.txt:/etc/exchange/bots.txt:ro
+    restart: unless-stopped
+
+  bots:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["bots"]
+    command: ["--accounts", "/etc/exchange/bots.txt", "--connect", "exchange:9000"]
+    volumes:
+      - ./bots.txt:/etc/exchange/bots.txt:ro
+    depends_on:
+      - exchange
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8.4
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - exchange
+    restart: unless-stopped
+
+volumes:
+  exchange-data:
+  caddy-data:

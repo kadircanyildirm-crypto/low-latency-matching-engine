@@ -1,0 +1,6 @@
+# HTTPS with a certificate from Let's Encrypt, for the domain in $DOMAIN. WebSocket
+# upgrades pass through as they are.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy exchange:8080
+}

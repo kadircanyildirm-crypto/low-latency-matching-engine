@@ -56,6 +56,23 @@ jobs:
           RUSTFLAGS: --cfg loom
           CARGO_TARGET_DIR: target/loom
 
+  # The public demo's image builds, and its compose file is valid (deploy/README.md).
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sh deploy/make-accounts.sh
+      - run: docker compose -f deploy/compose.yaml config --quiet
+        env:
+          DOMAIN: demo.example.com
+      - run: docker build -f deploy/Dockerfile -t exchange-demo .
+      - name: The image's programs run, and answer with their usage
+        run: |
+          for program in gateway bots; do
+            out=$(docker run --rm --entrypoint "$program" exchange-demo --help 2>&1 || true)
+            echo "$out" | grep -q usage
+          done
+
   # The minimum supported Rust version declared in Cargo.toml.
   msrv:
     runs-on: ubuntu-latest

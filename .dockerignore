@@ -1,0 +1,13 @@
+# Only the sources go into the image's build.
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+compare/target
+compare/data
+compare/results
+compare/vendor
+graphify-out
+mutants.out*
+.git
+deploy/bots.txt

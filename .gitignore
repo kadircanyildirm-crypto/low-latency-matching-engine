@@ -7,3 +7,6 @@ mutants.out*/
 /compare/data
 /compare/results
 /compare/vendor
+
+# The demo deployment's secrets.
+/deploy/bots.txt

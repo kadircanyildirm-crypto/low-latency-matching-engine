@@ -94,7 +94,7 @@ impl Gateway {
             let engine = Engine::open(&path, EngineConfig::new(config_book), &mut Discard)
                 .map_err(|e| e.to_string())?
                 .0;
-            let accounts = [account(1), account(2), account(3)];
+            let accounts = [account(1), account(2), account(3), account(4)];
             let exchange = Exchange::new(
                 engine.book(),
                 engine.last_seq(),
@@ -525,4 +525,56 @@ fn market_data_reaches_subscribers() {
         assert_eq!(watcher.receive().unwrap(), level(2, Side::Sell, 101, 3, 1));
         gateway.stop();
     }
+}
+
+/// Bots keep a market alive: within a second, makers quote both sides and the others trade
+/// against them.
+#[test]
+fn bots_make_a_market() {
+    use gateway::bots::{self, Bot, Strategy};
+    let dir = TempDir::new("bots");
+    let gateway = Gateway::start(&dir, ServerConfig::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads: Vec<_> = [
+        (Strategy::MarketMaker, 1, 50),
+        (Strategy::Noise, 2, 30),
+        (Strategy::Trend, 3, 30),
+    ]
+    .into_iter()
+    .map(|(strategy, id, interval)| {
+        let bot = Bot {
+            strategy,
+            account: account(id),
+            mid: 500,
+            interval: Duration::from_millis(interval),
+            seed: u64::from(id),
+        };
+        let (addr, stop) = (gateway.addr, stop.clone());
+        thread::spawn(move || bots::run(addr, bot, &stop))
+    })
+    .collect();
+    // A fourth account watches.
+    let mut watcher = Client::login(gateway.addr, 4, 104).unwrap().0;
+    watcher
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    watcher.send(&Inbound::Subscribe).unwrap();
+    let (mut trades, mut bids, mut asks) = (0, 0, 0);
+    while trades < 5 || bids == 0 || asks == 0 {
+        match watcher.receive().unwrap() {
+            Outbound::TradeTick(_) => trades += 1,
+            Outbound::LevelUpdate(level) if level.orders > 0 => match level.side {
+                Side::Buy => bids += 1,
+                Side::Sell => asks += 1,
+            },
+            _ => {}
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for thread in threads {
+        thread.join().unwrap().unwrap();
+    }
+    // The maker took its quotes with it.
+    drop(watcher);
+    gateway.stop();
 }

@@ -2,6 +2,7 @@
 //! [`protocol`] crate, and receive reports of what happens to them.
 //!
 //! - [`accounts`]: who may log in, and their limits.
+//! - [`bots`]: market makers, noise traders and trend followers for a demo market.
 //! - [`client`]: a blocking client, for tests and tools.
 //! - [`exchange`]: the logic, without sockets: sessions, pre-trade risk, order ids, and the
 //!   routing of the book's events to the sessions they concern.
@@ -15,6 +16,7 @@
 #![warn(missing_docs)]
 
 pub mod accounts;
+pub mod bots;
 pub mod client;
 pub mod exchange;
 pub mod load;

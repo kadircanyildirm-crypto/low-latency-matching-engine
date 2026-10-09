@@ -183,21 +183,31 @@ pub enum Wait {
     Backoff,
 }
 
-/// The state of one wait.
-struct Waiting {
+/// One wait, for a stage that waits on more than one thing at once: call
+/// [`snooze`](Backoff::snooze) each time it finds nothing to do, and
+/// [`reset`](Backoff::reset) when it does something.
+#[derive(Clone, Debug)]
+pub struct Backoff {
     strategy: Wait,
     rounds: u32,
 }
 
-impl Waiting {
-    fn new(strategy: Wait) -> Self {
-        Waiting {
+impl Backoff {
+    /// A wait with `strategy`.
+    pub fn new(strategy: Wait) -> Self {
+        Backoff {
             strategy,
             rounds: 0,
         }
     }
 
-    fn snooze(&mut self) {
+    /// Starts the wait over: the next snooze spins again.
+    pub fn reset(&mut self) {
+        self.rounds = 0;
+    }
+
+    /// Waits a little, longer the more often it was called since the last reset.
+    pub fn snooze(&mut self) {
         #[cfg(loom)]
         loom::thread::yield_now();
         self.rounds = self.rounds.saturating_add(1);
@@ -260,7 +270,7 @@ impl<T> Producer<T> {
     /// Appends `value`, waiting while the ring is full. Gives it back if the consumer is
     /// gone.
     pub fn push(&mut self, mut value: T, wait: Wait) -> Result<(), T> {
-        let mut waiting = Waiting::new(wait);
+        let mut waiting = Backoff::new(wait);
         loop {
             match self.try_push(value) {
                 Ok(()) => return Ok(()),
@@ -365,7 +375,7 @@ impl<T> Consumer<T> {
     /// Waits until an item is waiting, and returns true, or until the producer is gone and
     /// every item has been read, and returns false.
     pub fn wait(&mut self, wait: Wait) -> bool {
-        let mut waiting = Waiting::new(wait);
+        let mut waiting = Backoff::new(wait);
         loop {
             if self.available() > 0 {
                 return true;

@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use arbitrary::Arbitrary;
-use engine::storage::{CrashModel, SimStorage};
+use engine::sim::{CrashModel, SimStorage};
 use engine::{Engine, EngineConfig, Error, SyncPolicy};
 use libfuzzer_sys::fuzz_target;
 use orderbook::workload::SplitMix64;

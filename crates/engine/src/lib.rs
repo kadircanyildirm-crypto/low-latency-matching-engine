@@ -19,6 +19,7 @@
 pub mod codec;
 mod engine;
 mod journal;
+pub mod sim;
 pub mod snapshots;
 pub mod storage;
 

@@ -105,7 +105,7 @@ impl Engine<FsStorage> {
 
 impl<S: Storage> Engine<S> {
     /// [`Engine::open`] on another storage, such as the crash-testing
-    /// [`SimStorage`](crate::storage::SimStorage).
+    /// [`SimStorage`](crate::sim::SimStorage).
     ///
     /// # Panics
     ///

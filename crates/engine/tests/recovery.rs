@@ -5,7 +5,7 @@ mod common;
 
 use std::path::Path;
 
-use engine::storage::{CrashModel, SimStorage};
+use engine::sim::{CrashModel, SimStorage};
 use engine::{Engine, EngineConfig, Error, SyncPolicy};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, Event};

@@ -538,3 +538,185 @@ fn one_engine_per_directory() {
     drop(Engine::open(&dir, small(book), &mut Discard).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A newest segment cut shorter than its header, with no record left, is torn and goes.
+#[test]
+fn a_header_cut_short_is_torn() {
+    let (book, commands) = common::flow(70, 11);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage
+        .clone()
+        .open(&segment(11))
+        .unwrap()
+        .set_len(10)
+        .unwrap();
+    let (engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!(report.journal.removed_segments, 1);
+    assert_eq!(engine.last_seq(), 10);
+    assert_eq!(engine.book().digest(), digests[10]);
+}
+
+/// A read error in the journal is the disk's, not damage.
+#[test]
+fn read_errors_in_the_journal_are_not_damage() {
+    let (book, commands) = common::flow(71, 25);
+    let storage = SimStorage::new();
+    run(&storage, small(book), &commands);
+    storage.set_failing_reads(true);
+    assert!(matches!(open(&storage, small(book)), Err(Error::Io(_))));
+}
+
+/// The next segment is filled with zeros a piece at a time, twice as fast as records
+/// arrive, and the rest of it at once when it is nearly done.
+#[test]
+fn the_next_segment_is_prepared_at_twice_the_rate_of_records() {
+    let (book, commands) = common::flow(72, 1_000);
+    let config = EngineConfig {
+        segment_capacity: 2_000,
+        ..EngineConfig::new(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    let next = Path::new(DIR).join("journal-00000000000000002001.next");
+    let size = || {
+        storage
+            .files()
+            .into_iter()
+            .find(|(path, _)| *path == next)
+            .map(|(_, size)| size)
+    };
+    // 511 records owe 65,408 bytes of zeros: less than a piece.
+    engine.submit_batch(&commands[..511], &mut events).unwrap();
+    assert_eq!(size(), Some(0));
+    // One more makes a piece of 65,536 bytes, written after the header's place.
+    engine.submit(commands[511], &mut events).unwrap();
+    assert_eq!(size(), Some(64 + 65_536));
+    // 488 more owe exactly the rest of the 128,000-byte body.
+    engine
+        .submit_batch(&commands[512..999], &mut events)
+        .unwrap();
+    assert_eq!(size(), Some(64 + 65_536));
+    engine.submit(commands[999], &mut events).unwrap();
+    assert_eq!(size(), Some(64 + 128_000));
+}
+
+/// With one snapshot kept and taken exactly at the end of a segment, retention keeps the
+/// current segment and deletes only the ones before it.
+#[test]
+fn retention_at_a_segment_boundary_keeps_the_current_segment() {
+    let (book, commands) = common::flow(73, 25);
+    let digests = common::digests(book, &commands);
+    let config = EngineConfig {
+        keep_snapshots: 1,
+        ..small(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    engine.submit_batch(&commands[..20], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    let names: Vec<_> = storage.files().into_iter().map(|(path, _)| path).collect();
+    assert!(!names.contains(&segment(1)));
+    assert!(names.contains(&segment(11)));
+    engine.submit_batch(&commands[20..], &mut events).unwrap();
+    drop(engine);
+    let (engine, _) = open(&storage, config).unwrap();
+    assert_eq!(engine.book().digest(), digests[25]);
+}
+
+/// A segment with a damaged header whose records all lie beyond the first read is still
+/// found to hold records, and refused.
+#[test]
+fn records_deep_in_a_segment_with_a_damaged_header_are_found() {
+    let (book, commands) = common::flow(74, 17_000);
+    let config = EngineConfig {
+        segment_capacity: 20_000,
+        ..EngineConfig::new(book)
+    };
+    let storage = SimStorage::new();
+    {
+        let (mut engine, _) = open(&storage, config).unwrap();
+        let mut events: Vec<(Seq, Event)> = Vec::new();
+        for chunk in commands.chunks(1_000) {
+            engine.submit_batch(chunk, &mut events).unwrap();
+            events.clear();
+        }
+    }
+    let mut file = storage.clone().open(&segment(1)).unwrap();
+    file.write_at(64, &vec![0; 16_384 * RECORD_SIZE]).unwrap();
+    storage.flip_bit(&segment(1), 3);
+    assert!(matches!(open(&storage, config), Err(Error::Corrupt { .. })));
+}
+
+/// Replay that starts past the end of a short segment file reads empty slots.
+#[test]
+fn replay_can_start_past_the_end_of_a_short_file() {
+    let (book, commands) = common::flow(75, 15);
+    let digests = common::digests(book, &commands);
+    let config = EngineConfig {
+        segment_capacity: 20,
+        ..EngineConfig::new(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    engine.submit_batch(&commands, &mut events).unwrap();
+    engine.snapshot().unwrap();
+    drop(engine);
+    storage
+        .clone()
+        .open(&segment(1))
+        .unwrap()
+        .set_len(64 + 3 * RECORD_SIZE as u64)
+        .unwrap();
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.snapshot, Some(15));
+    assert_eq!(engine.last_seq(), 15);
+    assert_eq!(engine.book().digest(), digests[15]);
+}
+
+/// A valid record in the wrong slot among the commands verification replays makes it give
+/// up, not report a divergence.
+#[test]
+fn a_misplaced_record_stops_verification() {
+    let (book, commands) = common::flow(76, 25);
+    let digests = common::digests(book, &commands);
+    let config = EngineConfig {
+        segment_capacity: 30,
+        snapshot_every: Some(10),
+        ..EngineConfig::new(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    for &command in &commands {
+        engine.submit(command, &mut events).unwrap();
+    }
+    drop(engine);
+    // Snapshots at 10 and 20; verification replays 11 to 20. Put record 3 where 15 is.
+    let mut file = storage.clone().open(&segment(1)).unwrap();
+    let mut record = [0; RECORD_SIZE];
+    file.read_at(64 + 2 * RECORD_SIZE as u64, &mut record)
+        .unwrap();
+    file.write_at(64 + 14 * RECORD_SIZE as u64, &record)
+        .unwrap();
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.snapshot, Some(20));
+    assert_eq!(report.verified, None);
+    assert!(report.unverified.is_some());
+    assert_eq!(engine.book().digest(), digests[25]);
+}
+
+/// A directory given by a relative name of one component is created, and the current
+/// directory, its parent, synced.
+#[test]
+fn a_relative_directory_is_created() {
+    let name = std::path::PathBuf::from(format!("engine-relative-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&name);
+    FsStorage.create_dir_all(&name).unwrap();
+    assert!(name.is_dir());
+    std::fs::remove_dir_all(&name).unwrap();
+}

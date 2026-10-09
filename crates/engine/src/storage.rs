@@ -104,10 +104,8 @@ impl Storage for FsStorage {
             self.create_dir_all(parent)?;
         }
         std::fs::create_dir(dir)?;
-        match dir.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => self.sync_dir(parent),
-            _ => self.sync_dir(Path::new(".")),
-        }
+        let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
+        self.sync_dir(parent.unwrap_or(Path::new(".")))
     }
 
     fn list(&mut self, dir: &Path) -> io::Result<Vec<String>> {

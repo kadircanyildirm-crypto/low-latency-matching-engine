@@ -730,9 +730,14 @@ impl<S: Storage> Journal<S> {
     fn roll(&mut self) -> Result<(), Error> {
         self.sync()?;
         let first_seq = self.last_seq + 1;
+        // A roll happens when the current segment is full, which is where the prepared one
+        // starts.
         let prepared = match self.next.take() {
-            Some(prepared) if prepared.header.first_seq == first_seq => prepared,
-            _ => {
+            Some(prepared) => {
+                debug_assert_eq!(prepared.header.first_seq, first_seq);
+                prepared
+            }
+            None => {
                 let header = Header {
                     first_seq,
                     fingerprint: self.fingerprint,
@@ -840,8 +845,7 @@ impl<S: Storage> Journal<S> {
             .segments
             .iter()
             .position(|s| s.first_seq + u64::from(s.capacity) > seq + 1)
-            .unwrap_or(self.segments.len() - 1)
-            .min(self.segments.len() - 1);
+            .unwrap_or(self.segments.len() - 1);
         if keep_from == 0 {
             return Ok(0);
         }

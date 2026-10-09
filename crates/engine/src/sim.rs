@@ -43,10 +43,69 @@ struct Disk {
     durable_names: BTreeMap<PathBuf, Rc<RefCell<Inode>>>,
     /// Directory changes since then, in order.
     pending: Vec<NameChange>,
-    /// Whether writes and syncs fail, as on a full or failing disk.
+    /// Whether every change fails, as on a full or failing disk. A failed file sync also
+    /// forgets the file's unsynced writes, as Linux marks the pages clean after a failed
+    /// write-back: they stay readable but never become durable.
     failing: bool,
+    /// Whether file syncs fail, while everything else works: the write-back fails.
+    failing_syncs: bool,
+    /// Whether reads fail.
+    failing_reads: bool,
+    /// Changes to files whose name contains this fail, as if their part of the disk were
+    /// full or broken.
+    failing_names: Option<String>,
+    /// Changes the process may still make before it dies, if limited.
+    budget: Option<u64>,
+    /// Whether the process has died: every change fails until a crash or a revival.
+    dead: bool,
+    /// Changes made so far: writes, length changes, syncs, creations, renames, removals.
+    changes: u64,
     /// Directories someone holds the lock of. A crash releases them all.
     locked: std::collections::BTreeSet<PathBuf>,
+}
+
+impl Disk {
+    /// [`change`](Self::change) to the file at `path`.
+    fn change_to(&mut self, path: &Path) -> io::Result<()> {
+        self.check_name(path)?;
+        self.change()
+    }
+
+    /// Fails if changes to the file at `path` are made to fail.
+    fn check_name(&self, path: &Path) -> io::Result<()> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if self
+            .failing_names
+            .as_deref()
+            .is_some_and(|part| name.contains(part))
+        {
+            return Err(io::Error::other("injected failure"));
+        }
+        Ok(())
+    }
+
+    /// Accounts for one change, or fails it: the process is dead, or dies now, or the disk
+    /// is failing.
+    fn change(&mut self) -> io::Result<()> {
+        if self.dead {
+            return Err(io::Error::other("the process is dead"));
+        }
+        if let Some(budget) = self.budget.as_mut() {
+            if *budget == 0 {
+                self.dead = true;
+                return Err(io::Error::other("the process died"));
+            }
+            *budget -= 1;
+        }
+        if self.failing {
+            return Err(io::Error::other("injected failure"));
+        }
+        self.changes += 1;
+        Ok(())
+    }
 }
 
 /// The lock on a directory of a [`SimStorage`], released when dropped.
@@ -120,14 +179,12 @@ impl Change {
 pub struct SimFile {
     inode: Rc<RefCell<Inode>>,
     disk: Rc<RefCell<Disk>>,
+    path: PathBuf,
 }
 
 impl SimFile {
-    fn check(&self) -> io::Result<()> {
-        if self.disk.borrow().failing {
-            return Err(io::Error::other("injected failure"));
-        }
-        Ok(())
+    fn change(&self) -> io::Result<()> {
+        self.disk.borrow_mut().change_to(&self.path)
     }
 }
 
@@ -177,8 +234,7 @@ impl SimStorage {
                 names: after.clone(),
                 durable_names: after,
                 pending: Vec::new(),
-                failing: false,
-                locked: Default::default(),
+                ..Disk::default()
             })),
         }
     }
@@ -213,9 +269,52 @@ impl SimStorage {
         }
     }
 
-    /// From now on, every write, length change and sync fails if `failing`.
+    /// From now on, every change fails if `failing`: writes, length changes, syncs,
+    /// creations, renames, removals and directory syncs. A failed file sync forgets the
+    /// file's unsynced writes, as Linux does: they stay readable but never become durable.
     pub fn set_failing(&self, failing: bool) {
         self.disk.borrow_mut().failing = failing;
+    }
+
+    /// From now on, every file sync fails if `failing`, and forgets the file's unsynced
+    /// writes as a failed write-back on Linux does; writes still work.
+    pub fn set_failing_syncs(&self, failing: bool) {
+        self.disk.borrow_mut().failing_syncs = failing;
+    }
+
+    /// From now on, every read fails if `failing`.
+    pub fn set_failing_reads(&self, failing: bool) {
+        self.disk.borrow_mut().failing_reads = failing;
+    }
+
+    /// From now on, every change to a file whose name contains `part` fails, or none if
+    /// `None`: creating, writing, syncing, renaming or removing it.
+    pub fn set_failing_names(&self, part: Option<&str>) {
+        self.disk.borrow_mut().failing_names = part.map(str::to_owned);
+    }
+
+    /// Lets the process make `changes` more changes, then dies: the next change fails, and
+    /// so does every one after it, until [`crash`](Self::crash) or [`revive`](Self::revive).
+    pub fn die_after(&self, changes: u64) {
+        self.disk.borrow_mut().budget = Some(changes);
+    }
+
+    /// Whether the process has died.
+    pub fn is_dead(&self) -> bool {
+        self.disk.borrow().dead
+    }
+
+    /// Changes made so far.
+    pub fn changes(&self) -> u64 {
+        self.disk.borrow().changes
+    }
+
+    /// Starts a new process on the same disk, as after a kill: whatever the dead one wrote
+    /// stays, synced or not.
+    pub fn revive(&self) {
+        let mut disk = self.disk.borrow_mut();
+        disk.dead = false;
+        disk.budget = None;
     }
 
     /// The names of every file, with their sizes, in path order.
@@ -297,12 +396,14 @@ impl Storage for SimStorage {
     fn create(&mut self, path: &Path) -> io::Result<SimFile> {
         let inode = Rc::new(RefCell::new(Inode::default()));
         let mut disk = self.disk.borrow_mut();
+        disk.change_to(path)?;
         disk.names.insert(path.to_owned(), inode.clone());
         disk.pending
             .push(NameChange::Create(path.to_owned(), inode.clone()));
         Ok(SimFile {
             inode,
             disk: self.disk.clone(),
+            path: path.to_owned(),
         })
     }
 
@@ -312,11 +413,14 @@ impl Storage for SimStorage {
         Ok(SimFile {
             inode,
             disk: self.disk.clone(),
+            path: path.to_owned(),
         })
     }
 
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         let mut disk = self.disk.borrow_mut();
+        disk.check_name(from)?;
+        disk.change_to(to)?;
         let inode = disk.names.remove(from).ok_or_else(not_found)?;
         disk.names.insert(to.to_owned(), inode);
         disk.pending
@@ -326,6 +430,7 @@ impl Storage for SimStorage {
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
         let mut disk = self.disk.borrow_mut();
+        disk.change_to(path)?;
         disk.names.remove(path).ok_or_else(not_found)?;
         disk.pending.push(NameChange::Remove(path.to_owned()));
         Ok(())
@@ -333,6 +438,7 @@ impl Storage for SimStorage {
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
         let mut disk = self.disk.borrow_mut();
+        disk.change()?;
         let disk = &mut *disk;
         let mut kept = Vec::new();
         for change in disk.pending.drain(..) {
@@ -363,7 +469,7 @@ impl StorageFile for SimFile {
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        self.check()?;
+        self.change()?;
         let mut inode = self.inode.borrow_mut();
         let change = Change::SetLen(len);
         change.apply(&mut inode.current);
@@ -372,6 +478,9 @@ impl StorageFile for SimFile {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.disk.borrow().failing_reads {
+            return Err(io::Error::other("injected read failure"));
+        }
         let inode = self.inode.borrow();
         let bytes = usize::try_from(offset)
             .ok()
@@ -382,7 +491,7 @@ impl StorageFile for SimFile {
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        self.check()?;
+        self.change()?;
         let mut inode = self.inode.borrow_mut();
         let change = Change::Write(offset, buf.to_vec());
         change.apply(&mut inode.current);
@@ -391,7 +500,19 @@ impl StorageFile for SimFile {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.check()?;
+        let result = if self.disk.borrow().failing_syncs {
+            Err(io::Error::other("injected sync failure"))
+        } else {
+            self.change()
+        };
+        if let Err(error) = result {
+            let disk = self.disk.borrow();
+            if disk.failing || disk.failing_syncs {
+                // The write-back failed: the pages are clean now, but not on the disk.
+                self.inode.borrow_mut().unsynced.clear();
+            }
+            return Err(error);
+        }
         let mut inode = self.inode.borrow_mut();
         let inode = &mut *inode;
         for change in inode.unsynced.drain(..) {

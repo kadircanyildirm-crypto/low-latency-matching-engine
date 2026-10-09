@@ -10,10 +10,11 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use engine::{Discard, Engine, EngineConfig};
+use engine::EngineConfig;
+use engine::storage::FsStorage;
 use gateway::client::Client;
 use gateway::web::{Guests, ws};
-use gateway::{Account, Exchange, Server, ServerConfig, Timing};
+use gateway::{Account, Funds, Server, ServerConfig, Timing, recovery};
 use orderbook::{BookConfig, Side, TimeInForce};
 use protocol::{Inbound, NewOrder, OrderKind, Outbound};
 use serde_json::{Value, json};
@@ -54,9 +55,6 @@ impl Gateway {
                 max_owners: 16,
                 ..BookConfig::new(1, 1_000, 1_024)
             };
-            let engine = Engine::open(path.join("data"), EngineConfig::new(book), &mut Discard)
-                .unwrap()
-                .0;
             let bot = Account {
                 id: 1,
                 token: 101,
@@ -64,16 +62,33 @@ impl Gateway {
                 messages_per_second: 10_000,
                 funds: None,
             };
-            let exchange =
-                Exchange::new(engine.book(), engine.last_seq(), &[bot], Timing::default()).unwrap();
+            // The guests of earlier runs, as the gateway binary loads them.
+            let mut accounts = vec![bot];
+            let guests_file = path.join("guests.txt");
+            if let Ok(text) = std::fs::read_to_string(&guests_file) {
+                accounts.extend(gateway::accounts::parse(&text, book.max_owners).unwrap());
+            }
+            let data = path.join("data");
+            let (engine, exchange, recovered) = recovery::open(
+                FsStorage,
+                &data,
+                EngineConfig::new(book),
+                &accounts,
+                Timing::default(),
+            )
+            .unwrap();
             let addr = "127.0.0.1:0".parse().unwrap();
             let mut server = Server::bind(exchange, engine, addr, ServerConfig::default()).unwrap();
+            server.checkpoint_to(data, 1_000, recovered.checkpoint.unwrap_or(0));
             let guests = Guests {
-                file: Some(path.join("guests.txt")),
+                file: Some(guests_file),
                 ids: 10..12,
                 max_open_orders: 5,
                 messages_per_second: 100,
-                funds: None,
+                funds: Some(Funds {
+                    cash: 100_000,
+                    position: 100,
+                }),
             };
             server.serve_web(addr, Some(guests)).unwrap();
             let addrs = (
@@ -315,4 +330,64 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let mut third = Browser::connect(gateway.web);
     third.send(json!({"type": "register"}));
     assert_eq!(third.expect("error")["message"], "no accounts are left");
+}
+
+/// A guest's money is where it was after the gateway stops and starts again, and so are its
+/// orders, with their references.
+#[test]
+fn a_guests_money_survives_a_restart() {
+    let dir = TempDir::new("restart");
+    let gateway = Gateway::start(&dir);
+    let mut browser = Browser::connect(gateway.web);
+    browser.send(json!({"type": "register"}));
+    let registered = browser.expect("registered");
+    let token = registered["token"].as_str().unwrap().to_owned();
+    browser.send(json!({"type": "login", "account": 10, "token": token}));
+    assert_eq!(browser.expect("balance")["cash"], 100_000);
+    browser.send(json!({"type": "order", "ref": 1, "side": "sell", "qty": 30, "price": 120}));
+    browser.send(json!({"type": "order", "ref": 2, "side": "buy", "qty": 10, "price": 90}));
+    let (mut bot, _) = Client::login(gateway.binary, 1, 101).unwrap();
+    bot.send(&Inbound::NewOrder(NewOrder {
+        client_ref: 7,
+        side: Side::Buy,
+        qty: 12,
+        kind: OrderKind::Limit {
+            price: 120,
+            tif: TimeInForce::Ioc,
+            display: None,
+        },
+    }))
+    .unwrap();
+    // Twelve sold at 120; eighteen still offered, ten bid for at 90.
+    let after = loop {
+        let balance = browser.expect("balance");
+        if balance["position"] == 88 {
+            break balance;
+        }
+    };
+    assert_eq!(after["cash"], 100_000 + 12 * 120);
+    assert_eq!(
+        (after["cash_held"].clone(), after["position_held"].clone()),
+        (json!(900), json!(18))
+    );
+    // The gateway stops with the browser still there: its orders stay. Had the browser
+    // left first, they would have been cancelled with its connection.
+    drop(gateway);
+    assert_eq!(browser.expect("logout")["reason"], "shutdown");
+    drop((browser, bot));
+
+    let gateway = Gateway::start(&dir);
+    let mut browser = Browser::connect(gateway.web);
+    browser.send(json!({"type": "login", "account": 10, "token": token}));
+    assert_eq!(browser.expect("login_accepted")["account"], 10);
+    let balance = browser.expect("balance");
+    assert_eq!(balance["cash"], 100_000 + 12 * 120, "{balance}");
+    assert_eq!(balance["position"], 88);
+    // Its orders came back with their references: cancelling one tells which.
+    browser.send(json!({"type": "cancel", "id": 2}));
+    let cancelled = browser.expect("report");
+    assert_eq!(
+        (cancelled["kind"].clone(), cancelled["ref"].clone()),
+        (json!("cancelled"), json!(2))
+    );
 }

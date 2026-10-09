@@ -17,16 +17,18 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use engine::Engine;
-use engine::storage::Storage;
+use engine::storage::{FsStorage, Storage};
+use engine::{Engine, Seq};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use protocol::{LogoutReason, Outbound, decode_inbound, encode_outbound};
 
 use crate::exchange::{Exchange, Mailbox, SessionId};
+use crate::recovery;
 use crate::web::json::{self, WebIn};
 use crate::web::{self, Guests, http, ws};
 
@@ -215,6 +217,9 @@ pub struct Server<C: Core> {
     /// The listener for browsers, and where their accounts come from.
     web: Option<TcpListener>,
     guests: Option<Guests>,
+    /// Where the exchange's checkpoints go, how many commands apart, and the last one's
+    /// sequence number.
+    checkpoints: Option<(PathBuf, u64, Seq)>,
     wires: Wires,
     /// Slots of closed connections, to reuse.
     free: Vec<SessionId>,
@@ -248,6 +253,7 @@ impl<C: Core> Server<C> {
             listener,
             web: None,
             guests: None,
+            checkpoints: None,
             wires: Wires {
                 slots: Vec::new(),
                 max_output: config.max_output,
@@ -277,6 +283,36 @@ impl<C: Core> Server<C> {
             .register(&mut listener, WEB_LISTENER, Interest::READABLE)?;
         self.web = Some(listener);
         self.guests = guests;
+        Ok(())
+    }
+
+    /// Saves the exchange's checkpoints in `dir` ([`recovery`]), once at least `every`
+    /// commands have passed since the last, which was at `since`, and when the server
+    /// stops: always at a moment when no command is in flight. A checkpoint that cannot be
+    /// saved stops the server, since a restart could no longer rebuild the exchange.
+    pub fn checkpoint_to(&mut self, dir: PathBuf, every: u64, since: Seq) {
+        self.checkpoints = Some((dir, every.max(1), since));
+    }
+
+    /// Saves a checkpoint if one is due, or `now` if one can be taken.
+    fn checkpoint(&mut self, now: bool) -> io::Result<()> {
+        let Some((dir, every, last)) = &mut self.checkpoints else {
+            return Ok(());
+        };
+        let seq = self.exchange.last_seq();
+        let due = if now {
+            seq > *last
+        } else {
+            seq >= *last + *every
+        };
+        if !due || self.core.busy() {
+            return Ok(());
+        }
+        let Some(checkpoint) = self.exchange.checkpoint() else {
+            return Ok(());
+        };
+        recovery::save(&mut FsStorage, dir, &checkpoint)?;
+        *last = checkpoint.seq;
         Ok(())
     }
 
@@ -310,6 +346,7 @@ impl<C: Core> Server<C> {
             }
         }
         self.shut_down();
+        self.checkpoint(true)?;
         Ok(())
     }
 
@@ -365,6 +402,7 @@ impl<C: Core> Server<C> {
             self.exchange.tick(now, &mut self.wires);
         }
         self.write(now);
+        self.checkpoint(false)?;
         Ok(())
     }
 

@@ -15,6 +15,10 @@
 //! They trade paper money: `--guest-cash` (in price ticks times lots) and
 //! `--guest-position` (in lots) to start with.
 //!
+//! The exchange's own state, paper money above all, is checkpointed in the data directory
+//! every `--checkpoint-every` commands (10,000 by default, and at most `--snapshot-every`),
+//! and rebuilt on the next start from the newest checkpoint and the journal after it.
+//!
 //! The accounts file holds one account per line: id, token, open-order limit and message
 //! rate. The book's settings are part of the journal: a directory opens only with the ones
 //! it was created with. Stop it with Ctrl+C or by killing it; the journal recovers either
@@ -26,11 +30,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use engine::{Discard, Engine, EngineConfig, SyncPolicy};
+use engine::storage::FsStorage;
+use engine::{EngineConfig, SyncPolicy};
 use gateway::web::Guests;
 use gateway::{
     Account, Core, Exchange, Funds, Pipeline, PipelineConfig, Server, ServerConfig, Timing,
-    accounts,
+    accounts, recovery,
 };
 use orderbook::BookConfig;
 use ring::Wait;
@@ -39,7 +44,8 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--sync always|os] [--min-price <n>] [--max-price <n>] [--max-orders <n>] \
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
-[--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>]";
+[--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
+[--checkpoint-every <n>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -82,6 +88,14 @@ fn run() -> Result<(), String> {
     };
     book.check().map_err(|e| format!("book settings: {e}"))?;
     let snapshot_every: u64 = parse(take("snapshot-every"), "1000000", "snapshot-every")?;
+    let checkpoint_every: u64 = parse(take("checkpoint-every"), "10000", "checkpoint-every")?;
+    if checkpoint_every == 0 || snapshot_every > 0 && checkpoint_every > snapshot_every {
+        return Err(
+            "--checkpoint-every must be at least one, and at most --snapshot-every: the journal \
+             must reach back to the last checkpoint"
+                .into(),
+        );
+    }
     let server = ServerConfig {
         max_sessions: parse(take("max-sessions"), "1024", "max-sessions")?,
         ..ServerConfig::default()
@@ -154,21 +168,31 @@ fn run() -> Result<(), String> {
         snapshot_every: (snapshot_every > 0).then_some(snapshot_every),
         ..EngineConfig::new(book)
     };
-    let (engine, report) =
-        Engine::open(&dir, config, &mut Discard).map_err(|e| format!("opening {dir}: {e}"))?;
-    eprintln!(
-        "gateway: recovered {dir} up to command {} ({} replayed), {} orders on the book",
-        engine.last_seq(),
-        report.journal.replayed,
-        engine.book().order_count()
-    );
-    let exchange = Exchange::new(
-        engine.book(),
-        engine.last_seq(),
+    let (engine, exchange, recovered) = recovery::open(
+        FsStorage,
+        Path::new(&dir),
+        config,
         &accounts,
         Timing::default(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("opening {dir}: {e}"))?;
+    eprintln!(
+        "gateway: recovered {dir} up to command {}, {} orders on the book; the exchange from {}",
+        engine.last_seq(),
+        engine.book().order_count(),
+        match recovered.checkpoint {
+            Some(seq) => format!(
+                "its checkpoint at {seq} and {} commands after it",
+                recovered.replayed
+            ),
+            None => "the book alone".to_owned(),
+        }
+    );
+    let checkpoints = (
+        PathBuf::from(&dir),
+        checkpoint_every,
+        recovered.checkpoint.unwrap_or(0),
+    );
     if let Some(&core) = cores.first() {
         let found = core_affinity::get_core_ids()
             .unwrap_or_default()
@@ -186,9 +210,25 @@ fn run() -> Result<(), String> {
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::start(engine, config).map_err(|e| e.to_string())?;
-        serve(exchange, pipeline, listen, server, accounts.len(), web)
+        serve(
+            exchange,
+            pipeline,
+            listen,
+            server,
+            accounts.len(),
+            web,
+            checkpoints,
+        )
     } else {
-        serve(exchange, engine, listen, server, accounts.len(), web)
+        serve(
+            exchange,
+            engine,
+            listen,
+            server,
+            accounts.len(),
+            web,
+            checkpoints,
+        )
     }
 }
 
@@ -207,9 +247,11 @@ fn serve<C: Core>(
     config: ServerConfig,
     accounts: usize,
     web: Option<(SocketAddr, Guests)>,
+    (dir, every, since): (PathBuf, u64, u64),
 ) -> Result<(), String> {
     let mut server =
         Server::bind(exchange, core, listen, config).map_err(|e| format!("{listen}: {e}"))?;
+    server.checkpoint_to(dir, every, since);
     eprintln!(
         "gateway: {accounts} accounts, listening on {}",
         server.local_addr().map_err(|e| e.to_string())?

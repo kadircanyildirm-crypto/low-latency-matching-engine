@@ -21,9 +21,9 @@ env:
 jobs:
   # The full mutation test suite (README.md#mutation-testing), each crate over four runners.
   # Test infrastructure is left out: the benchmarks' flow generator, the simulated disk and
-  # the kill test's child process. Of the gateway, only its logic is mutated: the network
-  # layer, the client and the load generator are tested end to end, over real sockets whose
-  # timing no test controls. A missed mutant fails the job. A mutant that makes the tests
+  # the kill test's child process. Of the gateway, its logic and its pipeline are mutated:
+  # the network layer, the client and the load generator are tested end to end, over real
+  # sockets whose timing no test controls. A missed mutant fails the job. A mutant that makes the tests
   # hang is detected too: cargo-mutants reports it as a timeout.
   mutants:
     name: mutants (${{ matrix.crate }}, shard ${{ matrix.shard }} of 4)
@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [orderbook, engine, gateway]
+        crate: [orderbook, engine, gateway, ring, marketdata]
         shard: [0, 1, 2, 3]
         include:
           - crate: orderbook
@@ -43,6 +43,7 @@ jobs:
           - crate: gateway
             scope: >-
               --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
+              --file crates/gateway/src/pipeline.rs
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

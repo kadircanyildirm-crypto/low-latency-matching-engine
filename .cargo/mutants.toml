@@ -8,8 +8,17 @@
 # fails, which no test on a running machine can do. The simulated disk models syncs, and
 # the crash tests catch every journal or snapshot path that skips one; only the two calls
 # that hand the sync to the OS are left out.
+#
+# How long a ring's backoff spins, yields and naps, and when it starts over, changes only
+# how long a wait takes, which no test can observe; that every wait ends is tested. So does
+# what spares the ring's shared cache lines: a consumer that rereads the producer's
+# position when its cached copy would do, and a producer that publishes an unchanged one,
+# get every result right, only slower.
 exclude_re = [
     "\\bproofs::",
+    "\\bBackoff::(snooze|reset)\\b",
+    "replace > with >= in Producer<T>::push_from",
+    "replace > with < in Consumer<T>::available",
     "<impl StorageFile for FsFile>::sync ",
     "<impl Storage for FsStorage>::sync_dir ",
 ]

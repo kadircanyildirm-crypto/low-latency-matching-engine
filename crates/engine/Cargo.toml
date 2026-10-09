@@ -13,4 +13,10 @@ crc32fast = "1.5.2"
 orderbook = { path = "../orderbook" }
 
 [dev-dependencies]
+core_affinity = "0.8.3"
+hdrhistogram = { version = "7.5.4", default-features = false }
 proptest = "1.11.0"
+
+[[bench]]
+name = "journal"
+harness = false

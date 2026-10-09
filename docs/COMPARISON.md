@@ -5,10 +5,8 @@ order books on exactly the same order flow, and checks that every engine produce
 the same trades and the same final book. The harness lives in [`compare/`](../compare); one
 command per engine reruns everything ([Reproducing](#reproducing)).
 
-> **The numbers below are preliminary.** They were taken on a development laptop while
-> three other build-and-test jobs were running on it, two interleaved rounds per engine.
-> Treat the ratios as indicative and the absolute values as noisy. The harness is meant to
-> be rerun on an idle machine, which will replace these numbers.
+> The numbers below come from a development laptop, idle apart from the harness, with
+> every engine pinned to the same performance core: three interleaved rounds per engine.
 
 ## Competitors
 
@@ -23,7 +21,7 @@ Why these: exchange-core (about 2,600 GitHub stars) is the best-known open-sourc
 core and follows the same LMAX architecture this project does; liquibook (about 1,500
 stars) is a widely used C++ order book; OrderBook-rs (about 540 stars, 74k downloads) was
 the most downloaded actively maintained order book engine in a crates.io search on
-2026-10-09. Our engine is `crates/orderbook` as of commit `0a5f459`, which the comparison
+2026-10-09. Our engine is `crates/orderbook` as of commit `7123fcc`, which the comparison
 does not change.
 
 Toolchains: Rust 1.96.0 with the main workspace's release profile (fat LTO, one codegen
@@ -128,10 +126,11 @@ it), in its own process, with the measuring thread pinned to one core:
    commands with no per-command timer, timed in chunks of 100k commands. Two figures come
    out: the overall rate (all commands over the total time, everything included, the
    figure to use on an idle machine) and the median chunk's rate, which an occasional
-   preemption by another process cannot move. On this busy laptop a single interval was
-   not usable: a first attempt measured our `deep` scenario at 0.49M cmd/s while its own
-   latency pass, run right after, had a median of 290 ns. Engines are compared on the chunk
-   median here.
+   preemption by another process cannot move. On a busy laptop a single interval is not
+   usable: a first attempt, with other builds running, measured our `deep` scenario at
+   0.49M cmd/s while its own latency pass, run right after, had a median of 290 ns. Engines
+   are compared on the chunk median; on the idle machine the two figures agree within a
+   few percent.
 4. Latency pass: another fresh book replays the warm-up prefix, then the measured
    commands with a timestamp before and after each one. Percentiles are exact (nearest
    rank over all 2M samples).
@@ -150,7 +149,8 @@ pass, as in exchange-core's own benchmarks; collections during a pass are includ
 
 Pinning: by default the measuring thread is pinned to the last logical core, as the latency
 benchmark does. **On the i5-12450H that is an E-core** (Gracemont, CPUID leaf 0x1A), so the
-numbers here, like the README's, are from an efficiency core; `CMP_CORE` selects another.
+runs below set `CMP_CORE=2`, a performance core, as the README's latency figures do with
+`LAT_CORE=2`.
 The JVM pins only its main thread (the JIT and GC threads run elsewhere). OpenHFT Affinity
 3.2.2, which exchange-core ships, cannot pin on Windows, so the harness calls
 `SetThreadAffinityMask` through JNA itself. This matters: unpinned, exchange-core ran
@@ -165,115 +165,114 @@ more than twice as fast as when pinned, because Windows put it on a P-core.
 | liquibook | A `std::multimap` node allocation per resting order; a cancel or replace finds the order by walking its price level linearly; every command goes through a callback vector dispatched with virtual calls inside a `try`/`catch`; all-or-none bookkeeping on every match | Cost grows with orders per level (the `deep` scenario) |
 | OrderBook-rs | Concurrent data structures (lock-free skip lists of levels, a concurrent id map, atomics, a submit gate) used single-threaded; about 1 to 3 KB allocated per passive add (its own measurement); a UUID v5 (SHA-1) trade id per execution; `u128` prices; a `TradeResult` with a symbol string per trade batch; removal from the owner's id list is linear in that owner's orders | It is built for many threads touching one book; a single-threaded replay pays for that without using it. The per-owner list makes `deep` (16k orders per owner) much slower than the small books |
 
-## Results (preliminary)
+## Results
 
-Two interleaved rounds per engine on 2026-10-09, every thread pinned to logical core 11
-(an E-core), 2M measured commands per run; liquibook's two `sweep` runs were redone
-after the fix described above, about 20 minutes later. **Every row is verified.**
+Three interleaved rounds per engine on 2026-10-09, on a laptop otherwise idle, every
+measuring thread pinned to logical core 2 (a P-core), 2M measured commands per run. Our
+engine is at commit `7123fcc`. **Every row is verified.**
 
 Throughput is the median 100k-command chunk, in millions of commands per second; latency
 is the median per command.
 
 | Scenario | ours | exchange-core | liquibook | OrderBook-rs |
 |---|---:|---:|---:|---:|
-| `baseline` | **16.7M/s**, 84 ns | 8.7M/s (0.52x), 100 ns* | 2.05M/s (0.12x), 427 ns | 0.54M/s (0.03x), 1.5 µs |
-| `sweep` | **16.6M/s**, 80 ns | 8.4M/s (0.50x), 100 ns* | 3.6M/s (0.22x), 302 ns | 0.50M/s (0.03x), 1.5 µs |
-| `deep` | **4.15M/s**, 196 ns | 3.1M/s (0.74x), 300 ns* | 0.20M/s (0.05x), 2.5 µs | 0.03M/s (0.01x), 8.9 µs |
-| `modify` | **15.9M/s**, 84 ns | 8.5M/s (0.54x), 100 ns* | 1.8M/s (0.11x), 442 ns | 0.45M/s (0.03x), 1.8 µs |
+| `baseline` | **27.6M/s**, 55 ns | 16.3M/s (0.59x), 100 ns* | 3.48M/s (0.13x), 238 ns | 0.94M/s (0.03x), 858 ns |
+| `sweep` | **24.8M/s**, 55 ns | 13.6M/s (0.55x), 100 ns* | 6.16M/s (0.25x), 182 ns | 0.86M/s (0.03x), 837 ns |
+| `deep` | **7.47M/s**, 143 ns | 5.09M/s (0.68x), 200 ns* | 0.27M/s (0.04x), 1.7 µs | 0.04M/s (0.01x), 6.0 µs |
+| `modify` | **26.1M/s**, 56 ns | 15.8M/s (0.61x), 100 ns* | 2.87M/s (0.11x), 253 ns | 0.76M/s (0.03x), 972 ns |
 
 \* exchange-core's latencies are in 100 ns steps (Java's timer on Windows), so its medians
 mean "100-200 ns" and cannot be compared below that resolution.
 
 The full report (`compare/run.sh report`): median over the runs, range in brackets;
 "Throughput" is all commands over their total time, "Chunk median" the robust figure
-above; latency in ns, timer overhead (~25 ns, Java ~0-100 ns) included.
+above; latency in ns, timer overhead (~14 ns, Java ~0-100 ns) included.
 
 **baseline** (~5k resting orders on ~220 levels near the touch)
 
 | Engine | Runs | Throughput | Chunk median | vs ours | p50 | p90 | p99 | p99.9 | p99.99 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ours | 2 | 16.28 [15.97-16.59] | 16.72 [16.70-16.74] | 1.00x | 84 | 119 | 190 | 382 | 2565 |
-| exchange-core | 2 | 8.26 [8.24-8.27] | 8.66 [8.54-8.79] | 0.52x | 100 | 200 | 450 | 900 | 5700 |
-| liquibook | 2 | 2.04 [2.04-2.05] | 2.05 [2.05-2.05] | 0.12x | 427 | 946 | 2024 | 4121 | 37412 |
-| OrderBook-rs | 2 | 0.52 [0.52-0.52] | 0.54 [0.52-0.55] | 0.03x | 1507 | 3138 | 6755 | 12525 | 91393 |
+| ours | 3 | 26.58 [25.28-28.33] | 27.61 [27.10-28.32] | 1.00x | 55 | 69 | 113 | 163 | 612 |
+| exchange-core | 3 | 15.99 [14.63-16.50] | 16.30 [16.02-16.56] | 0.59x | 100 | 100 | 300 | 600 | 2100 |
+| liquibook | 3 | 3.51 [3.09-3.54] | 3.48 [3.28-3.50] | 0.13x | 238 | 560 | 1130 | 1667 | 13662 |
+| OrderBook-rs | 3 | 0.94 [0.93-0.94] | 0.94 [0.94-0.94] | 0.03x | 858 | 1764 | 3872 | 12700 | 76584 |
 
 **sweep** (40% aggressive and market flow, sizes up to 1,000; multi-level fills)
 
 | Engine | Runs | Throughput | Chunk median | vs ours | p50 | p90 | p99 | p99.9 | p99.99 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ours | 2 | 16.35 [16.03-16.67] | 16.61 [16.55-16.67] | 1.00x | 80 | 118 | 190 | 260 | 1917 |
-| exchange-core | 2 | 8.26 [8.16-8.37] | 8.36 [8.32-8.40] | 0.50x | 100 | 200 | 500 | 950 | 5700 |
-| liquibook | 2 | 3.31 [3.04-3.58] | 3.62 [3.61-3.64] | 0.22x | 302 | 371 | 487 | 663 | 5790 |
-| OrderBook-rs | 2 | 0.49 [0.47-0.50] | 0.50 [0.49-0.52] | 0.03x | 1465 | 3916 | 8313 | 14094 | 70058 |
+| ours | 3 | 24.17 [23.39-25.09] | 24.80 [23.98-25.21] | 1.00x | 55 | 80 | 130 | 182 | 698 |
+| exchange-core | 3 | 13.55 [12.16-13.84] | 13.57 [12.09-13.76] | 0.55x | 100 | 100 | 300 | 700 | 6400 |
+| liquibook | 3 | 6.04 [6.00-6.15] | 6.16 [6.13-6.18] | 0.25x | 182 | 231 | 306 | 454 | 8515 |
+| OrderBook-rs | 3 | 0.84 [0.82-0.86] | 0.86 [0.85-0.87] | 0.03x | 837 | 2239 | 4660 | 12344 | 83247 |
 
 **deep** (850k-1M resting orders on ~10k levels; far beyond the caches)
 
 | Engine | Runs | Throughput | Chunk median | vs ours | p50 | p90 | p99 | p99.9 | p99.99 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ours | 2 | 4.21 [4.04-4.39] | 4.15 [4.10-4.21] | 1.00x | 196 | 469 | 990 | 3461 | 11452 |
-| exchange-core | 2 | 3.11 [2.81-3.40] | 3.08 [2.82-3.34] | 0.74x | 300 | 500 | 1000 | 3850 | 13700 |
-| liquibook | 2 | 0.20 [0.19-0.21] | 0.20 [0.20-0.20] | 0.05x | 2456 | 12315 | 21003 | 44747 | 301579 |
-| OrderBook-rs | 2 | 0.04 [0.04-0.04] | 0.03 [0.03-0.04] | 0.01x | 8862 | 65506 | 143083 | 375384 | 2643646 |
+| ours | 3 | 7.39 [6.84-7.64] | 7.47 [6.93-7.49] | 1.00x | 143 | 275 | 784 | 1022 | 13561 |
+| exchange-core | 3 | 5.04 [4.86-5.12] | 5.09 [4.82-5.28] | 0.68x | 200 | 400 | 900 | 1400 | 20000 |
+| liquibook | 3 | 0.29 [0.28-0.29] | 0.27 [0.27-0.27] | 0.04x | 1679 | 9215 | 15863 | 40162 | 151625 |
+| OrderBook-rs | 3 | 0.05 [0.05-0.05] | 0.04 [0.04-0.05] | 0.01x | 5964 | 43168 | 100304 | 224213 | 1121757 |
 
 **modify** (baseline flow with 5% price moves)
 
 | Engine | Runs | Throughput | Chunk median | vs ours | p50 | p90 | p99 | p99.9 | p99.99 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ours | 2 | 15.29 [14.70-15.88] | 15.86 [15.65-16.07] | 1.00x | 84 | 126 | 185 | 272 | 2442 |
-| exchange-core | 2 | 7.15 [5.90-8.39] | 8.53 [8.17-8.90] | 0.54x | 100 | 200 | 500 | 950 | 12800 |
-| liquibook | 2 | 1.81 [1.77-1.85] | 1.81 [1.76-1.85] | 0.11x | 442 | 1144 | 2202 | 3525 | 27350 |
-| OrderBook-rs | 2 | 0.44 [0.44-0.44] | 0.45 [0.45-0.46] | 0.03x | 1847 | 4921 | 15129 | 39345 | 186836 |
+| ours | 3 | 25.93 [25.11-26.25] | 26.08 [25.98-26.35] | 1.00x | 56 | 77 | 119 | 169 | 576 |
+| exchange-core | 3 | 15.38 [15.34-16.02] | 15.78 [15.50-16.18] | 0.61x | 100 | 100 | 300 | 600 | 3600 |
+| liquibook | 3 | 2.91 [2.87-3.07] | 2.87 [2.85-3.02] | 0.11x | 253 | 750 | 1433 | 2034 | 25154 |
+| OrderBook-rs | 3 | 0.75 [0.73-0.78] | 0.76 [0.75-0.78] | 0.03x | 972 | 2538 | 6649 | 16287 | 98178 |
 
-**One run on a P-core** (logical core 2, `CMP_CORE=2`; a spot check, not part of the rounds):
+Latency ranges over the runs are in the report; medians up to p99 moved by at most a few
+percent between runs, the p99.99 of every engine by up to a factor of two or three.
 
-| Scenario | ours | exchange-core |
-|---|---:|---:|
-| `baseline` | 29.3M/s, p50 54 ns, p99 111 ns | 13.5M/s (0.46x), p50 100 ns, p99 300 ns |
-| `deep` | 5.6M/s, p50 157 ns, p99 888 ns | 5.0M/s (0.89x), p50 200 ns, p99 900 ns |
+**An earlier, preliminary pass** ran two rounds on the last logical core (an E-core) while
+three build-and-test jobs shared the laptop, before our engine replaced its order-id hash
+map with the cache-line index. It ranked the engines the same way: ours at 16.7M/s on
+`baseline` and 4.15M/s on `deep`, exchange-core at 0.52x and 0.74x, liquibook at 0.12x and
+0.05x, OrderBook-rs at 0.03x and 0.01x. A one-run P-core spot check from that pass put
+exchange-core at 0.46x on `baseline` and 0.89x on `deep`; with the new index it is 0.68x.
 
 ### What the numbers say
 
 - **Ours is the fastest in every scenario measured.** On the small books (`baseline`,
-  `sweep`, `modify`) it does about twice the work of exchange-core per second and has the
-  lowest latency at every percentile the timers can resolve. Where the book fits in
+  `sweep`, `modify`) it does 1.6 to 1.8 times the work of exchange-core per second and has
+  the lowest latency at every percentile the timers can resolve. Where the book fits in
   cache, the dense price ladder (one subtraction to find a level), the intrusive queues in
   a preallocated slab and the absence of allocation and garbage collection pay off.
-- **exchange-core comes close on the deep book, and on a P-core it nearly catches up:**
-  0.74x on the E-core and 0.89x in the P-core spot check, with the same p99 (about 1 µs)
-  and a similar p99.9. With a million resting orders both engines are dominated by cache
-  misses: cancels and fills touch arbitrary old orders. exchange-core finds orders through
-  an adaptive radix tree, which suits the stream's sequential order ids; ours goes through
-  a hash map (`FxHashMap`) into a 48 MB slab. Replacing that hash map
-  with a directly indexed table once the gateway assigns sequential ids is already on the
-  roadmap ([DESIGN.md §11](DESIGN.md#11-known-limitations-and-deliberate-deferrals)); this
-  comparison is evidence for doing it.
-- **exchange-core gains more from a P-core than ours does on `deep`** (+62% against +35%),
-  so the core type matters for the ranking's margins; the final numbers should come from
-  the machine and core the project cares about.
-- **liquibook** is 5 to 20 times slower. A cancel or replace finds the order by walking its
+- **exchange-core comes closest on the deep book: 0.68x,** with a p99 of 900 ns against
+  our 784 ns. With a million resting orders both engines are dominated by cache misses:
+  cancels and fills touch arbitrary old orders. exchange-core finds orders through an
+  adaptive radix tree, which suits the stream's sequential order ids. Ours used a
+  general-purpose hash map (`FxHashMap`) until this comparison showed the deep book to be
+  its weakest case; it now uses an id index that normally finds an order in one cache line
+  ([DESIGN.md §13](DESIGN.md#13-performance-work)). exchange-core reached 0.89x of ours
+  on `deep` in the preliminary P-core spot check, with the hash map, and 0.68x here.
+- **liquibook** is 4 to 25 times slower. A cancel or replace finds the order by walking its
   price level linearly (`find_on_market`), every resting order is a node allocation in a
   `std::multimap`, and every command goes through its callback queue. On `deep`, with
-  about 85 orders per level, the walk dominates: 2.5 µs median, 21 µs p99. `sweep`, with
+  about 85 orders per level, the walk dominates: 1.7 µs median, 16 µs p99. `sweep`, with
   short queues and many market orders, is its best case.
-- **OrderBook-rs** is 30 times slower on the small books, over 100 times on `deep`, and has
-  the longest tails. It is designed for
-  many threads sharing one book, and a single thread pays for that design without
-  benefiting from it: concurrent skip lists and maps, atomics, about 1-3 KB allocated per
-  resting order, a SHA-1-based UUID per trade, and per-user id lists that are searched
-  linearly (16k orders per user on `deep`). Its own published figures (Apple M5 Max:
-  mixed workload p50 0.54 µs, p99 15.7 µs) are consistent with these.
+- **OrderBook-rs** is about 30 times slower on the small books, over 150 times on `deep`,
+  and has the longest tails. It is designed for many threads sharing one book, and a
+  single thread pays for that design without benefiting from it: concurrent skip lists and
+  maps, atomics, about 1-3 KB allocated per resting order, a SHA-1-based UUID per trade,
+  and per-user id lists that are searched linearly (16k orders per user on `deep`). Its
+  own published figures (Apple M5 Max: mixed workload p50 0.54 µs, p99 15.7 µs) are
+  consistent with these.
 - These numbers are close to, but not the same as, the README's: the streams differ (no
-  self-trade prevention firing, no price protection, a different mix), and the machine
-  was busy.
+  self-trade prevention firing, no price protection, a different mix).
 
 ## Caveats
 
-- **Noisy, shared machine.** Other agents were compiling and testing on the same laptop
-  throughout; the coordinator re-measures on an idle machine. Tails (p99.9 and beyond) are
-  dominated by that noise and by Windows scheduling, for every engine.
-- **E-core.** All engines ran on the same efficiency core. A P-core is faster for all of
-  them, but not by the same factor (see the spot check above: ours +75% and exchange-core
-  +56% on `baseline`, +35% and +62% on `deep`).
+- **A laptop, not an isolated core.** The machine was otherwise idle, but it runs Windows
+  with its usual background services and no tuning. Tails (p99.99 and beyond) are
+  dominated by scheduling, for every engine.
+- **Core type.** All engines ran on the same performance core. On an efficiency core all
+  of them are slower, and not by the same factor: in the preliminary pass, a P-core gave
+  ours +75% and exchange-core +56% on `baseline`, but +35% and +62% on `deep`. The ranking
+  did not change.
 - **Java's timer.** exchange-core's percentiles are in 100 ns steps on Windows; a median of
   100 ns means "between 0 and 200 ns". Its throughput is unaffected.
 - **One flow family.** All four scenarios come from one generator. Books with very
@@ -314,5 +313,5 @@ Useful settings: `CMP_CORE=2` pins to another core (on the i5-12450H, logical co
 P-cores and 8-11 E-cores), `CMP_SCENARIOS=baseline,deep` restricts the scenarios,
 `CMP_RUNS=3` adds runs per process, `JAVA_OPTS` overrides the JVM options. The comparison is
 its own Cargo workspace, so the main workspace's `cargo build` and `cargo test` never
-compile it. On this laptop a round of all engines and scenarios takes about 8 minutes,
-most of it OrderBook-rs.
+compile it. On this laptop's P-core a round of all engines and scenarios takes about
+5 minutes, most of it OrderBook-rs.

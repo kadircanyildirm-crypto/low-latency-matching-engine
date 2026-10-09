@@ -109,6 +109,11 @@ impl OrderBook {
 
     /// Moves the book to `phase`. Leaving a call phase uncrosses the book first; only a
     /// call phase can leave the book crossed, so for any other phase this does nothing.
+    ///
+    /// Phase changes are rare, and kept out of line so that the code of the uncross does
+    /// not weigh on the commands of continuous trading.
+    #[cold]
+    #[inline(never)]
     pub(super) fn set_phase<S: EventSink>(&mut self, phase: Phase, sink: &mut S) {
         if phase != Phase::Auction {
             self.uncross(sink);

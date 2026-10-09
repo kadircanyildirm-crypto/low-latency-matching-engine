@@ -509,17 +509,18 @@ impl OrderBook {
             return Err(RejectReason::InvalidDisplay);
         }
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
-        self.check_phase(!may_rest)?;
+        // Continuous trading pays this one branch for phases.
+        if self.phase != Phase::Continuous {
+            return self
+                .new_limit_outside_continuous(id, owner, side, level, qty, tif, display, sink);
+        }
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
         }
-        // Price protection and the band guard against what an order trades on arrival. In
-        // a call phase nothing does, and the uncross is what finds the new price.
-        let continuous = self.phase == Phase::Continuous;
-        if continuous && self.outside_protection(side, level) {
+        if self.outside_protection(side, level) {
             return Err(RejectReason::PriceOutsideProtection);
         }
-        if continuous && self.outside_band(side, level) {
+        if self.outside_band(side, level) {
             return Err(RejectReason::PriceOutsideBand);
         }
         if tif == TimeInForce::PostOnly && self.crosses(side, level) {
@@ -528,18 +529,11 @@ impl OrderBook {
         // A crossing order always finds room to rest: its first match either fills it or
         // removes a resting order (by filling it or by self-trade prevention), freeing a
         // slot. So only an order that can do nothing but rest is refused when full, and
-        // orders that never rest are never refused. In a call phase nothing matches, so
-        // every order needs a free slot.
-        if may_rest && self.pool.is_full() && !(continuous && self.crosses(side, level)) {
+        // orders that never rest are never refused.
+        if may_rest && self.pool.is_full() && !self.crosses(side, level) {
             return Err(RejectReason::BookFull);
         }
         sink.on_event(Event::Accepted { id });
-        if !continuous {
-            // A call phase collects orders for the uncross without matching them.
-            let post_only = tif == TimeInForce::PostOnly;
-            self.rest(id, owner, side, level, qty, qty, post_only, display, sink);
-            return Ok(());
-        }
         match tif {
             TimeInForce::Gtc | TimeInForce::PostOnly => {
                 let post_only = tif == TimeInForce::PostOnly;
@@ -571,6 +565,40 @@ impl OrderBook {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A limit order outside continuous trading. A halt or the close refuses it, and a call
+    /// phase refuses one that must trade at once. Otherwise it rests without matching, and
+    /// without the price controls, which guard against what an order trades on arrival: in
+    /// a call nothing does, and the uncross finds the new price. Since nothing matches,
+    /// nothing frees a slot either, so a full book refuses every order.
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn new_limit_outside_continuous<S: EventSink>(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        level: u32,
+        qty: Qty,
+        tif: TimeInForce,
+        display: Option<Qty>,
+        sink: &mut S,
+    ) -> Result<(), RejectReason> {
+        let post_only = tif == TimeInForce::PostOnly;
+        self.check_phase(!matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly))?;
+        if self.index.contains_key(&id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if post_only && self.crosses(side, level) {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
+        if self.pool.is_full() {
+            return Err(RejectReason::BookFull);
+        }
+        sink.on_event(Event::Accepted { id });
+        self.rest(id, owner, side, level, qty, qty, post_only, display, sink);
         Ok(())
     }
 
@@ -854,7 +882,7 @@ impl OrderBook {
 
     /// Rests `remaining` of a validated limit order at the back of its level, in a free
     /// slot, showing its first tranche if it is an iceberg.
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn rest<S: EventSink>(
         &mut self,

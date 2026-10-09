@@ -9,7 +9,9 @@ use std::path::Path;
 
 use engine::sim::{CrashModel, SimStorage};
 use engine::storage::{Storage, StorageFile};
-use engine::{Discard, Engine, EngineConfig, Error, RecoveryReport, Seq, SyncPolicy};
+use engine::{
+    Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq, SyncPolicy,
+};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, Event, OrderBook};
 
@@ -139,18 +141,23 @@ fn a_failing_snapshot_does_not_stop_trading() {
     let (mut engine, _) = open(&storage, config).unwrap();
     let mut events = Vec::new();
     storage.set_failing_names(Some(".tmp"));
+    let mut failed = Vec::new();
     for &command in &commands[..25] {
         engine.submit(command, &mut events).unwrap();
+        if engine.take_failure().is_some() {
+            failed.push(engine.last_seq());
+        }
     }
-    assert!(engine.take_failure().is_some());
     assert!(engine.take_failure().is_none());
     assert_eq!(engine.last_snapshot(), 0);
+    // The failure at 10 put the next attempt off to 20, which failed too.
+    assert_eq!(failed, [11, 21]);
     storage.set_failing_names(None);
     for &command in &commands[25..] {
         engine.submit(command, &mut events).unwrap();
     }
-    // The failure at 10 put the next attempt off to 20, which failed too; 30 worked.
-    assert!(engine.last_snapshot() >= 30);
+    // 30 worked, and so did 40 and 50.
+    assert_eq!(engine.last_snapshot(), 50);
     assert_eq!(engine.book().digest(), digests[60]);
     drop(engine);
     let (engine, _) = open(&storage, config).unwrap();
@@ -323,9 +330,16 @@ fn read_errors_set_nothing_aside() {
 fn small_contracts() {
     let (book, commands) = common::flow(60, 5);
     let storage = SimStorage::new();
-    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let (mut engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!(report, RecoveryReport::default());
     let mut events: Vec<(Seq, Event)> = Vec::new();
     engine.submit_batch(&commands, &mut events).unwrap();
+    // Without a snapshot there is nothing to verify the journal against.
+    drop(engine);
+    let (mut engine, report) = open(&storage, small(book)).unwrap();
+    assert_eq!((report.snapshot, report.verified), (None, None));
+    assert_eq!(report.unverified, None);
+    assert_eq!(report.journal.replayed, 5);
     // An empty batch journals nothing and returns the last sequence number.
     assert_eq!(engine.submit_batch(&[], &mut events).unwrap(), 5);
     assert_eq!(engine.last_seq(), 5);
@@ -401,12 +415,40 @@ fn set_rules(storage: &SimStorage, first: u64, rules: u32) {
     file.write_at(0, &header).unwrap();
 }
 
+/// The header of the segment starting at `first`.
+fn header(storage: &SimStorage, first: u64) -> [u8; 64] {
+    let path = Path::new(DIR).join(format!("journal-{first:020}.log"));
+    let mut header = [0; 64];
+    storage
+        .clone()
+        .open(&path)
+        .unwrap()
+        .read_at(0, &mut header)
+        .unwrap();
+    header
+}
+
+/// Creates an empty segment of 10 records starting at `first` with the header of the one
+/// starting at `like`, as if a process had created it and stopped before its first record.
+fn empty_segment(storage: &SimStorage, first: u64, like: u64) {
+    let mut header = header(storage, like);
+    header[16..24].copy_from_slice(&first.to_le_bytes());
+    let crc = crc32fast::hash(&header[..60]);
+    header[60..].copy_from_slice(&crc.to_le_bytes());
+    let path = Path::new(DIR).join(format!("journal-{first:020}.log"));
+    let mut file = storage.clone().create(&path).unwrap();
+    file.write_at(0, &header).unwrap();
+    file.write_at(64, &[0; 10 * RECORD_SIZE]).unwrap();
+}
+
 /// The upgrade path: the old version takes a snapshot as it stops, and the new one, under
 /// other rules, starts from it, cuts the old journal there and goes on in a new segment.
+/// Empty segments the old version left after the snapshot go.
 #[test]
 fn a_new_rules_version_starts_from_the_old_versions_snapshot() {
     let (book, commands) = common::flow(63, 40);
     let digests = common::digests(book, &commands);
+    // The snapshot inside a segment, or at its end.
     for at in [25, 30] {
         let storage = SimStorage::new();
         let (mut engine, _) = open(&storage, small(book)).unwrap();
@@ -417,9 +459,17 @@ fn a_new_rules_version_starts_from_the_old_versions_snapshot() {
         for first in [1, 11, 21] {
             set_rules(&storage, first, orderbook::RULES_VERSION + 1);
         }
+        empty_segment(&storage, 31, 21);
+        if at == 30 {
+            empty_segment(&storage, 41, 21);
+        }
         let (mut engine, report) =
             open(&storage, small(book)).unwrap_or_else(|e| panic!("{at}: {e}"));
         assert_eq!(engine.last_seq(), at as u64);
+        // The segment the snapshot ends ends there too, or goes if it holds nothing before.
+        assert_eq!(report.journal.removed_segments, if at == 25 { 1 } else { 2 });
+        let capacity = u32::from_le_bytes(header(&storage, 21)[32..36].try_into().unwrap());
+        assert_eq!(capacity, if at == 25 { 5 } else { 10 });
         assert_eq!(engine.book().digest(), digests[at]);
         assert!(
             report.unverified.is_some(),
@@ -564,6 +614,15 @@ fn a_clean_shutdown_is_recorded() {
     assert_eq!(engine.last_seq(), 25);
     assert_eq!(report.journal.rewritten_records, 0);
     engine.close().unwrap();
+    // A damaged marker is no marker: the records no later one vouches for are written
+    // again, as after a crash. Rolling into a segment syncs the journal, so 21 to 25 vouch
+    // for the rest. The marker's magic is intact; the number it claims is far too large.
+    let clean = Path::new(DIR).join("journal.clean");
+    storage.flip_bit(&clean, 15 * 8 + 6);
+    let (engine, report) = open(&storage, os).unwrap();
+    assert_eq!(engine.last_seq(), 25);
+    assert_eq!(report.journal.rewritten_records, 5);
+    engine.close().unwrap();
     // The last record, which no later record vouches for, is damaged.
     storage.flip_bit(
         &Path::new(DIR).join("journal-00000000000000000021.log"),
@@ -620,4 +679,71 @@ fn a_snapshot_at_the_end_of_a_segment() {
     assert_eq!(report.snapshot, Some(10));
     assert_eq!(report.journal.replayed, 15);
     assert_eq!(engine.book().digest(), digests[25]);
+}
+
+/// A record that claims the damaged one durable is lost data, wherever it sits in the
+/// segments after the damage.
+#[test]
+fn a_later_record_vouching_for_a_damaged_one_is_found_in_any_slot() {
+    let (book, commands) = common::flow(70, 18);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    // Records 1 to 15 vouch for nothing; 16 to 18, in the middle of the second segment,
+    // vouch for everything up to 15.
+    engine.submit_batch(&commands[..15], &mut events).unwrap();
+    engine.submit_batch(&commands[15..], &mut events).unwrap();
+    drop(engine);
+    storage.flip_bit(
+        &Path::new(DIR).join("journal-00000000000000000001.log"),
+        (64 + 4 * 64) * 8 + 300,
+    );
+    match open(&storage, small(book)) {
+        Err(Error::Corrupt { file, .. }) => {
+            assert!(file.ends_with("journal-00000000000000000011.log"), "{file:?}");
+        }
+        other => panic!("{:?}", other.map(|(_, report)| report)),
+    }
+}
+
+/// Every new segment is written in full, zeros and all, before it takes records.
+#[test]
+fn segments_are_allocated_in_full() {
+    let (book, _) = common::flow(71, 0);
+    // Not a whole number of the pieces segments are filled in.
+    let config = EngineConfig {
+        segment_capacity: 1_500,
+        ..EngineConfig::new(book)
+    };
+    let storage = SimStorage::new();
+    let _engine = open(&storage, config).unwrap();
+    let path = Path::new(DIR).join("journal-00000000000000000001.log");
+    let size = storage.files().into_iter().find(|(name, _)| *name == path);
+    assert_eq!(size, Some((path, 64 + 1_500 * RECORD_SIZE as u64)));
+}
+
+/// Damaged snapshots stay for inspection while they are no older than the oldest snapshot
+/// kept.
+#[test]
+fn damaged_snapshots_go_with_the_snapshots_of_their_age() {
+    let (book, commands) = common::flow(72, 30);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    let damaged = |seq: u64| Path::new(DIR).join(format!("snapshot-{seq:020}.damaged"));
+    engine.submit_batch(&commands[..10], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    for seq in [5, 10, 15] {
+        let mut file = storage.clone().create(&damaged(seq)).unwrap();
+        file.write_at(0, b"damaged").unwrap();
+    }
+    let present = |seq: u64| storage.files().iter().any(|(name, _)| *name == damaged(seq));
+    engine.submit_batch(&commands[10..20], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    // Snapshots at 10 and 20 are kept.
+    assert_eq!([present(5), present(10), present(15)], [false, true, true]);
+    engine.submit_batch(&commands[20..], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    // Now at 20 and 30.
+    assert_eq!([present(10), present(15)], [false, false]);
 }

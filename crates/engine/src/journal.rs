@@ -975,7 +975,7 @@ pub(crate) fn read_range<S: Storage>(
                 Ok(filled) => filled,
                 Err(error) => return Ok(Err(error.to_string())),
             };
-            for bytes in chunk[..filled * RECORD_SIZE].chunks_exact(RECORD_SIZE) {
+            for bytes in chunk.chunks_exact(RECORD_SIZE).take(filled) {
                 if next > to {
                     break;
                 }

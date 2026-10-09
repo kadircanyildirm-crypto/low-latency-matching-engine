@@ -4,6 +4,7 @@
 
 mod common;
 
+use common::reference::ReferenceBook;
 use common::strategies::scenario;
 use orderbook::{
     BookConfig, BookSnapshot, OrderBook, SelfTradePolicy, Side, SnapshotError, SnapshotOrder,
@@ -16,6 +17,10 @@ proptest! {
 
     /// Any state that a snapshot left out would make the restored book drift from the
     /// original sooner or later: a different trade id, queue position or rejection.
+    ///
+    /// The reference book loaded from the same snapshot must continue like the original
+    /// too. The `restore` fuzz target compares restored books against it, so this checks
+    /// the loading itself.
     #[test]
     fn a_restored_book_continues_exactly_like_the_original(
         (cfg, commands, cut) in scenario(200).prop_flat_map(|(cfg, commands)| {
@@ -37,16 +42,28 @@ proptest! {
         }
         prop_assert_eq!(&restored.snapshot(), &snapshot);
         prop_assert_eq!(restored.digest(), original.digest());
+        let mut reference = ReferenceBook::restore(&snapshot);
+        prop_assert_eq!(reference.snapshot(), common::snapshot(&original));
 
-        let (mut got, mut want) = (Vec::new(), Vec::new());
+        let (mut got, mut want, mut naive) = (Vec::new(), Vec::new(), Vec::new());
         for (step, &command) in commands[cut..].iter().enumerate() {
             got.clear();
             want.clear();
+            naive.clear();
             restored.process(command, &mut got);
             original.process(command, &mut want);
+            reference.process(command, &mut naive);
             prop_assert_eq!(&got, &want, "{} commands after the restore: {:?}", step, command);
+            prop_assert_eq!(&naive, &want, "reference, {} commands after the restore", step);
         }
         prop_assert_eq!(restored.snapshot(), original.snapshot());
+        prop_assert_eq!(reference.snapshot(), common::snapshot(&original));
+        for side in [Side::Buy, Side::Sell] {
+            let stops: Vec<_> = original.stops(side).collect();
+            prop_assert_eq!(reference.stops(side), stops);
+        }
+        prop_assert_eq!(reference.trade_count(), original.trade_count());
+        prop_assert_eq!(reference.reference_price(), original.reference_price());
     }
 }
 

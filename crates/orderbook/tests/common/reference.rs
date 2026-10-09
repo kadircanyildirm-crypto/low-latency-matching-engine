@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use orderbook::{
-    BookConfig, CancelReason, Command, Event, OrderId, OwnerId, Price, Qty, QueuedOrder,
-    RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
+    BookConfig, BookSnapshot, CancelReason, Command, Event, OrderId, OwnerId, Price, Qty,
+    QueuedOrder, RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
 };
 
 use super::Snapshot;
@@ -64,6 +64,32 @@ impl ReferenceBook {
             pending: Vec::new(),
             traded: None,
         }
+    }
+
+    /// A book in the state `snapshot` records, which the engine's `restore` accepted: each
+    /// order joins the back of its level's queue and each stop the pending list, both in
+    /// snapshot order.
+    pub fn restore(snapshot: &BookSnapshot) -> Self {
+        let mut book = Self::new(snapshot.config);
+        book.trades = snapshot.trade_count;
+        book.reference = snapshot.reference_price;
+        for order in &snapshot.orders {
+            book.ladder(order.side)
+                .entry(order.price)
+                .or_default()
+                .push_back(Order {
+                    id: order.id,
+                    owner: order.owner,
+                    leaves: order.leaves,
+                    total: order.leaves + order.filled,
+                    post_only: order.post_only,
+                    display: order.display,
+                    visible: order.visible,
+                });
+            book.orders.insert(order.id, (order.side, order.price));
+        }
+        book.pending = snapshot.stops.clone();
+        book
     }
 
     /// One side's pending stops in trigger order: buy stops lowest trigger first, sell stops

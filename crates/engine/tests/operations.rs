@@ -161,8 +161,9 @@ fn a_failing_roll_poisons_the_engine() {
     let storage = SimStorage::new();
     let (mut engine, _) = open(&storage, small(book)).unwrap();
     let mut events = Vec::new();
-    storage.set_failing_names(Some("00000000000000000011"));
     engine.submit_batch(&commands[..10], &mut events).unwrap();
+    // The next segment is prepared while the current one fills; it cannot be finished.
+    storage.set_failing_names(Some("00000000000000000011"));
     assert!(engine.submit(commands[10], &mut events).is_err());
     assert!(matches!(
         engine.submit(commands[10], &mut events),

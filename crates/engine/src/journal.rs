@@ -180,10 +180,6 @@ impl Header {
         })
     }
 
-    fn file_len(&self) -> u64 {
-        HEADER_SIZE + u64::from(self.capacity) * RECORD_SIZE as u64
-    }
-
     fn offset(&self, slot: u32) -> u64 {
         HEADER_SIZE + u64::from(slot) * RECORD_SIZE as u64
     }
@@ -207,6 +203,11 @@ fn read_header<F: StorageFile>(file: &mut F) -> Result<Result<Header, HeaderErro
 /// The name of the segment whose first sequence number is `first_seq`.
 fn segment_name(first_seq: Seq) -> String {
     format!("journal-{first_seq:020}.log")
+}
+
+/// The name of the segment starting at `first_seq` while it is being prepared.
+fn prepared_name(first_seq: Seq) -> String {
+    format!("journal-{first_seq:020}.next")
 }
 
 /// The first sequence number of the segment called `name`, if it is one.
@@ -255,16 +256,31 @@ pub struct Journal<S: Storage> {
     durable: Seq,
     /// Encoded records waiting for one write call.
     buf: Vec<u8>,
+    /// The next segment, filled with zeros a piece at a time while this one fills, under a
+    /// temporary name; rolling over then only writes its header and renames it.
+    next: Option<Prepared<S::File>>,
+    /// Bytes of zeros the next segment is owed, from records appended since the last piece.
+    owed: u64,
 }
+
+/// A segment file being filled with zeros under the name `journal-<first seq>.next`.
+struct Prepared<F> {
+    file: F,
+    first_seq: Seq,
+    capacity: u32,
+    /// Bytes after the header already zero.
+    filled: u64,
+}
+
+/// Bytes of zeros written per piece.
+const PIECE: usize = 1 << 16;
+static ZEROS: [u8; PIECE] = [0; PIECE];
 
 /// Records encoded per write call at most.
 const BATCH_RECORDS: usize = 256;
 
 /// Records read per read call during recovery.
 const READ_RECORDS: usize = 16_384;
-
-/// Bytes of zeros written per write call when a segment is created.
-const ZERO_FILL: usize = 1 << 20;
 
 /// What the journal's files are expected to be.
 #[derive(Clone, Copy, Debug)]
@@ -385,10 +401,16 @@ impl<S: Storage> Journal<S> {
             });
         }
 
-        // Everything checks out: from here on, recovery repairs.
+        // Everything checks out: from here on, recovery repairs. A segment that was still
+        // being prepared never held a record.
         if let Some(path) = &torn_newest {
             storage.remove(path)?;
             report.removed_segments += 1;
+        }
+        for name in storage.list(dir)? {
+            if name.starts_with("journal-") && name.ends_with(".next") {
+                storage.remove(&dir.join(name))?;
+            }
         }
         let (file, slot) = match covering {
             Some(i) => {
@@ -396,9 +418,12 @@ impl<S: Storage> Journal<S> {
                 let file = storage.open(&dir.join(segment_name(first_seq)))?;
                 (file, (after + 1 - first_seq) as u32)
             }
-            None => (storage.create(&dir.join(segment_name(after + 1)))?, 0),
+            // Replaced by the new segment below.
+            None => (storage.create(&dir.join(prepared_name(after + 1)))?, 0),
         };
         let mut journal = Journal {
+            next: None,
+            owed: 0,
             file,
             storage,
             dir: dir.to_owned(),
@@ -413,7 +438,7 @@ impl<S: Storage> Journal<S> {
         };
         match covering {
             Some(start) => journal.replay(start, &mut apply, &mut report)?,
-            None => journal.initialise_segment(after + 1)?,
+            None => journal.start_segment(after + 1)?,
         }
         // The directory may hold entries that only the OS cache knows of: a segment a killed
         // process created, or the removals above and those of leftover temporary snapshots.
@@ -635,32 +660,73 @@ impl<S: Storage> Journal<S> {
         Ok(true)
     }
 
-    /// Fills the file for the segment starting at `first_seq`, which `self.file` already
-    /// is, with zeros to its full size, and makes that and its header durable before any
-    /// record is written into it. Writing the zeros, rather than only setting the length,
-    /// makes the file system allocate every block now: appends then overwrite allocated
-    /// blocks in place, and a data sync has no block allocation to record. It also replaces
-    /// whatever an earlier file of the same name left in those blocks.
-    fn initialise_segment(&mut self, first_seq: Seq) -> Result<(), Error> {
+    /// Creates the file for the segment after the current one, under its temporary name.
+    fn prepare(&mut self, first_seq: Seq) -> Result<Prepared<S::File>, Error> {
+        Ok(Prepared {
+            file: self
+                .storage
+                .create(&self.dir.join(prepared_name(first_seq)))?,
+            first_seq,
+            capacity: self.capacity,
+            filled: 0,
+        })
+    }
+
+    /// Writes zeros into the next segment for the records appended since the last piece,
+    /// twice as fast as records arrive, so it is ready long before it is needed.
+    fn prefill(&mut self, records: usize) -> Result<(), Error> {
+        if self.next.is_none() {
+            let first_seq = self.current().first_seq + u64::from(self.current().capacity);
+            self.next = Some(self.prepare(first_seq)?);
+        }
+        let next = self.next.as_mut().expect("a prepared segment");
+        let body = u64::from(next.capacity) * RECORD_SIZE as u64;
+        self.owed += 2 * (records * RECORD_SIZE) as u64;
+        while next.filled < body && (self.owed >= PIECE as u64 || self.owed >= body - next.filled) {
+            let n = (body - next.filled).min(PIECE as u64);
+            next.file
+                .write_at(HEADER_SIZE + next.filled, &ZEROS[..n as usize])?;
+            next.filled += n;
+            self.owed = self.owed.saturating_sub(n);
+        }
+        Ok(())
+    }
+
+    /// Makes the segment starting at `first_seq` the current one: finishes filling it with
+    /// zeros, writes its header, makes both durable, gives it its final name and makes that
+    /// durable, all before any record is written into it. Writing the zeros, rather than
+    /// only setting the length, makes the file system allocate every block: appends then
+    /// overwrite allocated blocks in place, and a data sync has no block allocation to
+    /// record. It also replaces whatever an earlier file of the same name left there.
+    fn start_segment(&mut self, first_seq: Seq) -> Result<(), Error> {
+        let mut next = match self.next.take() {
+            Some(next) if next.first_seq == first_seq => next,
+            _ => self.prepare(first_seq)?,
+        };
         let header = Header {
             first_seq,
             fingerprint: self.fingerprint,
-            capacity: self.capacity,
+            capacity: next.capacity,
             rules: self.rules,
         };
-        let zeros = vec![0; ZERO_FILL];
-        let len = header.file_len();
-        let mut offset = HEADER_SIZE;
-        while offset < len {
-            let n = (len - offset).min(ZERO_FILL as u64) as usize;
-            self.file.write_at(offset, &zeros[..n])?;
-            offset += n as u64;
+        let body = u64::from(next.capacity) * RECORD_SIZE as u64;
+        while next.filled < body {
+            let n = (body - next.filled).min(PIECE as u64);
+            next.file
+                .write_at(HEADER_SIZE + next.filled, &ZEROS[..n as usize])?;
+            next.filled += n;
         }
-        self.file.write_at(0, &header.encode())?;
-        self.file.sync()?;
+        next.file.write_at(0, &header.encode())?;
+        next.file.sync()?;
+        self.storage.rename(
+            &self.dir.join(prepared_name(first_seq)),
+            &self.dir.join(segment_name(first_seq)),
+        )?;
         self.storage.sync_dir(&self.dir)?;
+        self.file = next.file;
         self.segments.push(header);
         self.slot = 0;
+        self.owed = 0;
         Ok(())
     }
 
@@ -668,11 +734,7 @@ impl<S: Storage> Journal<S> {
     /// only once every record before it is on disk.
     fn roll(&mut self) -> Result<(), Error> {
         self.sync()?;
-        let first_seq = self.last_seq + 1;
-        self.file = self
-            .storage
-            .create(&self.dir.join(segment_name(first_seq)))?;
-        self.initialise_segment(first_seq)
+        self.start_segment(self.last_seq + 1)
     }
 
     fn current(&self) -> &Header {
@@ -704,6 +766,7 @@ impl<S: Storage> Journal<S> {
             self.slot += n as u32;
             self.last_seq += n as u64;
             rest = &rest[n..];
+            self.prefill(n)?;
         }
         Ok(self.last_seq)
     }

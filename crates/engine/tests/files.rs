@@ -50,19 +50,36 @@ fn small(book: BookConfig) -> EngineConfig {
 }
 
 #[test]
-fn leftover_temporary_snapshots_are_deleted() {
-    let (book, commands) = common::flow(20, 30);
+fn leftover_temporary_files_are_deleted() {
+    let (book, commands) = common::flow(20, 35);
+    let digests = common::digests(book, &commands);
     let storage = SimStorage::new();
-    run(&storage, small(book), &commands);
+    run(&storage, small(book), &commands[..30]);
+    // The next segment is being prepared under a temporary name.
+    let prepared = Path::new(DIR).join("journal-00000000000000000031.next");
+    assert!(storage.files().iter().any(|(path, _)| *path == prepared));
+    storage.flip_bit(&prepared, 3);
     let mut fs = storage.clone();
     let partial = Path::new(DIR).join("snapshot-00000000000000000030.tmp");
     fs.create(&partial)
         .unwrap()
         .write_at(0, b"half a snapshot")
         .unwrap();
-    let (engine, _) = open(&storage, small(book)).unwrap();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
     assert_eq!(engine.last_seq(), 30);
-    assert!(storage.files().iter().all(|(path, _)| *path != partial));
+    assert!(
+        storage
+            .files()
+            .iter()
+            .all(|(path, _)| *path != partial && *path != prepared)
+    );
+    // The segment the prepared file was for starts afresh.
+    let mut events = Vec::new();
+    engine.submit_batch(&commands[30..], &mut events).unwrap();
+    assert!(storage.files().iter().any(|(path, _)| *path == segment(31)));
+    drop(engine);
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.book().digest(), digests[35]);
 }
 
 #[test]

@@ -56,8 +56,10 @@ fn a_reopened_engine_continues_where_it_stopped() {
     assert_eq!(engine.book().digest(), digests[1_234]);
     submit_all(&mut engine, &commands[1_234..]);
     assert_eq!(engine.book().digest(), digests[2_000]);
-    // Seven segments of 300 hold 2,000 records.
-    assert_eq!(file_names(&storage).len(), 7);
+    // Seven segments of 300 hold 2,000 records, and the eighth is being prepared.
+    let names = file_names(&storage);
+    assert_eq!(names.iter().filter(|n| n.ends_with(".log")).count(), 7);
+    assert_eq!(names.iter().filter(|n| n.ends_with(".next")).count(), 1);
 }
 
 #[test]

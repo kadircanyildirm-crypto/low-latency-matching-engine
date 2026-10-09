@@ -3,8 +3,8 @@
 //!
 //! - Nothing panics.
 //! - Nothing goes to a session after it was closed.
-//! - Every report about an order goes to the session of the account that placed it, and
-//!   only logged-in sessions get reports.
+//! - All reports about an order go to sessions of one account, the one that owns it on the
+//!   book, and only logged-in sessions get reports.
 //! - After every flush, each account's open-order count matches its orders on the book,
 //!   and the open-order limit holds.
 
@@ -312,16 +312,24 @@ fuzz_target!(|steps: Vec<Step>| {
                     logged[session] = Some(account);
                 }
                 Outbound::Report(report) => {
-                    let account = logged[session];
-                    assert!(account.is_some());
+                    let account = logged[session].expect("a logged-in session");
                     match report.kind {
                         ReportKind::Accepted => {
-                            owners.insert(report.order_id, account.unwrap());
+                            assert_eq!(owners.insert(report.order_id, account), None);
                         }
                         ReportKind::MassCancelled { .. }
                         | ReportKind::PhaseChanged(_)
                         | ReportKind::Rejected(_) => {}
-                        _ => assert_eq!(owners.get(&report.order_id).copied(), account),
+                        _ => {
+                            // All of an order's reports go to one account. The first may
+                            // come later than the acceptance, which a session being closed
+                            // was not sent.
+                            let owner = *owners.entry(report.order_id).or_insert(account);
+                            assert_eq!(owner, account);
+                            if let Some(order) = exchange.book().order(report.order_id) {
+                                assert_eq!(order.owner, account);
+                            }
+                        }
                     }
                 }
                 _ => {}

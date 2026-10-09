@@ -1007,3 +1007,45 @@ proptest! {
         exchange.book().validate().unwrap();
     }
 }
+
+/// A session being closed is sent nothing more, not even the acceptance of an order it
+/// placed; the account's next session hears what becomes of the order.
+#[test]
+fn a_closing_sessions_orders_are_reported_to_the_next_session() {
+    let mut exchange = exchange(&[account(1)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    exchange.receive(0, limit(7, Side::Buy, 10, 1), 1, &mut mail);
+    exchange.receive(0, Inbound::Logout, 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let reason = LogoutReason::Requested;
+    assert_eq!(mail.take(0), [Outbound::Logout { reason }]);
+    // The connection lingers while it reads its logout; the account stays logged in.
+    exchange.connect(1, 2);
+    exchange.receive(1, login(1), 2, &mut mail);
+    let reason = LoginError::AlreadyLoggedIn;
+    assert_eq!(mail.take(1), [Outbound::LoginRejected { reason }]);
+    exchange.disconnect(1);
+    exchange.disconnect(0);
+    logged_in(&mut exchange, 1, 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let kinds: Vec<(u64, u64, ReportKind)> = mail
+        .reports(1)
+        .into_iter()
+        .map(|r| (r.order_id, r.client_ref, r.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (
+                1,
+                7,
+                ReportKind::Cancelled {
+                    qty: 1,
+                    reason: CancelReason::MassCancel
+                }
+            ),
+            (0, 0, ReportKind::MassCancelled { count: 1 }),
+        ]
+    );
+}

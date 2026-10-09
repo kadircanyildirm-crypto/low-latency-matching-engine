@@ -1180,7 +1180,8 @@ impl Exchange {
             Event::Rejected { id, reason } => {
                 // Only a command's sender learns why it was refused: a cancel naming
                 // someone else's order must not reach that order's owner.
-                let placed = command.places && id == seq;
+                let placed = command.places;
+                debug_assert!(!placed || id == seq, "a new order's refusal names it");
                 let client_ref = match self.live.get(&id) {
                     Some(live) if placed => live.client_ref,
                     _ => 0,

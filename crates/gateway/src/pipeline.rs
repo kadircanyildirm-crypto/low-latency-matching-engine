@@ -185,17 +185,14 @@ where
         self.shared.durable.load(Ordering::Acquire)
     }
 
-    /// Why a thread stopped, from its result.
+    /// Why a thread stopped: the writer's failure, which stops the matcher too, or else a
+    /// panic in the book, which poisons the matcher.
     fn failure(&mut self) -> Error {
-        // The writer's failure comes first: the matcher stops because of it.
-        let writer = self.writer.take().map(join);
-        if let Some(Err(error)) = writer {
+        if let Some(Err(error)) = self.writer.take().map(join) {
             return error;
         }
-        match self.matcher.take().map(join) {
-            Some(Err(error)) => error,
-            _ => Error::Poisoned,
-        }
+        drop(self.matcher.take().map(join));
+        Error::Poisoned
     }
 }
 

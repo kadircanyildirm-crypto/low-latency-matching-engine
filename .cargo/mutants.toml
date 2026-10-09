@@ -14,8 +14,19 @@
 # what spares the ring's shared cache lines: a consumer that rereads the producer's
 # position when its cached copy would do, and a producer that publishes an unchanged one,
 # get every result right, only slower.
+#
+# The pipeline's waits change only how long they take: the writer pausing when the
+# matcher's ring is full, stop draining events while the matcher finishes, the writer
+# removing freed segments only when there are some. Pinning a thread to a core changes
+# only where it runs. A full ring making the server stop reading changes only how much
+# waits in memory, never a reply.
 exclude_re = [
     "\\bproofs::",
+    "\\bpin\\b",
+    "replace == with != in write_all",
+    "replace == with != in Pipeline<S>::stop",
+    "replace > with >= in serve",
+    "Core for Pipeline<S>>::backed_up",
     "\\bBackoff::(snooze|reset)\\b",
     "replace > with >= in Producer<T>::push_from",
     "replace > with < in Consumer<T>::available",

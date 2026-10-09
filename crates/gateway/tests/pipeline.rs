@@ -143,13 +143,15 @@ fn login(exchange: &mut Exchange, session: SessionId, mail: &mut Mail) {
 }
 
 /// Plays `steps` against `exchange`, with `flush` handing each batch to the engine and
-/// waiting for its replies.
+/// waiting for its replies. Returns how many messages had been sent at each flush: a reply
+/// that came a round late would move it.
 fn play(
     steps: &[Step],
     exchange: &mut Exchange,
     mail: &mut Mail,
     mut flush: impl FnMut(&mut Exchange, &mut Mail),
-) {
+) -> Vec<usize> {
+    let mut rounds = Vec::new();
     for session in 0..SESSIONS {
         login(exchange, session, mail);
     }
@@ -160,10 +162,15 @@ fn play(
                 exchange.disconnect(*session);
                 login(exchange, *session, mail);
             }
-            Step::Flush => flush(exchange, mail),
+            Step::Flush => {
+                flush(exchange, mail);
+                rounds.push(mail.0.len());
+            }
         }
     }
     flush(exchange, mail);
+    rounds.push(mail.0.len());
+    rounds
 }
 
 /// Turns the pipeline until every command handed over has been applied and its events
@@ -193,7 +200,9 @@ fn the_pipeline_replies_as_the_engine_does() {
             } else {
                 SyncPolicy::Os
             },
-            segment_capacity: 16,
+            // Small segments roll, and sync, often; with large ones, a snapshot under
+            // SyncPolicy::Os has to ask the writer for its sync.
+            segment_capacity: if seed % 4 < 2 { 16 } else { 4_096 },
             snapshot_every: Some(40),
             keep_snapshots: 2,
             ..EngineConfig::new(book())
@@ -210,10 +219,11 @@ fn the_pipeline_replies_as_the_engine_does() {
         )
         .unwrap();
         let mut direct = Mail::default();
-        play(&steps, &mut exchange, &mut direct, |exchange, mail| {
+        let direct_rounds = play(&steps, &mut exchange, &mut direct, |exchange, mail| {
             exchange.flush(&mut engine, mail).unwrap();
             exchange.publish(mail);
         });
+        assert_eq!(exchange.last_seq(), engine.last_seq());
 
         // The pipeline.
         let storage = SimStorage::new();
@@ -236,7 +246,7 @@ fn the_pipeline_replies_as_the_engine_does() {
         };
         let mut pipeline = Pipeline::start(engine_b, pipeline_config).unwrap();
         let mut piped = Mail::default();
-        play(&steps, &mut exchange, &mut piped, |exchange, mail| {
+        let piped_rounds = play(&steps, &mut exchange, &mut piped, |exchange, mail| {
             settle(&mut pipeline, exchange, mail);
             exchange.publish(mail);
         });
@@ -249,7 +259,18 @@ fn the_pipeline_replies_as_the_engine_does() {
                 &direct.0[at.saturating_sub(3)..(at + 3).min(direct.0.len())]
             );
         }
+        assert_eq!(piped_rounds, direct_rounds, "seed {seed}");
         assert_eq!(pipeline.applied(), engine.last_seq());
+        if config.sync == SyncPolicy::Always {
+            assert_eq!(pipeline.durable(), engine.last_seq());
+        }
+        // The depth kept for market data is the book's.
+        let kept: Vec<_> = exchange.depth().levels(Side::Buy).collect();
+        let book: Vec<_> = engine.book().depth(Side::Buy).map(|l| l.price).collect();
+        assert_eq!(
+            kept.iter().map(|&(price, _)| price).collect::<Vec<_>>(),
+            book
+        );
 
         // What the pipeline journaled recovers to the engine's book, and its snapshots
         // and retention left the files a whole engine would have.
@@ -410,4 +431,45 @@ fn a_power_failure_loses_nothing_reported() {
             recovered.last_seq()
         );
     }
+}
+
+/// Stopping a pipeline whose rings are full of events nobody read still ends it: stop
+/// drains the events while the matcher finishes.
+#[test]
+fn a_pipeline_stops_with_events_unread() {
+    let config = EngineConfig::new(book());
+    let engine = open(&SimStorage::new(), config);
+    let mut exchange = Exchange::new(
+        engine.book(),
+        engine.last_seq(),
+        &accounts(),
+        Timing::default(),
+    )
+    .unwrap();
+    let pipeline_config = PipelineConfig {
+        capacity: 1,
+        ..PipelineConfig::default()
+    };
+    let mut pipeline = Pipeline::start(engine, pipeline_config).unwrap();
+    let mut mail = Mail::default();
+    login(&mut exchange, 0, &mut mail);
+    for client_ref in 0..50 {
+        let order = Inbound::NewOrder(NewOrder {
+            client_ref,
+            side: Side::Buy,
+            qty: 1,
+            kind: OrderKind::Limit {
+                price: 90 + client_ref as i64 % 10,
+                tif: TimeInForce::Gtc,
+                display: None,
+            },
+        });
+        exchange.receive(0, order, 0, &mut mail);
+    }
+    // One turn hands a ring's worth over and finds no events yet; the matcher then fills
+    // its ring with the first order's events and waits for room.
+    pipeline.turn(&mut exchange, &mut mail).unwrap();
+    let (writer, matcher) = pipeline.stop().unwrap();
+    assert!(matcher.last_seq() >= 1);
+    drop(writer);
 }

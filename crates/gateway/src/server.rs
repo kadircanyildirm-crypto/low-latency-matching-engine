@@ -9,6 +9,10 @@
 //!
 //! Stopping the server leaves the orders on the book, as a crash would: the next start
 //! finds them.
+//!
+//! A second listener, if the server has one, serves browsers: HTTP for the exchange's page,
+//! and sessions over WebSocket that speak JSON ([`web`](crate::web)). A browser's session
+//! is a session like any other.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -23,6 +27,8 @@ use mio::{Events, Interest, Poll, Token};
 use protocol::{LogoutReason, Outbound, decode_inbound, encode_outbound};
 
 use crate::exchange::{Exchange, Mailbox, SessionId};
+use crate::web::json::{self, WebIn};
+use crate::web::{self, Guests, http, ws};
 
 /// Limits of the network layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,8 +118,19 @@ impl<S: Storage> Core for Engine<S> {
     }
 }
 
-/// The listener's token; a connection's is its session id plus one.
+/// The binary listener's token, and the web listener's; a connection's is its session id
+/// plus two.
 const LISTENER: Token = Token(0);
+const WEB_LISTENER: Token = Token(1);
+
+/// The longest HTTP request a browser may send, headers and all.
+const MAX_REQUEST: usize = 8 << 10;
+
+/// The longest WebSocket message a browser may send.
+const MAX_WEB_MESSAGE: usize = 4 << 10;
+
+/// How long a browser has to send its HTTP request.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bytes read from a socket at a time.
 const READ_CHUNK: usize = 64 << 10;
@@ -122,8 +139,20 @@ const READ_CHUNK: usize = 64 << 10;
 /// otherwise keep the loop reading it, and its commands would fill one huge batch.
 const READ_BUDGET: usize = 16;
 
+/// What a connection speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The binary protocol.
+    Binary,
+    /// HTTP, until it asks for a file or upgrades; accepted at `since`.
+    Http { since: u64 },
+    /// JSON over WebSocket; `registered` once it has created an account.
+    WebSocket { registered: bool },
+}
+
 struct Connection {
     stream: TcpStream,
+    kind: Kind,
     /// Bytes received but not yet decoded: at most one partial message.
     input: Vec<u8>,
     /// Encoded replies not yet written.
@@ -153,7 +182,13 @@ impl Mailbox for Wires {
         if connection.slow || connection.dead {
             return;
         }
-        encode_outbound(&message, &mut connection.output);
+        match connection.kind {
+            Kind::Binary => encode_outbound(&message, &mut connection.output),
+            Kind::WebSocket { .. } => {
+                ws::encode_text(&json::outbound(&message), &mut connection.output);
+            }
+            Kind::Http { .. } => return,
+        }
         if connection.output.len() > self.max_output {
             connection.slow = true;
         }
@@ -161,6 +196,9 @@ impl Mailbox for Wires {
 
     fn close(&mut self, session: SessionId) {
         if let Some(connection) = self.slots.get_mut(session).and_then(Option::as_mut) {
+            if matches!(connection.kind, Kind::WebSocket { .. }) && !connection.closing {
+                ws::encode_close(&mut connection.output);
+            }
             connection.closing = true;
         }
     }
@@ -174,6 +212,9 @@ pub struct Server<C: Core> {
     poll: Poll,
     events: Events,
     listener: TcpListener,
+    /// The listener for browsers, and where their accounts come from.
+    web: Option<TcpListener>,
+    guests: Option<Guests>,
     wires: Wires,
     /// Slots of closed connections, to reuse.
     free: Vec<SessionId>,
@@ -205,6 +246,8 @@ impl<C: Core> Server<C> {
             poll,
             events: Events::with_capacity(1_024),
             listener,
+            web: None,
+            guests: None,
             wires: Wires {
                 slots: Vec::new(),
                 max_output: config.max_output,
@@ -222,6 +265,24 @@ impl<C: Core> Server<C> {
     /// for port 0.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Also serves browsers on `addr`: the exchange's page, and sessions over WebSocket.
+    /// Visitors may create accounts from `guests`; without it, they log in to accounts that
+    /// exist.
+    pub fn serve_web(&mut self, addr: SocketAddr, guests: Option<Guests>) -> io::Result<()> {
+        let mut listener = TcpListener::bind(addr)?;
+        self.poll
+            .registry()
+            .register(&mut listener, WEB_LISTENER, Interest::READABLE)?;
+        self.web = Some(listener);
+        self.guests = guests;
+        Ok(())
+    }
+
+    /// The address the web listener listens on, if there is one.
+    pub fn web_addr(&self) -> Option<io::Result<SocketAddr>> {
+        self.web.as_ref().map(TcpListener::local_addr)
     }
 
     /// The exchange.
@@ -270,15 +331,19 @@ impl<C: Core> Server<C> {
         let now = self.now();
         self.ready.clear();
         self.ready.append(&mut self.unread);
-        let mut accept = false;
+        let (mut accept, mut accept_web) = (false, false);
         for event in &self.events {
             match event.token() {
                 LISTENER => accept = true,
-                Token(token) => self.ready.push(token - 1),
+                WEB_LISTENER => accept_web = true,
+                Token(token) => self.ready.push(token - 2),
             }
         }
         if accept {
-            self.accept(now);
+            self.accept(now, false);
+        }
+        if accept_web {
+            self.accept(now, true);
         }
         // A connection both left unread and ready again is read once.
         self.ready.sort_unstable();
@@ -307,9 +372,14 @@ impl<C: Core> Server<C> {
         u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn accept(&mut self, now: u64) {
+    fn accept(&mut self, now: u64, web: bool) {
         loop {
-            let mut stream = match self.listener.accept() {
+            let listener = match (web, &self.web) {
+                (false, _) => &self.listener,
+                (true, Some(listener)) => listener,
+                (true, None) => return,
+            };
+            let mut stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 // Would block, or a connection that failed before it was accepted, or out
@@ -328,14 +398,22 @@ impl<C: Core> Server<C> {
             let registered = stream.set_nodelay(true).and_then(|()| {
                 self.poll
                     .registry()
-                    .register(&mut stream, Token(session + 1), Interest::READABLE)
+                    .register(&mut stream, Token(session + 2), Interest::READABLE)
             });
             if registered.is_err() {
                 self.free.push(session);
                 continue;
             }
+            // A browser's session starts once its connection is upgraded to a WebSocket.
+            let kind = if web {
+                Kind::Http { since: now }
+            } else {
+                self.exchange.connect(session, now);
+                Kind::Binary
+            };
             self.wires.slots[session] = Some(Connection {
                 stream,
+                kind,
                 input: Vec::new(),
                 output: Vec::new(),
                 writing: false,
@@ -344,7 +422,6 @@ impl<C: Core> Server<C> {
                 closing: false,
                 closed_at: None,
             });
-            self.exchange.connect(session, now);
         }
     }
 
@@ -384,37 +461,165 @@ impl<C: Core> Server<C> {
             }
             let mut input = std::mem::take(&mut connection.input);
             input.extend_from_slice(&self.scratch[..read]);
-            let mut at = 0;
-            loop {
-                match decode_inbound(&input[at..]) {
-                    Ok(Some((message, len))) => {
-                        at += len;
-                        self.exchange
-                            .receive(session, message, now, &mut self.wires);
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        let reason = LogoutReason::ProtocolError;
-                        self.exchange.end(session, reason, &mut self.wires);
-                        at = input.len();
-                        break;
-                    }
-                }
-            }
-            input.drain(..at);
+            let used = self.consume(session, &input, now);
+            input.drain(..used);
             if let Some(connection) = self.wires.slots[session].as_mut() {
                 connection.input = input;
             }
         }
     }
 
+    /// Handles the complete messages at the start of `input`, in whatever the connection
+    /// speaks, and returns how many bytes they took. Bytes that cannot be read end the
+    /// session, and count as taken.
+    fn consume(&mut self, session: SessionId, input: &[u8], now: u64) -> usize {
+        let mut at = 0;
+        while at < input.len() {
+            let Some(connection) = self.wires.slots[session].as_mut() else {
+                return input.len();
+            };
+            if connection.closing {
+                return input.len();
+            }
+            let rest = &input[at..];
+            match connection.kind {
+                Kind::Binary => match decode_inbound(rest) {
+                    Ok(Some((message, len))) => {
+                        at += len;
+                        self.exchange
+                            .receive(session, message, now, &mut self.wires);
+                    }
+                    Ok(None) => return at,
+                    Err(_) => {
+                        let reason = LogoutReason::ProtocolError;
+                        self.exchange.end(session, reason, &mut self.wires);
+                        return input.len();
+                    }
+                },
+                Kind::Http { .. } => match http::parse(rest, MAX_REQUEST) {
+                    Ok(None) => return at,
+                    Ok(Some((http::Request::Upgrade { key }, len))) => {
+                        at += len;
+                        connection
+                            .output
+                            .extend_from_slice(&http::upgrade_response(&key));
+                        connection.kind = Kind::WebSocket { registered: false };
+                        self.exchange.connect(session, now);
+                    }
+                    Ok(Some((http::Request::Get { path }, _))) => {
+                        let response = match web::page(&path) {
+                            Some((content_type, body)) => {
+                                http::response("200 OK", content_type, body)
+                            }
+                            None => http::response("404 Not Found", "text/plain", b"not found"),
+                        };
+                        connection.output.extend_from_slice(&response);
+                        connection.closing = true;
+                        return input.len();
+                    }
+                    Err(error) => {
+                        let body = error.to_string();
+                        let response =
+                            http::response("400 Bad Request", "text/plain", body.as_bytes());
+                        connection.output.extend_from_slice(&response);
+                        connection.closing = true;
+                        return input.len();
+                    }
+                },
+                Kind::WebSocket { .. } => match ws::decode(rest, MAX_WEB_MESSAGE) {
+                    Ok(None) => return at,
+                    Ok(Some((frame, len))) => {
+                        at += len;
+                        match frame {
+                            ws::Frame::Text(text) => self.web_message(session, &text, now),
+                            ws::Frame::Ping(payload) => {
+                                ws::encode_pong(&payload, &mut connection.output);
+                            }
+                            ws::Frame::Pong => {}
+                            // The browser is leaving: what it had is cancelled as it goes.
+                            ws::Frame::Close => {
+                                connection.dead = true;
+                                return input.len();
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let reason = LogoutReason::ProtocolError;
+                        self.exchange.end(session, reason, &mut self.wires);
+                        return input.len();
+                    }
+                },
+            }
+        }
+        at
+    }
+
+    /// A browser's JSON message.
+    fn web_message(&mut self, session: SessionId, text: &str, now: u64) {
+        let message = match json::parse(text) {
+            Ok(WebIn::Register) => return self.register(session),
+            Ok(message) => message,
+            Err(error) => {
+                self.send_web(session, &json::error(&error.to_string()));
+                let reason = LogoutReason::ProtocolError;
+                return self.exchange.end(session, reason, &mut self.wires);
+            }
+        };
+        match message.inbound() {
+            Some(inbound) => self
+                .exchange
+                .receive(session, inbound, now, &mut self.wires),
+            None => {
+                self.send_web(session, &json::error("a token is 16 hexadecimal digits"));
+                let reason = LogoutReason::ProtocolError;
+                self.exchange.end(session, reason, &mut self.wires);
+            }
+        }
+    }
+
+    /// Creates an account for the browser on `session`: one per connection.
+    fn register(&mut self, session: SessionId) {
+        let registered = self.wires.slots[session]
+            .as_ref()
+            .is_some_and(|c| c.kind == Kind::WebSocket { registered: true });
+        let reply = match (&mut self.guests, registered) {
+            (_, true) => json::error("one account per connection"),
+            (None, _) => json::error("registration is closed"),
+            (Some(guests), false) => match guests.create(&mut self.exchange) {
+                Ok(Some(account)) => {
+                    if let Some(connection) = self.wires.slots[session].as_mut() {
+                        connection.kind = Kind::WebSocket { registered: true };
+                    }
+                    json::registered(account.id, account.token)
+                }
+                Ok(None) => json::error("no accounts are left"),
+                Err(_) => json::error("the account could not be saved"),
+            },
+        };
+        self.send_web(session, &reply);
+    }
+
+    /// Sends a browser a message the exchange does not know of.
+    fn send_web(&mut self, session: SessionId, text: &str) {
+        if let Some(connection) = self.wires.slots[session].as_mut() {
+            ws::encode_text(text, &mut connection.output);
+        }
+    }
+
     /// Writes the replies, and drops the connections that are done.
     fn write(&mut self, now: u64) {
         let linger = self.config.linger.as_nanos() as u64;
+        let http_timeout = HTTP_TIMEOUT.as_nanos() as u64;
         for session in 0..self.wires.slots.len() {
             let Some(connection) = self.wires.slots[session].as_mut() else {
                 continue;
             };
+            // A browser that does not finish its request in time is dropped.
+            if let Kind::Http { since } = connection.kind {
+                if !connection.closing && now.saturating_sub(since) >= http_timeout {
+                    connection.dead = true;
+                }
+            }
             if !connection.dead && !connection.slow && flush(connection).is_err() {
                 connection.dead = true;
             }
@@ -439,7 +644,7 @@ impl<C: Core> Server<C> {
                 } else {
                     Interest::READABLE
                 };
-                let token = Token(session + 1);
+                let token = Token(session + 2);
                 if self
                     .poll
                     .registry()

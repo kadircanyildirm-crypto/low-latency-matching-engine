@@ -68,6 +68,8 @@ pub enum SetupError {
     /// The recovered book holds an order whose id is above the journal's last sequence
     /// number: it was not placed through a gateway, and a new order could get its id.
     ForeignOrder(OrderId),
+    /// An account with this id exists already.
+    AccountExists(u32),
 }
 
 impl fmt::Display for SetupError {
@@ -80,6 +82,7 @@ impl fmt::Display for SetupError {
                 f,
                 "the book holds order {id}, above the journal's last sequence number"
             ),
+            SetupError::AccountExists(id) => write!(f, "account {id} exists already"),
         }
     }
 }
@@ -242,6 +245,28 @@ impl Exchange {
     /// batch.
     pub fn last_seq(&self) -> Seq {
         self.last_seq
+    }
+
+    /// Adds an account while the exchange runs, such as a visitor's paper-trading account.
+    pub fn add_account(&mut self, account: Account) -> Result<(), SetupError> {
+        let state = self
+            .accounts
+            .get_mut(account.id as usize)
+            .ok_or(SetupError::AccountOutOfRange(account.id))?;
+        if state.is_some() {
+            return Err(SetupError::AccountExists(account.id));
+        }
+        *state = Some(AccountState {
+            account,
+            session: None,
+            open: 0,
+        });
+        Ok(())
+    }
+
+    /// Whether an account with id `id` exists.
+    pub fn has_account(&self, id: u32) -> bool {
+        self.accounts.get(id as usize).is_some_and(Option::is_some)
     }
 
     /// The orders and pending stops `account` has, counting those waiting in the batch.

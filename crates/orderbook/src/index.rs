@@ -99,9 +99,15 @@ impl IdIndex {
     }
 
     /// Line and way of `id`, if it is in the index.
+    ///
+    /// The walk also ends where it started. Every line could have a non-zero `passed`
+    /// count at once: displaced entries left behind by different bursts of colliding ids
+    /// can together span the whole table, even though the table is never more than half
+    /// full. Without that stop, looking up an absent id would then never end.
     #[inline]
     fn find(&self, id: OrderId) -> Option<(usize, usize)> {
-        let mut l = self.home(id);
+        let home = self.home(id);
+        let mut l = home;
         loop {
             let line = &self.lines[l];
             if let Some(way) = line.way_of(id) {
@@ -111,6 +117,9 @@ impl IdIndex {
                 return None;
             }
             l = (l + 1) & self.mask;
+            if l == home {
+                return None;
+            }
         }
     }
 
@@ -243,6 +252,18 @@ mod tests {
             assert_eq!(index.lines.len(), lines, "capacity {capacity}");
             assert_eq!(index.mask, lines - 1);
         }
+    }
+
+    /// A lookup of an absent id ends even when every line has been passed, a state that
+    /// churn of colliding ids can reach.
+    #[test]
+    fn lookups_end_when_every_line_has_been_passed() {
+        let mut index = IdIndex::with_capacity(16);
+        index.insert(7, 3);
+        index.lines.iter_mut().for_each(|line| line.passed += 1);
+        assert_eq!(index.get(&8), None);
+        assert!(!index.contains_key(&9));
+        assert_eq!(index.get(&7), Some(&3));
     }
 
     /// Four consecutive ids share a line, and sequential ids spread out so evenly that a

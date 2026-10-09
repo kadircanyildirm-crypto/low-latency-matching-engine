@@ -237,10 +237,33 @@ mod tests {
                     }
                 }
                 prop_assert_eq!(index.len(), model.len());
+                prop_assert_eq!(index.passed_counts(), index.recount_passed());
             }
             for (id, slot) in &model {
                 prop_assert_eq!(index.get(id), Some(slot));
             }
+        }
+    }
+
+    impl IdIndex {
+        fn passed_counts(&self) -> Vec<u32> {
+            self.lines.iter().map(|line| line.passed).collect()
+        }
+
+        /// What every line's `passed` count must be: the entries stored beyond it whose
+        /// home is this line or one before it, on their way from home.
+        fn recount_passed(&self) -> Vec<u32> {
+            let mut counts = vec![0; self.lines.len()];
+            for (at, line) in self.lines.iter().enumerate() {
+                for way in (0..WAYS).filter(|&way| line.slots[way] != NIL) {
+                    let mut l = self.home(line.ids[way]);
+                    while l != at {
+                        counts[l] += 1;
+                        l = (l + 1) & self.mask;
+                    }
+                }
+            }
+            counts
         }
     }
 

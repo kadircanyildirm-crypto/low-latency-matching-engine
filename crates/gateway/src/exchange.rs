@@ -26,6 +26,7 @@ use protocol::{
     Inbound, LevelUpdate, LoginError, LogoutReason, NewOrder, OrderKind, Outbound, RejectCode,
     Report, ReportKind, TradeTick, VERSION,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::accounts::Account;
 use crate::wallet::Wallet;
@@ -89,6 +90,57 @@ impl fmt::Display for SetupError {
 }
 
 impl std::error::Error for SetupError {}
+
+/// What the exchange knows that the book does not, as of a sequence number: the money of
+/// paper-trading accounts, and every open order's account and client reference. Saved now
+/// and then, it lets a restart rebuild the exchange from the journal after it
+/// ([`recovery`](crate::recovery)), as a snapshot lets the engine rebuild the book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// The sequence number of the last command it reflects.
+    pub seq: Seq,
+    /// Paper-trading accounts' cash and positions; what their orders hold follows from the
+    /// orders.
+    pub wallets: Vec<SavedWallet>,
+    /// The orders and pending stops on the book.
+    pub orders: Vec<SavedOrder>,
+}
+
+/// A paper-trading account's cash and position, in a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWallet {
+    /// The account.
+    pub account: u32,
+    /// Its cash.
+    pub cash: i64,
+    /// Its position.
+    pub position: i64,
+}
+
+/// An open order, in a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedOrder {
+    /// Its id.
+    pub id: OrderId,
+    /// Its account.
+    pub account: u32,
+    /// The client's reference for it.
+    pub client_ref: u64,
+    /// Whether it buys.
+    pub buy: bool,
+    /// Its limit price, if it has one.
+    pub price: Option<Price>,
+    /// Its open quantity.
+    pub leaves: Qty,
+}
+
+/// Drops what it is sent: the mailbox of a recovery, when nobody is logged in.
+struct Nobody;
+
+impl Mailbox for Nobody {
+    fn send(&mut self, _: SessionId, _: Outbound) {}
+    fn close(&mut self, _: SessionId) {}
+}
 
 /// One message in a token bucket.
 const TOKEN: u128 = 1_000_000_000;
@@ -207,14 +259,7 @@ impl Exchange {
         accounts: &[Account],
         timing: Timing,
     ) -> Result<Exchange, SetupError> {
-        let max_owners = book.config().max_owners;
-        let mut states: Vec<Option<AccountState>> = (0..max_owners).map(|_| None).collect();
-        for account in accounts {
-            let state = states
-                .get_mut(account.id as usize)
-                .ok_or(SetupError::AccountOutOfRange(account.id))?;
-            *state = Some(AccountState::new(*account));
-        }
+        let mut exchange = Exchange::empty(book.config().max_owners, last_seq, accounts, timing)?;
         let mut live = HashMap::new();
         for side in [Side::Buy, Side::Sell] {
             for level in book.depth(side) {
@@ -229,22 +274,6 @@ impl Exchange {
                 live.insert(stop.id, (stop.owner, side, stop.limit, stop.qty));
             }
         }
-        let mut exchange = Exchange {
-            timing,
-            accounts: states,
-            sessions: Vec::new(),
-            live: HashMap::with_capacity(live.len()),
-            batch: Vec::new(),
-            in_flight: VecDeque::new(),
-            last_seq,
-            now: 0,
-            depth: Depth::of(book),
-            trades: Vec::new(),
-            delivered: last_seq,
-            published: last_seq,
-            updates: Vec::new(),
-            changed_wallets: Vec::new(),
-        };
         for (id, (account, side, price, leaves)) in live {
             if id > last_seq {
                 return Err(SetupError::ForeignOrder(id));
@@ -252,8 +281,41 @@ impl Exchange {
             exchange.place(id, account, 0, side, price, 0);
             exchange.set_leaves(id, leaves);
         }
+        exchange.depth = Depth::of(book);
         exchange.changed_wallets.clear();
         Ok(exchange)
+    }
+
+    /// An exchange for `accounts` with no orders, after the command `last_seq`.
+    fn empty(
+        max_owners: u32,
+        last_seq: Seq,
+        accounts: &[Account],
+        timing: Timing,
+    ) -> Result<Exchange, SetupError> {
+        let mut states: Vec<Option<AccountState>> = (0..max_owners).map(|_| None).collect();
+        for account in accounts {
+            let state = states
+                .get_mut(account.id as usize)
+                .ok_or(SetupError::AccountOutOfRange(account.id))?;
+            *state = Some(AccountState::new(*account));
+        }
+        Ok(Exchange {
+            timing,
+            accounts: states,
+            sessions: Vec::new(),
+            live: HashMap::new(),
+            batch: Vec::new(),
+            in_flight: VecDeque::new(),
+            last_seq,
+            now: 0,
+            depth: Depth::new(),
+            trades: Vec::new(),
+            delivered: last_seq,
+            published: last_seq,
+            updates: Vec::new(),
+            changed_wallets: Vec::new(),
+        })
     }
 
     /// The sequence number of the last command numbered: handed over, or still in the
@@ -278,6 +340,188 @@ impl Exchange {
     /// A paper-trading account's wallet.
     pub fn wallet(&self, account: u32) -> Option<Wallet> {
         self.accounts.get(account as usize)?.as_ref()?.wallet
+    }
+
+    /// The exchange's state, if every command numbered has had all its events delivered:
+    /// the caller knows, since it hands the batches over and delivers the events.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        if !self.batch.is_empty() || self.delivered != self.last_seq {
+            return None;
+        }
+        let wallets = self
+            .accounts
+            .iter()
+            .flatten()
+            .filter_map(|state| {
+                let wallet = state.wallet?;
+                Some(SavedWallet {
+                    account: state.account.id,
+                    cash: wallet.cash,
+                    position: wallet.position,
+                })
+            })
+            .collect();
+        let mut orders: Vec<SavedOrder> = self
+            .live
+            .iter()
+            .map(|(&id, live)| SavedOrder {
+                id,
+                account: live.account,
+                client_ref: live.client_ref,
+                buy: live.side == Side::Buy,
+                price: live.price,
+                leaves: live.leaves,
+            })
+            .collect();
+        orders.sort_unstable_by_key(|order| order.id);
+        Some(Checkpoint {
+            seq: self.last_seq,
+            wallets,
+            orders,
+        })
+    }
+
+    /// The exchange as `checkpoint` saved it, for `accounts`, in front of a book configured
+    /// as `book`. The commands and events after it follow through
+    /// [`replay_command`](Self::replay_command) and [`replay_event`](Self::replay_event),
+    /// and [`finish`](Self::finish) ends the recovery.
+    pub fn restore(
+        checkpoint: &Checkpoint,
+        book: &orderbook::BookConfig,
+        accounts: &[Account],
+        timing: Timing,
+    ) -> Result<Exchange, SetupError> {
+        let mut exchange = Exchange::empty(book.max_owners, checkpoint.seq, accounts, timing)?;
+        for saved in &checkpoint.wallets {
+            if let Some(wallet) = exchange
+                .accounts
+                .get_mut(saved.account as usize)
+                .and_then(Option::as_mut)
+                .and_then(|state| state.wallet.as_mut())
+            {
+                wallet.cash = saved.cash;
+                wallet.position = saved.position;
+            }
+        }
+        for order in &checkpoint.orders {
+            if order.id > checkpoint.seq {
+                return Err(SetupError::ForeignOrder(order.id));
+            }
+            let side = if order.buy { Side::Buy } else { Side::Sell };
+            exchange.place(
+                order.id,
+                order.account,
+                order.client_ref,
+                side,
+                order.price,
+                0,
+            );
+            exchange.set_leaves(order.id, order.leaves);
+        }
+        Ok(exchange)
+    }
+
+    /// A command after the checkpoint, as recovery replays it: numbered and tracked as if
+    /// it had just been handed over. Its client reference was not journaled, and is lost.
+    ///
+    /// # Panics
+    ///
+    /// If `seq` does not follow the last command.
+    pub fn replay_command(&mut self, seq: Seq, command: Command) {
+        assert_eq!(seq, self.last_seq + 1, "commands are replayed in sequence");
+        let (owner, places) = match command {
+            Command::Limit {
+                id,
+                owner,
+                side,
+                price,
+                qty,
+                ..
+            } => {
+                self.place(id, owner, 0, side, Some(price), qty);
+                (owner, true)
+            }
+            Command::Market {
+                id,
+                owner,
+                side,
+                qty,
+            } => {
+                self.place(id, owner, 0, side, None, qty);
+                (owner, true)
+            }
+            Command::Stop {
+                id,
+                owner,
+                side,
+                limit,
+                qty,
+                ..
+            } => {
+                self.place(id, owner, 0, side, limit, qty);
+                (owner, true)
+            }
+            Command::Cancel { owner, .. }
+            | Command::Modify { owner, .. }
+            | Command::CancelAll { owner } => (owner, false),
+            Command::SetPhase { .. } => (0, false),
+        };
+        self.last_seq = seq;
+        self.in_flight.push_back(InFlight {
+            seq,
+            session: SYSTEM,
+            owner,
+            places,
+        });
+    }
+
+    /// An event after the checkpoint, as recovery replays it.
+    pub fn replay_event(&mut self, seq: Seq, event: Event) {
+        self.deliver(seq, event, &mut Nobody);
+    }
+
+    /// Ends a recovery: the depth is taken from `book`, and the orders the exchange knows
+    /// must be exactly those on it, with the same open quantities.
+    pub fn finish(&mut self, book: &OrderBook) -> Result<(), String> {
+        self.depth = Depth::of(book);
+        self.trades.clear();
+        self.changed_wallets.clear();
+        self.delivered = self.last_seq;
+        self.published = self.last_seq;
+        let mut on_book = 0;
+        for side in [Side::Buy, Side::Sell] {
+            for level in book.depth(side) {
+                for order in book.queue(side, level.price) {
+                    on_book += 1;
+                    match self.live.get(&order.id) {
+                        Some(live)
+                            if live.leaves == order.leaves && live.account == order.owner => {}
+                        other => {
+                            return Err(format!(
+                                "order {} is on the book with {} open, but the exchange has {other:?}",
+                                order.id, order.leaves
+                            ));
+                        }
+                    }
+                }
+            }
+            for stop in book.stops(side) {
+                on_book += 1;
+                if !self.live.contains_key(&stop.id) {
+                    return Err(format!(
+                        "stop {} is on the book, not in the exchange",
+                        stop.id
+                    ));
+                }
+            }
+        }
+        if on_book != self.live.len() {
+            return Err(format!(
+                "the book holds {on_book} orders, the exchange knows of {}",
+                self.live.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Whether an account with id `id` exists.

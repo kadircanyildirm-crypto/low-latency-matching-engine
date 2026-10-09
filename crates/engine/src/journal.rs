@@ -837,6 +837,11 @@ impl<S: Storage> Journal<S> {
     pub(crate) fn storage(&mut self) -> &mut S {
         &mut self.storage
     }
+
+    /// Another handle on the storage, for the snapshots.
+    pub(crate) fn storage_clone(&self) -> S {
+        self.storage.clone()
+    }
 }
 
 /// Whether a segment file, whose header may not be trusted, holds a valid record of a

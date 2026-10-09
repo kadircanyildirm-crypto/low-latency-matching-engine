@@ -141,13 +141,35 @@ impl<O: Output> EventSink for Tagged<'_, O> {
 }
 
 /// The order book behind a sequencer and a write-ahead journal.
+///
+/// An engine is a [`Writer`], which journals commands, and a [`Matcher`], which applies
+/// them to the book and takes snapshots, working in step on one thread.
+/// [`split`](Engine::split) separates them, for a pipeline that runs each on a thread of its
+/// own.
 pub struct Engine<S: Storage = FsStorage> {
-    /// Held while the engine is open, so no second engine writes the same journal.
+    writer: Writer<S>,
+    matcher: Matcher<S>,
+}
+
+/// The journal half of an [`Engine`]: it numbers commands and writes them, and syncs them as
+/// the policy says.
+pub struct Writer<S: Storage = FsStorage> {
+    /// Held while the writer exists, so no second engine writes the same journal.
     _lock: S::Lock,
-    book: OrderBook,
     journal: Journal<S>,
+    sync: SyncPolicy,
+    poisoned: bool,
+}
+
+/// The book half of an [`Engine`]: it applies journaled commands to the book and takes
+/// snapshots of it.
+pub struct Matcher<S: Storage = FsStorage> {
+    book: OrderBook,
+    storage: S,
     dir: PathBuf,
     config: EngineConfig,
+    /// The sequence number of the last command applied.
+    last_seq: Seq,
     /// The sequence number of the newest snapshot, or of the state recovery started from.
     last_snapshot: Seq,
     /// When the next automatic snapshot is due.
@@ -298,21 +320,26 @@ impl<S: Storage> Engine<S> {
             storage.rename(&path, &path.with_extension("damaged"))?;
         }
 
-        Ok((
-            Engine {
-                _lock: lock,
-                book,
-                journal,
-                dir: dir.to_owned(),
-                config,
-                last_snapshot: after,
-                next_snapshot: config.snapshot_every.map(|every| after + every),
-                snapshot_failure: None,
-                poisoned: false,
-                snapshot_buf: Vec::new(),
-            },
-            report,
-        ))
+        let last_seq = journal.last_seq();
+        let writer = Writer {
+            _lock: lock,
+            journal,
+            sync: config.sync,
+            poisoned: false,
+        };
+        let matcher = Matcher {
+            book,
+            storage: writer.journal.storage_clone(),
+            dir: dir.to_owned(),
+            config,
+            last_seq,
+            last_snapshot: after,
+            next_snapshot: config.snapshot_every.map(|every| after + every),
+            snapshot_failure: None,
+            poisoned: false,
+            snapshot_buf: Vec::new(),
+        };
+        Ok((Engine { writer, matcher }, report))
     }
 
     /// Journals `command` under the next sequence number, syncs as the policy says, then
@@ -340,56 +367,39 @@ impl<S: Storage> Engine<S> {
         commands: &[Command],
         out: &mut O,
     ) -> Result<Seq, Error> {
-        if self.poisoned {
+        if self.writer.poisoned || self.matcher.poisoned {
             return Err(Error::Poisoned);
         }
-        if self
-            .next_snapshot
-            .is_some_and(|due| self.journal.last_seq() >= due)
-        {
+        if self.matcher.snapshot_due() {
             if let Err(error) = self.snapshot() {
-                if self.poisoned {
+                if self.writer.poisoned {
                     return Err(error);
                 }
-                self.snapshot_failure = Some(error);
-                self.next_snapshot = self
-                    .config
-                    .snapshot_every
-                    .map(|every| self.journal.last_seq() + every);
+                self.matcher.postpone_snapshot(error);
             }
         }
-        let first = self.journal.last_seq() + 1;
-        let mut journaled = self.journal.append(commands);
-        if self.config.sync == SyncPolicy::Always {
-            journaled = journaled.and_then(|seq| self.journal.sync().map(|()| seq));
-        }
-        let last = journaled.inspect_err(|_| self.poisoned = true)?;
-        // Poisoned until every command is applied: a panic in the book leaves it so.
-        self.poisoned = true;
+        let first = self.writer.last_seq() + 1;
+        let last = self.writer.write(commands)?;
         for (seq, &command) in (first..).zip(commands) {
-            self.book.process(command, &mut Tagged { seq, out });
+            self.matcher.apply(seq, command, out)?;
         }
-        self.poisoned = false;
         Ok(last)
     }
 
     /// Makes every journaled command durable.
     pub fn sync(&mut self) -> Result<(), Error> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
-        self.journal.sync().inspect_err(|_| self.poisoned = true)
+        self.writer.sync()
     }
 
     /// Syncs the journal, records that everything in it is durable, and closes the engine.
     /// The record spares the next recovery from writing the journal's tail again. Dropping
     /// an engine closes it too, but without the sync under [`SyncPolicy::Os`], without the
     /// record, and without a chance to report an error.
-    pub fn close(mut self) -> Result<(), Error> {
-        if self.poisoned {
+    pub fn close(self) -> Result<(), Error> {
+        if self.matcher.poisoned {
             return Err(Error::Poisoned);
         }
-        self.journal.close()
+        self.writer.close()
     }
 
     /// Writes a snapshot of the book now, after syncing the journal, reads it back to check
@@ -400,16 +410,197 @@ impl<S: Storage> Engine<S> {
     /// A snapshot that fails to write or to check is not used, and nothing is deleted; the
     /// engine stays usable. Only a failed journal sync poisons it.
     pub fn snapshot(&mut self) -> Result<(), Error> {
-        if self.poisoned {
+        if self.writer.poisoned || self.matcher.poisoned {
             return Err(Error::Poisoned);
         }
-        let seq = self.journal.last_seq();
-        if seq == self.last_snapshot {
+        if self.matcher.last_seq == self.matcher.last_snapshot {
             return Ok(());
         }
         // The journal must reach the snapshot before the snapshot exists.
-        self.sync()?;
-        let storage = self.journal.storage();
+        self.writer.sync()?;
+        if let Some(seq) = self.matcher.snapshot(self.writer.durable_seq())? {
+            self.writer.remove_through(seq)?;
+        }
+        Ok(())
+    }
+
+    /// The last failure that did not stop the engine, if there was one since the last call:
+    /// an automatic snapshot that could not be taken, or a next journal segment that could
+    /// not be prepared (it is prepared again when it is needed).
+    pub fn take_failure(&mut self) -> Option<Error> {
+        self.matcher
+            .snapshot_failure
+            .take()
+            .or_else(|| self.writer.take_failure())
+    }
+
+    /// The book.
+    pub fn book(&self) -> &OrderBook {
+        &self.matcher.book
+    }
+
+    /// The sequence number of the last command submitted, or recovered.
+    pub fn last_seq(&self) -> Seq {
+        self.writer.last_seq()
+    }
+
+    /// The highest sequence number known to be on stable storage.
+    pub fn durable_seq(&self) -> Seq {
+        self.writer.durable_seq()
+    }
+
+    /// The sequence number of the newest snapshot, or of the state recovery started from.
+    pub fn last_snapshot(&self) -> Seq {
+        self.matcher.last_snapshot
+    }
+
+    /// The configuration.
+    pub fn config(&self) -> &EngineConfig {
+        &self.matcher.config
+    }
+
+    /// Separates the engine into its writer and its matcher, for a pipeline that journals on
+    /// one thread and matches on another. The caller then keeps the promises the engine
+    /// keeps itself: the matcher applies each command only once the writer has journaled it
+    /// (and synced it, under [`SyncPolicy::Always`]), in sequence order; before the
+    /// matcher takes a snapshot, the writer syncs at least as far; and segments are removed
+    /// only through the sequence number a snapshot returns.
+    pub fn split(self) -> (Writer<S>, Matcher<S>) {
+        (self.writer, self.matcher)
+    }
+}
+
+impl<S: Storage> Writer<S> {
+    /// Journals `commands` under the next sequence numbers, and syncs them under
+    /// [`SyncPolicy::Always`]. Returns the sequence number of the last one; an empty batch
+    /// journals nothing and returns that of the last command before it.
+    ///
+    /// An error poisons the writer: the records may or may not have reached the disk, so
+    /// whether recovery will apply them is unknown, and it refuses everything until the
+    /// journal is reopened.
+    pub fn write(&mut self, commands: &[Command]) -> Result<Seq, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let mut journaled = self.journal.append(commands);
+        if self.sync == SyncPolicy::Always {
+            journaled = journaled.and_then(|seq| self.journal.sync().map(|()| seq));
+        }
+        journaled.inspect_err(|_| self.poisoned = true)
+    }
+
+    /// Makes every journaled command durable.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.journal.sync().inspect_err(|_| self.poisoned = true)
+    }
+
+    /// Deletes the journal segments that hold nothing after `seq`: what
+    /// [`Matcher::snapshot`] returned.
+    pub fn remove_through(&mut self, seq: Seq) -> Result<(), Error> {
+        self.journal.remove_through(seq).map(|_| ())
+    }
+
+    /// Syncs the journal, records that everything in it is durable, and closes it, as
+    /// [`Engine::close`] does.
+    pub fn close(mut self) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.journal.close()
+    }
+
+    /// Why the next journal segment could not be prepared, if that failed since the last
+    /// call. It is prepared again when it is needed.
+    pub fn take_failure(&mut self) -> Option<Error> {
+        self.journal.take_prepare_failure()
+    }
+
+    /// The sequence number of the last command journaled.
+    pub fn last_seq(&self) -> Seq {
+        self.journal.last_seq()
+    }
+
+    /// The highest sequence number known to be on stable storage.
+    pub fn durable_seq(&self) -> Seq {
+        self.journal.durable()
+    }
+
+    /// Whether a failed write or sync has poisoned the writer.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+impl<S: Storage> Matcher<S> {
+    /// Applies the command journaled under `seq`, which must follow the last one applied;
+    /// its events go to `out` tagged with `seq`. A panic in the book poisons the matcher.
+    ///
+    /// # Panics
+    ///
+    /// If `seq` does not follow the last command applied.
+    pub fn apply<O: Output>(
+        &mut self,
+        seq: Seq,
+        command: Command,
+        out: &mut O,
+    ) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        assert_eq!(seq, self.last_seq + 1, "commands are applied in sequence");
+        // Poisoned until the command is applied: a panic in the book leaves it so.
+        self.poisoned = true;
+        self.book.process(command, &mut Tagged { seq, out });
+        self.poisoned = false;
+        self.last_seq = seq;
+        Ok(())
+    }
+
+    /// Whether an automatic snapshot is due: `snapshot_every` commands have been applied
+    /// since the last one, or since the last failed attempt.
+    pub fn snapshot_due(&self) -> bool {
+        self.next_snapshot.is_some_and(|due| self.last_seq >= due)
+    }
+
+    /// Records why an automatic snapshot failed, for [`take_failure`](Self::take_failure),
+    /// and puts the next attempt off by another `snapshot_every` commands.
+    pub fn postpone_snapshot(&mut self, error: Error) {
+        self.snapshot_failure = Some(error);
+        self.next_snapshot = self
+            .config
+            .snapshot_every
+            .map(|every| self.last_seq + every);
+    }
+
+    /// Writes a snapshot of the book now, reads it back to check that it restores to
+    /// exactly this book, and deletes the snapshots no longer needed. `durable` is the
+    /// writer's [`durable_seq`](Writer::durable_seq): the journal must reach the snapshot
+    /// before the snapshot exists, so that the journal and an older snapshot can rebuild
+    /// it too. Returns the sequence number through which the writer may delete journal
+    /// segments, once there are as many snapshots as are kept. Does nothing if the newest
+    /// snapshot is already of the current state.
+    ///
+    /// A snapshot that fails to write or to check is not used, and nothing is deleted.
+    ///
+    /// # Panics
+    ///
+    /// If `durable` is before [`last_seq`](Self::last_seq).
+    pub fn snapshot(&mut self, durable: Seq) -> Result<Option<Seq>, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let seq = self.last_seq;
+        if seq == self.last_snapshot {
+            return Ok(None);
+        }
+        assert!(
+            durable >= seq,
+            "the journal is durable through {durable}, not through the snapshot at {seq}"
+        );
+        let storage = &mut self.storage;
         snapshots::write(storage, &self.dir, seq, &self.book, &mut self.snapshot_buf)?;
         // Nothing older may go before this one is known to load.
         let check = snapshots::read(storage, &self.dir, seq, &self.config.book);
@@ -439,19 +630,12 @@ impl<S: Storage> Engine<S> {
         storage.sync_dir(&self.dir)?;
         // Until there are as many snapshots as are kept, the whole journal stays, so a
         // damaged newest snapshot can fall back to an older one or to the start.
-        if seqs.len() - keep_from == self.config.keep_snapshots {
-            self.journal.remove_through(seqs[keep_from])?;
-        }
-        Ok(())
+        Ok((seqs.len() - keep_from == self.config.keep_snapshots).then_some(seqs[keep_from]))
     }
 
-    /// The last failure that did not stop the engine, if there was one since the last call:
-    /// an automatic snapshot that could not be taken, or a next journal segment that could
-    /// not be prepared (it is prepared again when it is needed).
+    /// Why the last automatic snapshot failed, if it did since the last call.
     pub fn take_failure(&mut self) -> Option<Error> {
-        self.snapshot_failure
-            .take()
-            .or_else(|| self.journal.take_prepare_failure())
+        self.snapshot_failure.take()
     }
 
     /// The book.
@@ -459,14 +643,9 @@ impl<S: Storage> Engine<S> {
         &self.book
     }
 
-    /// The sequence number of the last command submitted, or recovered.
+    /// The sequence number of the last command applied.
     pub fn last_seq(&self) -> Seq {
-        self.journal.last_seq()
-    }
-
-    /// The highest sequence number known to be on stable storage.
-    pub fn durable_seq(&self) -> Seq {
-        self.journal.durable()
+        self.last_seq
     }
 
     /// The sequence number of the newest snapshot, or of the state recovery started from.

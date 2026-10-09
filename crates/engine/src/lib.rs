@@ -27,7 +27,9 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-pub use engine::{Discard, Engine, EngineConfig, Output, RecoveryReport, SyncPolicy};
+pub use engine::{
+    Discard, Engine, EngineConfig, Matcher, Output, RecoveryReport, SyncPolicy, Writer,
+};
 pub use journal::{JournalReport, RECORD_SIZE};
 
 /// A command's position in the total order the sequencer assigns: 1, 2, 3, ...

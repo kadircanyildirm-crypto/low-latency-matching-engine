@@ -7,8 +7,9 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Directory and file operations.
-pub trait Storage {
+/// Directory and file operations. Clones are handles on the same storage: the journal and
+/// the snapshots each use one, possibly on different threads.
+pub trait Storage: Clone {
     /// An open file.
     type File: StorageFile;
     /// An exclusive hold on a directory, released when dropped.

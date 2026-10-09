@@ -5,11 +5,10 @@
 //! it: every synced byte, plus any part of what was written since, down to a torn single
 //! write.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use orderbook::workload::SplitMix64;
 
@@ -32,15 +31,15 @@ pub enum CrashModel {
 /// separate disk with the post-crash contents.
 #[derive(Clone, Debug, Default)]
 pub struct SimStorage {
-    disk: Rc<RefCell<Disk>>,
+    disk: Shared<Disk>,
 }
 
 #[derive(Debug, Default)]
 struct Disk {
     /// The directory as the program sees it.
-    names: BTreeMap<PathBuf, Rc<RefCell<Inode>>>,
+    names: BTreeMap<PathBuf, Shared<Inode>>,
     /// The directory as of the last directory sync.
-    durable_names: BTreeMap<PathBuf, Rc<RefCell<Inode>>>,
+    durable_names: BTreeMap<PathBuf, Shared<Inode>>,
     /// Directory changes since then, in order.
     pending: Vec<NameChange>,
     /// Whether every change fails, as on a full or failing disk. A failed file sync also
@@ -111,7 +110,7 @@ impl Disk {
 /// The lock on a directory of a [`SimStorage`], released when dropped.
 #[derive(Debug)]
 pub struct SimLock {
-    disk: Rc<RefCell<Disk>>,
+    disk: Shared<Disk>,
     dir: PathBuf,
 }
 
@@ -123,7 +122,7 @@ impl Drop for SimLock {
 
 #[derive(Debug)]
 enum NameChange {
-    Create(PathBuf, Rc<RefCell<Inode>>),
+    Create(PathBuf, Shared<Inode>),
     Rename(PathBuf, PathBuf),
     Remove(PathBuf),
 }
@@ -191,8 +190,8 @@ const SECTOR: usize = 512;
 /// A file of [`SimStorage`].
 #[derive(Debug)]
 pub struct SimFile {
-    inode: Rc<RefCell<Inode>>,
-    disk: Rc<RefCell<Disk>>,
+    inode: Shared<Inode>,
+    disk: Shared<Disk>,
 }
 
 impl SimFile {
@@ -214,13 +213,13 @@ impl SimStorage {
     /// order, as journaling file systems apply them.
     pub fn crash(&self, rng: &mut SplitMix64, model: CrashModel) -> SimStorage {
         let disk = self.disk.borrow();
-        let mut after: BTreeMap<PathBuf, Rc<RefCell<Inode>>> = BTreeMap::new();
-        let mut contents: BTreeMap<*const RefCell<Inode>, Rc<RefCell<Inode>>> = BTreeMap::new();
-        let mut survivor = |inode: &Rc<RefCell<Inode>>, rng: &mut SplitMix64| {
+        let mut after: BTreeMap<PathBuf, Shared<Inode>> = BTreeMap::new();
+        let mut contents: BTreeMap<*const Mutex<Inode>, Shared<Inode>> = BTreeMap::new();
+        let mut survivor = |inode: &Shared<Inode>, rng: &mut SplitMix64| {
             contents
-                .entry(Rc::as_ptr(inode))
+                .entry(Shared::as_ptr(inode))
                 .or_insert_with(|| {
-                    Rc::new(RefCell::new(Inode::survivor(&inode.borrow(), rng, model)))
+                    Shared::new(Inode::survivor(&inode.borrow(), rng, model))
                 })
                 .clone()
         };
@@ -248,12 +247,12 @@ impl SimStorage {
             inode.borrow_mut().name = name.clone();
         }
         SimStorage {
-            disk: Rc::new(RefCell::new(Disk {
+            disk: Shared::new(Disk {
                 names: after.clone(),
                 durable_names: after,
                 pending: Vec::new(),
                 ..Disk::default()
-            })),
+            }),
         }
     }
 
@@ -412,10 +411,10 @@ impl Storage for SimStorage {
     }
 
     fn create(&mut self, path: &Path) -> io::Result<SimFile> {
-        let inode = Rc::new(RefCell::new(Inode {
+        let inode = Shared::new(Inode {
             name: path.to_owned(),
             ..Inode::default()
-        }));
+        });
         let mut disk = self.disk.borrow_mut();
         disk.change_to(path)?;
         disk.names.insert(path.to_owned(), inode.clone());
@@ -664,5 +663,36 @@ mod tests {
         assert!(disk.remove(Path::new("d/missing")).is_err());
         let mut short = [0; 8];
         assert!(file.read_at(0, &mut short).is_err());
+    }
+}
+
+/// Shared mutable state, with the interface of `Rc<RefCell<T>>` but `Send` and `Sync`, so
+/// that a simulated disk can be used from several threads, as a pipeline does.
+#[derive(Debug, Default)]
+struct Shared<T>(Arc<Mutex<T>>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(self.0.clone())
+    }
+}
+
+impl<T> Shared<T> {
+    fn new(value: T) -> Self {
+        Shared(Arc::new(Mutex::new(value)))
+    }
+
+    /// The value, locked. A thread that panicked while holding it leaves it as it was.
+    fn borrow(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn borrow_mut(&self) -> MutexGuard<'_, T> {
+        self.borrow()
+    }
+
+    /// Identifies the value, as `Rc::as_ptr` does.
+    fn as_ptr(this: &Self) -> *const Mutex<T> {
+        Arc::as_ptr(&this.0)
     }
 }

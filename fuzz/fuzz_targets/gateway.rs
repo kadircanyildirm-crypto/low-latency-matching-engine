@@ -6,7 +6,7 @@
 //! - All reports about an order go to sessions of one account, the one that owns it on the
 //!   book, and only logged-in sessions get reports.
 //! - After every flush, each account's open-order count matches its orders on the book,
-//!   and the open-order limit holds.
+//!   the open-order limit holds, and the depth kept for market data is the book's.
 
 #![no_main]
 
@@ -75,6 +75,7 @@ enum Message {
         qty: u8,
     },
     MassCancel,
+    Subscribe,
 }
 
 /// Prices near the reference price of 100, inside and outside the band of 20.
@@ -160,6 +161,7 @@ impl Message {
                 qty: u64::from(qty % 12),
             },
             Message::MassCancel => Inbound::MassCancel,
+            Message::Subscribe => Inbound::Subscribe,
         }
     }
 }
@@ -286,10 +288,25 @@ fuzz_target!(|steps: Vec<Step>| {
             }
             Step::Flush => {
                 exchange.flush(&mut engine, &mut mail).unwrap();
+                exchange.publish(&mut mail);
                 for account in 1..4 {
                     let open = exchange.open_orders(account).unwrap();
                     assert_eq!(open, open_on_book(engine.book(), account));
                     assert!(open <= MAX_OPEN);
+                }
+                // The depth kept from the events is the book's.
+                for side in [Side::Buy, Side::Sell] {
+                    let kept: Vec<_> = exchange
+                        .depth()
+                        .levels(side)
+                        .map(|(price, level)| (price, level.qty, level.orders))
+                        .collect();
+                    let book: Vec<_> = engine
+                        .book()
+                        .depth(side)
+                        .map(|level| (level.price, level.qty, level.orders))
+                        .collect();
+                    assert_eq!(kept, book);
                 }
             }
             Step::Tick(by) => {
@@ -332,6 +349,11 @@ fuzz_target!(|steps: Vec<Step>| {
                             }
                         }
                     }
+                }
+                Outbound::BookSnapshot { .. }
+                | Outbound::LevelUpdate(_)
+                | Outbound::TradeTick(_) => {
+                    assert!(logged[session].is_some(), "market data before a login");
                 }
                 _ => {}
             }

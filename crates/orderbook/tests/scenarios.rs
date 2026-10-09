@@ -1516,6 +1516,24 @@ fn a_market_order_names_the_tighter_of_its_caps() {
     assert_eq!(stop(book_with(4, 2)), cancelled(20, 17, PriceBand));
     // A tie goes to price protection.
     assert_eq!(stop(book_with(3, 3)), cancelled(20, 16, PriceProtection));
+
+    // The same for a market sell, whose caps lie below the bids.
+    let book_with = |protection: u32, band: u32| {
+        let mut b = OrderBook::new(BookConfig {
+            price_protection: Some(protection),
+            price_band: Some(band),
+            reference_price: Some(100),
+            ..CFG
+        });
+        for (id, price) in (1..).zip(90..=100) {
+            run(&mut b, limit(id, Buy, price, 1));
+        }
+        b
+    };
+    let stop = |mut b: OrderBook| *run(&mut b, market(20, Sell, 20)).last().unwrap();
+    assert_eq!(stop(book_with(2, 4)), cancelled(20, 17, PriceProtection));
+    assert_eq!(stop(book_with(4, 2)), cancelled(20, 17, PriceBand));
+    assert_eq!(stop(book_with(3, 3)), cancelled(20, 16, PriceProtection));
 }
 
 #[test]

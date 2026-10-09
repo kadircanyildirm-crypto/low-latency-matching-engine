@@ -59,6 +59,11 @@ pub enum Error {
     /// believes it does. The engine accepts nothing more; reopening it recovers from what
     /// is actually on disk.
     Poisoned,
+    /// Another engine has the directory open. Two writers would corrupt the journal.
+    Locked {
+        /// The directory.
+        dir: PathBuf,
+    },
 }
 
 impl fmt::Display for Error {
@@ -77,6 +82,9 @@ impl fmt::Display for Error {
                 write!(f, "the journal from command {from} is missing")
             }
             Error::Poisoned => f.write_str("an earlier write failed; reopen the engine"),
+            Error::Locked { dir } => {
+                write!(f, "another engine has {} open", dir.display())
+            }
         }
     }
 }

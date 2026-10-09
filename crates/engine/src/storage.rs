@@ -11,6 +11,11 @@ use std::path::Path;
 pub trait Storage {
     /// An open file.
     type File: StorageFile;
+    /// An exclusive hold on a directory, released when dropped.
+    type Lock;
+
+    /// Takes the exclusive lock on `dir`, or returns `None` if someone else holds it.
+    fn lock(&mut self, dir: &Path) -> io::Result<Option<Self::Lock>>;
 
     /// Creates `dir` and its parents if they do not exist.
     fn create_dir_all(&mut self, dir: &Path) -> io::Result<()>;
@@ -68,6 +73,26 @@ impl FsFile {
 
 impl Storage for FsStorage {
     type File = FsFile;
+    type Lock = std::fs::File;
+
+    /// An OS lock on the file `LOCK` in `dir` (`flock`, `LockFileEx`). The OS releases it
+    /// when the process exits, however it exits, so a crash never leaves the directory
+    /// locked.
+    fn lock(&mut self, dir: &Path) -> io::Result<Option<std::fs::File>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("LOCK"))?;
+        // Through the trait: newer standard libraries have an inherent `try_lock` of
+        // their own, which the minimum supported Rust version lacks.
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(Some(file)),
+            Err(fs4::TryLockError::WouldBlock) => Ok(None),
+            Err(fs4::TryLockError::Error(error)) => Err(error),
+        }
+    }
 
     fn create_dir_all(&mut self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)

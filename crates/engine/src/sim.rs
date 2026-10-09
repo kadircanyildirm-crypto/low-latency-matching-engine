@@ -45,6 +45,21 @@ struct Disk {
     pending: Vec<NameChange>,
     /// Whether writes and syncs fail, as on a full or failing disk.
     failing: bool,
+    /// Directories someone holds the lock of. A crash releases them all.
+    locked: std::collections::BTreeSet<PathBuf>,
+}
+
+/// The lock on a directory of a [`SimStorage`], released when dropped.
+#[derive(Debug)]
+pub struct SimLock {
+    disk: Rc<RefCell<Disk>>,
+    dir: PathBuf,
+}
+
+impl Drop for SimLock {
+    fn drop(&mut self) {
+        self.disk.borrow_mut().locked.remove(&self.dir);
+    }
 }
 
 #[derive(Debug)]
@@ -163,6 +178,7 @@ impl SimStorage {
                 durable_names: after,
                 pending: Vec::new(),
                 failing: false,
+                locked: Default::default(),
             })),
         }
     }
@@ -251,6 +267,18 @@ impl Inode {
 
 impl Storage for SimStorage {
     type File = SimFile;
+    type Lock = SimLock;
+
+    fn lock(&mut self, dir: &Path) -> io::Result<Option<SimLock>> {
+        let mut disk = self.disk.borrow_mut();
+        if !disk.locked.insert(dir.to_owned()) {
+            return Ok(None);
+        }
+        Ok(Some(SimLock {
+            disk: self.disk.clone(),
+            dir: dir.to_owned(),
+        }))
+    }
 
     fn create_dir_all(&mut self, _dir: &Path) -> io::Result<()> {
         Ok(())

@@ -336,6 +336,9 @@ fn errors_explain_themselves() {
         Error::ConfigMismatch { file },
         Error::MissingJournal { from: 7 },
         Error::Poisoned,
+        Error::Locked {
+            dir: PathBuf::from("data"),
+        },
     ] {
         assert!(!error.to_string().is_empty());
         let io = matches!(error, Error::Io(_));
@@ -480,4 +483,30 @@ fn snapshot_headers_need_every_field_valid() {
         assert!(report.damaged_snapshots[0].1.contains("invalid header"));
         assert_eq!(engine.book().digest(), digests[20]);
     }
+}
+
+/// A second engine on the same directory is refused while the first is open, on the
+/// simulated disk and on the real file system, and admitted once it is closed.
+#[test]
+fn one_engine_per_directory() {
+    let (book, _) = common::flow(34, 0);
+    let storage = SimStorage::new();
+    let (first, _) = open(&storage, small(book)).unwrap();
+    assert!(matches!(
+        open(&storage, small(book)),
+        Err(Error::Locked { .. })
+    ));
+    drop(first);
+    open(&storage, small(book)).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("engine-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (first, _) = Engine::open(&dir, small(book)).unwrap();
+    assert!(matches!(
+        Engine::open(&dir, small(book)),
+        Err(Error::Locked { .. })
+    ));
+    drop(first);
+    drop(Engine::open(&dir, small(book)).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
 }

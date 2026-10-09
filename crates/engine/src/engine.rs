@@ -69,6 +69,8 @@ pub struct RecoveryReport {
 
 /// The order book behind a sequencer and a write-ahead journal.
 pub struct Engine<S: Storage = FsStorage> {
+    /// Held while the engine is open, so no second engine writes the same journal.
+    _lock: S::Lock,
     book: OrderBook,
     journal: Journal<S>,
     dir: PathBuf,
@@ -122,6 +124,9 @@ impl<S: Storage> Engine<S> {
         }
         assert!(config.keep_snapshots > 0, "keep at least one snapshot");
         storage.create_dir_all(dir)?;
+        let lock = storage.lock(dir)?.ok_or_else(|| Error::Locked {
+            dir: dir.to_owned(),
+        })?;
         snapshots::remove_partial(&mut storage, dir)?;
 
         let mut report = RecoveryReport::default();
@@ -158,6 +163,7 @@ impl<S: Storage> Engine<S> {
         report.journal = journal_report;
         Ok((
             Engine {
+                _lock: lock,
                 book,
                 journal,
                 dir: dir.to_owned(),

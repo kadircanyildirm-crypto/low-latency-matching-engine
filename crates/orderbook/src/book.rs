@@ -147,8 +147,13 @@ pub struct QueuedOrder {
 struct Level {
     head: u32,
     tail: u32,
+    /// What the level's orders show.
     total_qty: Qty,
     order_count: u32,
+    /// How many of them are icebergs, whose hidden quantity `total_qty` leaves out. Where
+    /// there are none, an auction reads the level's open quantity from `total_qty` alone.
+    /// It fills what would otherwise be padding.
+    icebergs: u32,
 }
 
 // The ladder's memory is `2 * levels * size_of::<Level>()`; see docs/DESIGN.md.
@@ -160,6 +165,7 @@ impl Level {
         tail: NIL,
         total_qty: 0,
         order_count: 0,
+        icebergs: 0,
     };
 
     /// Removes the order at the head of the queue and frees its slot. The caller has
@@ -173,7 +179,11 @@ impl Level {
     ) {
         let slot = self.head;
         let OrderNode {
-            id, next, owner, ..
+            id,
+            next,
+            owner,
+            iceberg,
+            ..
         } = *pool.get(slot);
         self.head = next;
         if next == NIL {
@@ -182,6 +192,7 @@ impl Level {
             pool.get_mut(next).prev = NIL;
         }
         self.order_count -= 1;
+        self.icebergs -= u32::from(iceberg);
         index.remove(&id);
         owners.unlink(slot, owner);
         pool.free(slot);
@@ -234,7 +245,7 @@ impl HalfBook {
     /// Appends the order in `slot` to the back of its level's queue.
     #[inline]
     fn push_back(&mut self, pool: &mut OrderPool, slot: u32) {
-        let level = pool.get(slot).level;
+        let OrderNode { level, iceberg, .. } = *pool.get(slot);
         let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
         let tail = lvl.tail;
@@ -249,6 +260,7 @@ impl HalfBook {
         lvl.tail = slot;
         lvl.total_qty += visible;
         lvl.order_count += 1;
+        lvl.icebergs += u32::from(iceberg);
         if lvl.order_count == 1 {
             self.occupied.insert(level as usize);
             self.best = Some(match (self.side, self.best) {
@@ -264,7 +276,11 @@ impl HalfBook {
     #[inline]
     fn unlink(&mut self, pool: &mut OrderPool, slot: u32) {
         let OrderNode {
-            level, prev, next, ..
+            level,
+            prev,
+            next,
+            iceberg,
+            ..
         } = *pool.get(slot);
         let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
@@ -280,6 +296,7 @@ impl HalfBook {
         }
         lvl.total_qty -= visible;
         lvl.order_count -= 1;
+        lvl.icebergs -= u32::from(iceberg);
         if lvl.order_count == 0 {
             self.level_emptied(level);
         }
@@ -1285,9 +1302,11 @@ impl OrderBook {
                 }
 
                 let (mut count, mut total, mut prev, mut cur) = (0u32, 0 as Qty, NIL, lvl.head);
+                let mut icebergs = 0u32;
                 while cur != NIL {
                     let node = self.pool.get(cur);
                     let id = node.id;
+                    icebergs += u32::from(node.iceberg);
                     if node.prev != prev {
                         return Err(format!("{side:?} {price}: broken back link at #{id}"));
                     }
@@ -1340,6 +1359,12 @@ impl OrderBook {
                     return Err(format!(
                         "{side:?} {price}: aggregates say {}/{} but queue holds {count}/{total}",
                         lvl.order_count, lvl.total_qty
+                    ));
+                }
+                if icebergs != lvl.icebergs {
+                    return Err(format!(
+                        "{side:?} {price}: level counts {} icebergs but holds {icebergs}",
+                        lvl.icebergs
                     ));
                 }
                 resting += count as usize;
@@ -1803,6 +1828,22 @@ mod validate_tests {
                 b.pool.iceberg_mut(s).visible = 2;
             },
             "aggregates say 2/4 but queue holds 2/3",
+        );
+        // An auction trusts the count to know where hidden quantity rests.
+        assert_detects(
+            |b| {
+                add_iceberg(b);
+                let l = level(b, 99);
+                b.bids.levels[l].icebergs = 0;
+            },
+            "Buy 99: level counts 0 icebergs but holds 1",
+        );
+        assert_detects(
+            |b| {
+                let l = level(b, 100);
+                b.bids.levels[l].icebergs = 1;
+            },
+            "Buy 100: level counts 1 icebergs but holds 0",
         );
     }
 

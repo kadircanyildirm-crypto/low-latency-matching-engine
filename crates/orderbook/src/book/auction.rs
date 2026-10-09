@@ -166,8 +166,8 @@ impl OrderBook {
     ///
     /// Walks the candidates in ascending order from the best ask to the best bid, the only
     /// prices at which anything executes, keeping running sums of the asks at or below and
-    /// the bids at or above the candidate. It touches each order in that range at most
-    /// twice and allocates nothing.
+    /// the bids at or above the candidate. It costs O(1) per occupied level in that range,
+    /// plus the orders of the levels where icebergs rest, and allocates nothing.
     fn uncross_level(&self) -> Option<(u32, Qty)> {
         let (bid, ask) = (self.bids.best?, self.asks.best?);
         if bid < ask {
@@ -203,9 +203,14 @@ impl OrderBook {
         Some((choice.price(self.reference), choice.volume))
     }
 
-    /// Open quantity of the orders at `level` of `half`, hidden iceberg quantity included.
+    /// Open quantity of the orders at `level` of `half`, hidden iceberg quantity included:
+    /// what they show, unless icebergs rest there and their queue must be summed.
     fn leaves_at(&self, half: &HalfBook, level: u32) -> Qty {
-        let (mut leaves, mut slot) = (0, half.levels[level as usize].head);
+        let lvl = &half.levels[level as usize];
+        if lvl.icebergs == 0 {
+            return lvl.total_qty;
+        }
+        let (mut leaves, mut slot) = (0, lvl.head);
         while slot != NIL {
             let node = self.pool.get(slot);
             leaves += node.remaining;

@@ -138,11 +138,16 @@ fn the_halves_keep_the_rules() {
         matcher.apply(seq, command, &mut Discard).unwrap();
     }
     assert!(!matcher.snapshot_due());
+    // A failed automatic snapshot is told once, and puts the next one off.
+    matcher.postpone_snapshot(Error::Poisoned);
+    assert!(matches!(matcher.take_failure(), Some(Error::Poisoned)));
+    assert!(matcher.take_failure().is_none());
     // One snapshot of two kept: nothing to remove yet.
     assert_eq!(matcher.snapshot(writer.durable_seq()).unwrap(), None);
     assert_eq!(matcher.last_snapshot(), 10);
     assert_eq!(matcher.config().segment_capacity, 8);
     assert!(matcher.take_failure().is_none());
+    assert!(!writer.is_poisoned());
     storage.set_failing(true);
     assert!(writer.write(&commands[10..]).is_err());
     assert!(writer.is_poisoned());
@@ -187,4 +192,24 @@ fn a_snapshot_needs_the_journal_durable_through_it() {
         matcher.apply(seq, command, &mut Discard).unwrap();
     }
     let _ = matcher.snapshot(writer.durable_seq());
+}
+
+/// An engine whose writer failed refuses a snapshot, even with nothing new to take.
+#[test]
+fn a_poisoned_engine_takes_no_snapshot() {
+    let (book, commands) = common::flow(84, 20);
+    let storage = SimStorage::new();
+    let (mut engine, _) = Engine::open_with(
+        storage.clone(),
+        Path::new(DIR),
+        EngineConfig::new(book),
+        &mut Discard,
+    )
+    .unwrap();
+    engine.submit_batch(&commands[..10], &mut Discard).unwrap();
+    engine.snapshot().unwrap();
+    storage.set_failing(true);
+    assert!(engine.submit_batch(&commands[10..], &mut Discard).is_err());
+    storage.set_failing(false);
+    assert!(matches!(engine.snapshot(), Err(Error::Poisoned)));
 }

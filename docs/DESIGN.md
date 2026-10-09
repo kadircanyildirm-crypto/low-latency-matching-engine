@@ -423,7 +423,7 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 | `fuzz/` | Coverage-guided fuzzing of the differential test, of the snapshot round trip, and of `restore` on arbitrary snapshots ([below](#fuzzing-and-formal-verification)). |
 | Kani proofs | The bitset, the order pool's free list and iceberg arithmetic, and the owner lists, for every input within stated bounds ([below](#fuzzing-and-formal-verification)). |
 | Coverage | CI measures line and branch coverage of the engine with cargo-llvm-cov ([numbers](../README.md#verification)). |
-| Mutation testing | Before trading phases, `cargo mutants` injected 340 small faults into the engine, and the tests detected every one of the 319 that compile ([results](../README.md#mutation-testing)). The phase code has not been through a run yet. |
+| Mutation testing | `cargo mutants` injects 758 small faults into the engine, and the tests detect every one of the 725 that compile ([results](../README.md#mutation-testing)). A weekly workflow repeats the full run. |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just

@@ -106,23 +106,35 @@ points at behaviour the tests do not pin down.
 
 | Outcome | Mutants | Meaning |
 |---|---:|---|
-| Caught | 296 | A test failed. |
-| Timed out | 23 | The mutant made the tests hang, so it was detected too. For example, if `level_emptied` does nothing, an empty level stays the best price and the matching loop never leaves it. |
-| Unviable | 21 | The mutant does not compile. |
+| Caught | 694 | A test failed. |
+| Timed out | 31 | The mutant made the tests hang, so it was detected too. For example, if `level_emptied` does nothing, an empty level stays the best price and the matching loop never leaves it. |
+| Unviable | 33 | The mutant does not compile. |
 | **Missed** | **0** | |
 
-Every one of the 319 mutants that compile was detected in the last full run, which
-includes the snapshot module's own run. `src/workload.rs`, the benchmark's order-flow
-generator, is excluded because it is not part of the engine. Every change since, up to
-stop orders, has been mutation-tested on the lines it touches (`cargo mutants --in-diff`),
-and none has left a mutant alive. Trading phases have not been through a run yet. A full
-run is repeated at the end of each milestone, and a scheduled workflow repeats it every
-week, failing on any missed mutant.
+Every one of the 725 mutants that compile was detected in the last full run, on
+2026-10-09 with every Phase 1 feature in place, trading phases included. It runs on four
+GitHub Actions runners in about an hour, and a scheduled workflow repeats it every week,
+failing on any missed mutant. `src/workload.rs`, the benchmark's order-flow generator, is
+excluded because it is not part of the engine, and so are the Kani proof harnesses,
+which ordinary builds never compile. Changes between full runs are mutation-tested on the
+lines they touch (`cargo mutants --in-diff`).
 
-The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
-`protection_cap`. The clamp turned out to have no effect: the matcher compares levels
-against the cap, and no level lies beyond the last one. The clamp was removed, and a
-rerun of `protection_cap`'s remaining mutants caught all of them.
+Full runs have found three kinds of gap so far, each closed before the run above:
+
+- **A clamp with no effect.** The first run missed two mutants of a `.min(last)` clamp in
+  `protection_cap`: the matcher compares levels against the cap, and no level lies beyond
+  the last one. The clamp was removed.
+- **Counts that only cost time.** Two mutants left the id index's per-line overflow
+  counts too high after a removal. Lookups still found every order, only scanning further,
+  so no behavioural test could tell. The index's property test now recomputes the counts.
+- **A walk that ran too far.** A mutant removed the uncross's stop at the best bid. The
+  candidates beyond it execute nothing and never win, so the price stayed right while the
+  walk went on to the top of the asks. A debug assertion now requires every candidate to
+  execute something.
+
+The same run also showed that the workflow passed despite missed mutants: cargo-mutants
+exits with the timeout code when any mutant timed out, and the job accepted it. It now
+fails whenever the list of missed mutants is not empty.
 
 ### Performance
 

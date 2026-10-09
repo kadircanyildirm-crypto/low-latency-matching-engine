@@ -1,0 +1,13 @@
+[package]
+name = "run-orderbook-rs"
+version = "0.1.0"
+description = "OrderBook-rs (crates.io: orderbook-rs) replaying the comparison streams."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+harness = { path = "../harness" }
+# Pinned exactly: the version is part of the result.
+orderbook-rs = "=0.15.0"
+pricelevel = "=0.10.2"

@@ -3,6 +3,7 @@
 #
 #   compare/run.sh export          record the command streams into compare/data
 #   compare/run.sh ours            one round of our engine over every scenario
+#   compare/run.sh orderbook-rs    one round of OrderBook-rs (crates.io)
 #   compare/run.sh all [ROUNDS]    ROUNDS interleaved rounds (default 5) of every engine,
 #                                  into a fresh compare/results/results.csv, then the report
 #   compare/run.sh report          summarise compare/results/results.csv
@@ -16,7 +17,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 results="$here/results/results.csv"
 
 # Every engine with an adapter, in the order of the first round.
-ENGINES=(ours)
+ENGINES=(ours orderbook-rs)
 
 cargo_cmp() {
     cargo "$1" --manifest-path "$here/Cargo.toml" "${@:2}"
@@ -25,6 +26,7 @@ cargo_cmp() {
 run_engine() {
     case "$1" in
         ours) cargo_cmp run --release --quiet --bin run-ours ;;
+        orderbook-rs) cargo_cmp run --release --quiet --bin run-orderbook-rs ;;
         *)
             echo "unknown engine: $1 (known: ${ENGINES[*]})" >&2
             exit 2
@@ -53,6 +55,6 @@ case "${1:-}" in
     export) cargo_cmp run --release --quiet --bin export ;;
     all) all "${2:-5}" ;;
     report) cargo_cmp run --release --quiet --bin report ;;
-    "" | -h | --help) sed -n '2,15p' "$0" ;;
+    "" | -h | --help) awk 'NR > 1 && /^#/ { print } /^set / { exit }' "$0" ;;
     *) run_engine "$1" ;;
 esac

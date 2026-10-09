@@ -21,8 +21,9 @@ const HEADER_SIZE: usize = 64;
 // Header, little-endian:
 //
 //   0..8    magic "LMESNAP\0"
-//   8..12   version
-//   12..16  zero
+//   8..12   format version
+//   12..16  version of the matching rules the book was built under (for the record: a
+//           snapshot is state, and loads under any rules)
 //   16..24  sequence number of the last command applied
 //   24..32  the book's digest
 //   32..40  length of the encoded state that follows
@@ -61,10 +62,10 @@ pub(crate) fn remove_partial<S: Storage>(storage: &mut S, dir: &Path) -> Result<
         .into_iter()
         .filter(|name| name.starts_with("snapshot-") && name.ends_with(".tmp"))
         .collect();
+    // Recovery syncs the directory once it is done.
     for name in &partial {
         storage.remove(&dir.join(name))?;
     }
-    storage.sync_dir(dir)?;
     Ok(())
 }
 
@@ -83,6 +84,7 @@ pub(crate) fn write<S: Storage>(
     let mut header = [0; HEADER_SIZE];
     header[..8].copy_from_slice(&MAGIC);
     header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&orderbook::RULES_VERSION.to_le_bytes());
     header[16..24].copy_from_slice(&seq.to_le_bytes());
     header[24..32].copy_from_slice(&book.digest().to_le_bytes());
     header[32..40].copy_from_slice(&(body.len() as u64).to_le_bytes());
@@ -114,19 +116,25 @@ pub(crate) fn read<S: Storage>(
         file: path.clone(),
         detail: detail.to_owned(),
     };
+    // A file too short to read is damage; any other read error is the disk's, not the
+    // file's, and must not get a good snapshot set aside.
+    let short = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::UnexpectedEof => corrupt("shorter than its header"),
+        _ => Error::Io(error),
+    };
     let mut file = storage.open(&path)?;
     let mut header = [0; HEADER_SIZE];
-    file.read_at(0, &mut header)
-        .map_err(|_| corrupt("shorter than its header"))?;
+    file.read_at(0, &mut header).map_err(short)?;
     let field = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
     let header_crc = u32::from_le_bytes(header[60..].try_into().unwrap());
-    if header[..8] != MAGIC
-        || header[8..12] != VERSION.to_le_bytes()
-        || header[12..16] != [0; 4]
-        || header[44..60] != [0; 16]
-        || header_crc != crc32fast::hash(&header[..60])
-    {
+    if header[..8] != MAGIC || header_crc != crc32fast::hash(&header[..60]) {
         return Err(corrupt("invalid header"));
+    }
+    if header[8..12] != VERSION.to_le_bytes() || header[44..60] != [0; 16] {
+        return Err(Error::Unsupported {
+            file: path,
+            detail: "another snapshot format version".into(),
+        });
     }
     if field(16) != seq {
         return Err(corrupt("sequence number differs from the file name"));
@@ -136,7 +144,7 @@ pub(crate) fn read<S: Storage>(
         return Err(corrupt("length differs from the header"));
     }
     let mut body = vec![0; len as usize];
-    file.read_at(HEADER_SIZE as u64, &mut body)?;
+    file.read_at(HEADER_SIZE as u64, &mut body).map_err(short)?;
     if u32::from_le_bytes(header[40..44].try_into().unwrap()) != crc32fast::hash(&body) {
         return Err(corrupt("checksum mismatch"));
     }

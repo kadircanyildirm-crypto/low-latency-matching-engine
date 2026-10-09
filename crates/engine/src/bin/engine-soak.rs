@@ -1,7 +1,8 @@
 //! Feeds a recorded command stream into an engine until the stream runs out or the process
-//! is killed, printing `durable <seq>` after every batch: the highest sequence number on
-//! stable storage at that moment. `tests/kill.rs` kills it at random points and checks
-//! what recovery makes of the directory.
+//! is killed, printing `<last> <durable>` after every batch: the sequence number of the last
+//! command journaled and applied, and the highest one on stable storage at that moment.
+//! `tests/kill.rs` kills it at random points and checks what recovery makes of the
+//! directory.
 //!
 //! Usage: `engine-soak <dir> <stream> <always|os> <segment capacity> <snapshot every, 0 for
 //! never> <seed>`
@@ -13,7 +14,7 @@
 use std::io::Write;
 
 use engine::codec::{COMMAND_SIZE, decode_command, decode_snapshot};
-use engine::{Engine, EngineConfig, SyncPolicy};
+use engine::{Discard, Engine, EngineConfig, Seq, SyncPolicy};
 use orderbook::workload::SplitMix64;
 use orderbook::{Command, Event};
 
@@ -46,9 +47,9 @@ fn main() {
         snapshot_every: (every > 0).then_some(every),
         ..EngineConfig::new(config)
     };
-    let (mut engine, _) = Engine::open(dir, config).expect("open the engine");
+    let (mut engine, _) = Engine::open(dir, config, &mut Discard).expect("open the engine");
     let mut rng = SplitMix64::new(seed.parse().expect("seed"));
-    let mut events: Vec<Event> = Vec::new();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
     let mut next = engine.last_seq() as usize;
     let mut out = std::io::stdout().lock();
     while next < commands.len() {
@@ -58,7 +59,7 @@ fn main() {
             .expect("submit");
         events.clear();
         next += n;
-        writeln!(out, "durable {}", engine.durable_seq()).expect("report");
+        writeln!(out, "{} {}", engine.last_seq(), engine.durable_seq()).expect("report");
         out.flush().expect("report");
     }
 }

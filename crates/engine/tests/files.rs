@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use engine::sim::SimStorage;
 use engine::storage::{FsStorage, Storage, StorageFile};
-use engine::{Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport};
+use engine::{Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq};
 use orderbook::{BookConfig, Command, Event};
 
 const DIR: &str = "data";
@@ -17,12 +17,12 @@ fn open(
     storage: &SimStorage,
     config: EngineConfig,
 ) -> Result<(Engine<SimStorage>, RecoveryReport), Error> {
-    Engine::open_with(storage.clone(), Path::new(DIR), config)
+    Engine::open_with(storage.clone(), Path::new(DIR), config, &mut Discard)
 }
 
 fn run(storage: &SimStorage, config: EngineConfig, commands: &[Command]) {
     let (mut engine, _) = open(storage, config).unwrap();
-    let mut events: Vec<Event> = Vec::new();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
     for &command in commands {
         engine.submit(command, &mut events).unwrap();
         events.clear();
@@ -174,12 +174,11 @@ fn a_missing_segment_in_the_middle_is_refused() {
     ));
 }
 
-/// The journal can only end before its snapshot through damage to synced data; the
-/// snapshot then stands, and the journal starts afresh after it.
+/// The journal can only end before its snapshot through damage to synced data, since it is
+/// synced before every snapshot. Recovery refuses, and deletes nothing.
 #[test]
-fn a_journal_that_ends_before_its_snapshot_is_replaced() {
+fn a_journal_that_ends_before_its_snapshot_is_refused() {
     let (book, commands) = common::flow(24, 35);
-    let digests = common::digests(book, &commands);
     let storage = SimStorage::new();
     let config = EngineConfig {
         snapshot_every: Some(30),
@@ -190,13 +189,9 @@ fn a_journal_that_ends_before_its_snapshot_is_replaced() {
     let mut fs = storage.clone();
     fs.remove(&segment(31)).unwrap();
     fs.remove(&segment(21)).unwrap();
-    let (engine, report) = open(&storage, config).unwrap();
-    assert_eq!(report.snapshot, Some(30));
-    assert_eq!(report.journal.removed_segments, 2);
-    assert_eq!(engine.last_seq(), 30);
-    assert_eq!(engine.book().digest(), digests[30]);
-    let names: Vec<_> = storage.files().into_iter().map(|(path, _)| path).collect();
-    assert!(names.contains(&segment(31)));
+    let files = storage.files();
+    assert!(matches!(open(&storage, config), Err(Error::Corrupt { .. })));
+    assert_eq!(storage.files(), files);
 }
 
 /// Damage to the last record of a full segment, when the next segment holds nothing valid,
@@ -458,17 +453,18 @@ fn a_record_in_the_wrong_slot_ends_replay() {
     assert_eq!(report.journal.cleared_records, 1);
 }
 
-/// Snapshot headers whose checksum holds but whose magic, version or reserved bytes are
-/// wrong.
+/// Snapshot headers whose checksum holds: a wrong magic number is damage, and recovery
+/// falls back; another format version, or reserved bytes in use, is a file from another
+/// version, and recovery stops without touching it; the rules version is only a record.
 #[test]
-fn snapshot_headers_need_every_field_valid() {
+fn snapshot_headers_are_checked_field_by_field() {
     let (book, commands) = common::flow(33, 20);
     let digests = common::digests(book, &commands);
     let config = EngineConfig {
         snapshot_every: Some(10),
         ..small(book)
     };
-    for byte in [0, 8, 12, 50] {
+    let with = |byte: usize| {
         let storage = SimStorage::new();
         run(&storage, config, &commands);
         let mut file = storage.clone().open(&snapshot(10)).unwrap();
@@ -478,11 +474,26 @@ fn snapshot_headers_need_every_field_valid() {
         let crc = crc32fast::hash(&header[..60]);
         header[60..].copy_from_slice(&crc.to_le_bytes());
         file.write_at(0, &header).unwrap();
-        let (engine, report) = open(&storage, config).unwrap();
-        assert_eq!(report.damaged_snapshots.len(), 1, "byte {byte}");
-        assert!(report.damaged_snapshots[0].1.contains("invalid header"));
-        assert_eq!(engine.book().digest(), digests[20]);
+        storage
+    };
+    let storage = with(0);
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.damaged_snapshots.len(), 1);
+    assert!(report.damaged_snapshots[0].1.contains("invalid header"));
+    assert_eq!(engine.book().digest(), digests[20]);
+    for byte in [8, 50] {
+        let storage = with(byte);
+        let files = storage.files();
+        assert!(
+            matches!(open(&storage, config), Err(Error::Unsupported { .. })),
+            "byte {byte}"
+        );
+        assert_eq!(storage.files(), files);
     }
+    let storage = with(12);
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.snapshot, Some(10));
+    assert_eq!(engine.book().digest(), digests[20]);
 }
 
 /// A second engine on the same directory is refused while the first is open, on the
@@ -501,12 +512,12 @@ fn one_engine_per_directory() {
 
     let dir = std::env::temp_dir().join(format!("engine-lock-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (first, _) = Engine::open(&dir, small(book)).unwrap();
+    let (first, _) = Engine::open(&dir, small(book), &mut Discard).unwrap();
     assert!(matches!(
-        Engine::open(&dir, small(book)),
+        Engine::open(&dir, small(book), &mut Discard),
         Err(Error::Locked { .. })
     ));
     drop(first);
-    drop(Engine::open(&dir, small(book)).unwrap());
+    drop(Engine::open(&dir, small(book), &mut Discard).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -8,8 +8,8 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use engine::{Engine, EngineConfig, SyncPolicy};
-use orderbook::{Event, EventSink};
+use engine::{Discard, Engine, EngineConfig, Output, Seq, SyncPolicy};
+use orderbook::Event;
 
 struct CountingAllocator;
 
@@ -53,8 +53,8 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 /// Counts events without storing them.
 struct Count(u64);
 
-impl EventSink for Count {
-    fn on_event(&mut self, _: Event) {
+impl Output for Count {
+    fn on_event(&mut self, _: Seq, _: Event) {
         self.0 += 1;
     }
 }
@@ -74,7 +74,7 @@ fn journaling_does_not_allocate() {
             sync,
             ..EngineConfig::new(book)
         };
-        let (mut engine, _) = Engine::open(&dir, config).unwrap();
+        let (mut engine, _) = Engine::open(&dir, config, &mut Discard).unwrap();
         let mut sink = Count(0);
         // Warm up: the book's scratch space and the journal's buffer reach their size.
         let (warmup, measured) = commands.split_at(1_000);

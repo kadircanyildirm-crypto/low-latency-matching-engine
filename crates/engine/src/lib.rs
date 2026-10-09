@@ -27,7 +27,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-pub use engine::{Engine, EngineConfig, RecoveryReport, SyncPolicy};
+pub use engine::{Discard, Engine, EngineConfig, Output, RecoveryReport, SyncPolicy};
 pub use journal::{JournalReport, RECORD_SIZE};
 
 /// A command's position in the total order the sequencer assigns: 1, 2, 3, ...
@@ -64,6 +64,29 @@ pub enum Error {
         /// The directory.
         dir: PathBuf,
     },
+    /// A file was written in a format this version does not read, such as by a newer
+    /// version. Nothing is changed or deleted.
+    Unsupported {
+        /// The file.
+        file: PathBuf,
+        /// What is unsupported.
+        detail: String,
+    },
+    /// Journal segments that replay needs were written under another version of the
+    /// matching rules ([`orderbook::RULES_VERSION`]); replaying them under these rules could
+    /// reach another state. Take a snapshot with the old version first.
+    RulesMismatch {
+        /// The segment.
+        file: PathBuf,
+        /// The rules version it was written under.
+        found: u32,
+    },
+    /// Replaying the journal from an older snapshot did not reach the state of the newer
+    /// one: the matching is not deterministic, or the files do not belong together.
+    Divergence {
+        /// The newer snapshot's sequence number.
+        seq: Seq,
+    },
 }
 
 impl fmt::Display for Error {
@@ -85,6 +108,23 @@ impl fmt::Display for Error {
             Error::Locked { dir } => {
                 write!(f, "another engine has {} open", dir.display())
             }
+            Error::Unsupported { file, detail } => {
+                write!(
+                    f,
+                    "{} is in an unsupported format: {detail}",
+                    file.display()
+                )
+            }
+            Error::RulesMismatch { file, found } => write!(
+                f,
+                "{} was written under matching rules {found}, not {}",
+                file.display(),
+                orderbook::RULES_VERSION
+            ),
+            Error::Divergence { seq } => write!(
+                f,
+                "replaying the journal does not reach the state of the snapshot at {seq}"
+            ),
         }
     }
 }

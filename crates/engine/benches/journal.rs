@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine::{Engine, EngineConfig, SyncPolicy};
+use engine::{Discard, Engine, EngineConfig, Output, Seq, SyncPolicy};
 use hdrhistogram::Histogram;
 use orderbook::workload::{Workload, WorkloadConfig};
 use orderbook::{BookConfig, Command, Event, EventSink, OrderBook};
@@ -24,6 +24,13 @@ struct Count(u64);
 impl EventSink for Count {
     #[inline]
     fn on_event(&mut self, _: Event) {
+        self.0 += 1;
+    }
+}
+
+impl Output for Count {
+    #[inline]
+    fn on_event(&mut self, _: Seq, _: Event) {
         self.0 += 1;
     }
 }
@@ -87,7 +94,7 @@ fn measure(
     warmup: usize,
     batch: usize,
 ) -> Run {
-    let (mut engine, _) = Engine::open(dir, config).unwrap();
+    let (mut engine, _) = Engine::open(dir, config, &mut Discard).unwrap();
     let mut sink = Count::default();
     for chunk in commands[..warmup].chunks(batch) {
         engine.submit_batch(chunk, &mut sink).unwrap();
@@ -196,7 +203,7 @@ fn main() {
     // leave, written and loaded.
     let dir = fresh_dir(&root, "replay");
     {
-        let (mut engine, _) = Engine::open(&dir, os).unwrap();
+        let (mut engine, _) = Engine::open(&dir, os, &mut Discard).unwrap();
         let mut sink = Count::default();
         for chunk in commands[..1_000_000].chunks(4_096) {
             engine.submit_batch(chunk, &mut sink).unwrap();
@@ -204,7 +211,7 @@ fn main() {
         engine.sync().unwrap();
     }
     let start = Instant::now();
-    let (mut engine, report) = Engine::open(&dir, os).unwrap();
+    let (mut engine, report) = Engine::open(&dir, os, &mut Discard).unwrap();
     let elapsed = start.elapsed();
     println!();
     println!(
@@ -219,7 +226,7 @@ fn main() {
     let written = start.elapsed();
     drop(engine);
     let start = Instant::now();
-    let (_, report) = Engine::open(&dir, os).unwrap();
+    let (_, report) = Engine::open(&dir, os, &mut Discard).unwrap();
     let loaded = start.elapsed();
     assert_eq!(report.journal.replayed, 0);
     println!(

@@ -6,18 +6,19 @@ mod common;
 use std::path::Path;
 
 use engine::sim::{CrashModel, SimStorage};
-use engine::{Engine, EngineConfig, Error, SyncPolicy};
+use engine::{Discard, Engine, EngineConfig, Error, Seq, SyncPolicy};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, Event};
 
 const DIR: &str = "data";
 
 fn open(storage: &SimStorage, config: EngineConfig) -> Result<Engine<SimStorage>, Error> {
-    Engine::open_with(storage.clone(), Path::new(DIR), config).map(|(engine, _)| engine)
+    Engine::open_with(storage.clone(), Path::new(DIR), config, &mut Discard)
+        .map(|(engine, _)| engine)
 }
 
 fn submit_all(engine: &mut Engine<SimStorage>, commands: &[Command]) {
-    let mut events: Vec<Event> = Vec::new();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
     for &command in commands {
         engine.submit(command, &mut events).unwrap();
         events.clear();
@@ -47,7 +48,8 @@ fn a_reopened_engine_continues_where_it_stopped() {
     assert_eq!(engine.durable_seq(), 1_234);
     drop(engine);
 
-    let (mut engine, report) = Engine::open_with(storage.clone(), Path::new(DIR), config).unwrap();
+    let (mut engine, report) =
+        Engine::open_with(storage.clone(), Path::new(DIR), config, &mut Discard).unwrap();
     assert_eq!(report.snapshot, None);
     assert_eq!(report.journal.replayed, 1_234);
     assert_eq!(report.journal.cleared_records, 0);
@@ -94,7 +96,8 @@ fn snapshots_bound_replay_and_retention_removes_what_they_supersede() {
     );
     drop(engine);
 
-    let (engine, report) = Engine::open_with(storage.clone(), Path::new(DIR), config).unwrap();
+    let (engine, report) =
+        Engine::open_with(storage.clone(), Path::new(DIR), config, &mut Discard).unwrap();
     assert_eq!(report.snapshot, Some(2_750));
     assert_eq!(report.journal.replayed, 250);
     assert_eq!(engine.book().digest(), digests[3_000]);
@@ -115,7 +118,8 @@ fn a_damaged_snapshot_falls_back_to_the_one_before() {
     drop(engine);
     storage.flip_bit(Path::new("data/snapshot-00000000000000000900.snap"), 12_345);
 
-    let (engine, report) = Engine::open_with(storage.clone(), Path::new(DIR), config).unwrap();
+    let (engine, report) =
+        Engine::open_with(storage.clone(), Path::new(DIR), config, &mut Discard).unwrap();
     assert_eq!(report.snapshot, Some(600));
     assert_eq!(report.damaged_snapshots.len(), 1);
     assert_eq!(report.damaged_snapshots[0].0, 900);

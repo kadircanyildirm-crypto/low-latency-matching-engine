@@ -2,11 +2,13 @@
 //! recovery, to exactly the state its journaled commands lead to.
 //!
 //! A child process (`engine-soak`) feeds a recorded command stream into an engine on the real
-//! file system and reports what is durable after every batch. The test kills it after a
-//! random delay, sometimes in the middle of a write, a sync, a segment roll or a snapshot,
-//! then opens the directory itself and checks that recovery kept at least everything the
-//! child had reported durable, rebuilt exactly the state after the commands it kept, and
-//! that finishing the stream from there ends in the state of a run that was never killed.
+//! file system and reports, after every batch, the last command it journaled and applied.
+//! The test kills it after a random delay, wherever it happens to be, then opens the
+//! directory itself and checks that recovery kept every command the child had reported, as
+//! a killed process loses nothing it wrote to the OS, rebuilt exactly the state after the
+//! commands it kept, and that finishing the stream from there ends in the state of a run
+//! that was never killed. Where exactly the kills land is not controlled; the simulated
+//! disk's tests (`interrupted.rs`) stop the process at every single change instead.
 
 mod common;
 
@@ -15,7 +17,7 @@ use std::process::{Command as Process, Stdio};
 use std::time::Duration;
 
 use engine::codec::{COMMAND_SIZE, encode_command, encode_snapshot};
-use engine::{Engine, EngineConfig, SyncPolicy};
+use engine::{Discard, Engine, EngineConfig, SyncPolicy};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, OrderBook};
 
@@ -99,19 +101,18 @@ fn a_killed_process_recovers_exactly() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if let Some(last) = stdout
                 .lines()
-                .filter_map(|line| line.strip_prefix("durable "))
-                .filter_map(|seq| seq.parse::<usize>().ok())
+                .filter_map(|line| line.split(' ').next()?.parse::<usize>().ok())
                 .next_back()
             {
                 reported = reported.max(last);
             }
 
-            let (engine, report) = Engine::open(&dir, config)
+            let (engine, report) = Engine::open(&dir, config, &mut Discard)
                 .unwrap_or_else(|e| panic!("run {run}, kill {kill}: {e}"));
             let kept = engine.last_seq() as usize;
             assert!(
                 kept >= reported,
-                "run {run}, kill {kill}: reported {reported} durable, recovered {kept}"
+                "run {run}, kill {kill}: reported {reported} applied, recovered {kept}"
             );
             assert_eq!(
                 engine.book().digest(),
@@ -122,7 +123,7 @@ fn a_killed_process_recovers_exactly() {
         }
 
         // Finish the stream in this process.
-        let (mut engine, _) = Engine::open(&dir, config).unwrap();
+        let (mut engine, _) = Engine::open(&dir, config, &mut Discard).unwrap();
         let mut events = Vec::new();
         let start = engine.last_seq() as usize;
         for chunk in commands[start..].chunks(256) {

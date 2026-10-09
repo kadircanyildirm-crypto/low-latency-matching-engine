@@ -294,6 +294,7 @@ impl<C: Core> Server<C> {
             self.exchange.shut_down(&mut self.wires);
             return Err(ServerError::Engine(error));
         }
+        self.exchange.publish(&mut self.wires);
         if now.saturating_sub(self.last_tick) >= self.config.tick.as_nanos() as u64 {
             self.last_tick = now;
             self.exchange.tick(now, &mut self.wires);

@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 core_affinity = "0.8.3"
 engine = { path = "../engine" }
+marketdata = { path = "../marketdata" }
 # Pinned to a release more than two weeks old.
 mio = { version = "=1.2.3", features = ["net", "os-poll"] }
 orderbook = { path = "../orderbook" }

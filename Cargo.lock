@@ -315,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "core_affinity",
  "engine",
+ "marketdata",
  "mio",
  "orderbook",
  "proptest",

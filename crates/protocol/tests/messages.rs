@@ -4,9 +4,9 @@
 use orderbook::{CancelReason, Phase, RejectReason, Side, TimeInForce};
 use proptest::prelude::*;
 use protocol::{
-    HEADER_SIZE, Inbound, LoginError, LogoutReason, MAX_MESSAGE_SIZE, NewOrder, OrderKind,
-    Outbound, ProtocolError, RejectCode, Report, ReportKind, decode_inbound, decode_outbound,
-    encode_inbound, encode_outbound,
+    HEADER_SIZE, Inbound, LevelUpdate, LoginError, LogoutReason, MAX_MESSAGE_SIZE, NewOrder,
+    OrderKind, Outbound, ProtocolError, RejectCode, Report, ReportKind, TradeTick, decode_inbound,
+    decode_outbound, encode_inbound, encode_outbound,
 };
 
 fn side() -> impl Strategy<Value = Side> {
@@ -62,6 +62,7 @@ fn inbound() -> impl Strategy<Value = Inbound> {
             }
         }),
         Just(Inbound::MassCancel),
+        Just(Inbound::Subscribe),
     ]
 }
 
@@ -169,6 +170,40 @@ fn outbound() -> impl Strategy<Value = Outbound> {
                 kind
             })
         ),
+        (any::<u64>(), any::<u32>())
+            .prop_map(|(seq, levels)| Outbound::BookSnapshot { seq, levels }),
+        (
+            any::<u64>(),
+            side(),
+            any::<i64>(),
+            any::<u64>(),
+            any::<u32>()
+        )
+            .prop_map(|(seq, side, price, qty, orders)| Outbound::LevelUpdate(
+                LevelUpdate {
+                    seq,
+                    side,
+                    price,
+                    qty,
+                    orders
+                }
+            )),
+        (
+            any::<u64>(),
+            any::<u64>(),
+            side(),
+            any::<i64>(),
+            any::<u64>()
+        )
+            .prop_map(
+                |(seq, trade_id, side, price, qty)| Outbound::TradeTick(TradeTick {
+                    seq,
+                    trade_id,
+                    side,
+                    price,
+                    qty
+                })
+            ),
     ]
 }
 

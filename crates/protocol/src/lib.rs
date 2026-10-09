@@ -18,6 +18,7 @@
 //! | 5 | `Cancel` | 12 | order id `u64` |
 //! | 6 | `Modify` | 28 | order id `u64`, price `i64`, total quantity `u64` |
 //! | 7 | `MassCancel` | 4 | |
+//! | 8 | `Subscribe` | 4 | |
 //!
 //! Exchange to client:
 //!
@@ -29,11 +30,19 @@
 //! | 104 | `Logout` | 12 | reason `u8`, zero ×7 |
 //! | 105 | `Reject` | 20 | reason `u8`, zero ×7, client ref `u64` |
 //! | 110 | `Report` | 76 | kind, side, code, flags (`u8` each), zero `u32`, sequence number, order id, client ref (`u64`), price `i64`, quantity, leaves, trade id (`u64`), aux `i64` |
+//! | 120 | `BookSnapshot` | 20 | sequence number `u64`, levels `u32`, zero `u32` |
+//! | 121 | `LevelUpdate` | 36 | sequence number `u64`, side `u8`, zero ×3, orders `u32`, price `i64`, quantity `u64` |
+//! | 122 | `TradeTick` | 44 | sequence number, trade id (`u64`), side `u8`, zero ×7, price `i64`, quantity `u64` |
 //!
 //! A `Report` describes one event of the book about one order, as seen by the order's
 //! owner; [`ReportKind`] says which fields each kind uses. The sequence number is that of
 //! the command that caused the event, and an order's id is the sequence number of the
 //! command that placed it.
+//!
+//! Market data is public. After `Subscribe`, a session gets a `BookSnapshot`, the number of
+//! price levels that follow it as `LevelUpdate`s with the same sequence number, bids best
+//! first and then asks; then, as the book changes, `TradeTick`s and `LevelUpdate`s with the
+//! sequence number of the last command they reflect. A level with no orders is gone.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -85,6 +94,8 @@ pub enum Inbound {
     },
     /// Cancels every order of the session's account.
     MassCancel,
+    /// Asks for market data: the book now, then its changes.
+    Subscribe,
 }
 
 /// An order to place.
@@ -154,6 +165,47 @@ pub enum Outbound {
     },
     /// An event of the book about one of the client's orders, or about the market.
     Report(Report),
+    /// The book as of `seq`: the `levels` `LevelUpdate`s that follow describe it.
+    BookSnapshot {
+        /// The sequence number of the last command the book reflects.
+        seq: u64,
+        /// How many levels follow.
+        levels: u32,
+    },
+    /// A price level of the book, as it is after the command `seq`.
+    LevelUpdate(LevelUpdate),
+    /// A trade.
+    TradeTick(TradeTick),
+}
+
+/// A price level, in market data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LevelUpdate {
+    /// The sequence number of the last command the level reflects.
+    pub seq: u64,
+    /// The side.
+    pub side: Side,
+    /// The price.
+    pub price: i64,
+    /// The quantity its orders show; zero, with zero orders, once it is gone.
+    pub qty: u64,
+    /// How many orders rest there.
+    pub orders: u32,
+}
+
+/// A trade, in market data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TradeTick {
+    /// The sequence number of the command that caused it.
+    pub seq: u64,
+    /// The trade's id.
+    pub trade_id: u64,
+    /// The side of the order that took liquidity; the buy side in an uncross.
+    pub side: Side,
+    /// The price.
+    pub price: i64,
+    /// The quantity.
+    pub qty: u64,
 }
 
 /// Why a login failed.
@@ -325,6 +377,7 @@ const NEW_ORDER: u8 = 4;
 const CANCEL: u8 = 5;
 const MODIFY: u8 = 6;
 const MASS_CANCEL: u8 = 7;
+const SUBSCRIBE: u8 = 8;
 
 const LOGIN_ACCEPTED: u8 = 101;
 const LOGIN_REJECTED: u8 = 102;
@@ -332,18 +385,24 @@ const HEARTBEAT_OUT: u8 = 103;
 const LOGOUT_OUT: u8 = 104;
 const REJECT: u8 = 105;
 const REPORT: u8 = 110;
+const BOOK_SNAPSHOT: u8 = 120;
+const LEVEL_UPDATE: u8 = 121;
+const TRADE_TICK: u8 = 122;
 
 /// The length of messages of type `kind`, if it is one.
 fn length_of(kind: u8) -> Option<usize> {
     Some(match kind {
         LOGIN => 20,
-        LOGOUT | HEARTBEAT | MASS_CANCEL | HEARTBEAT_OUT => 4,
+        LOGOUT | HEARTBEAT | MASS_CANCEL | SUBSCRIBE | HEARTBEAT_OUT => 4,
         NEW_ORDER => 44,
         CANCEL => 12,
         MODIFY => 28,
         LOGIN_ACCEPTED | REJECT => 20,
         LOGIN_REJECTED | LOGOUT_OUT => 12,
         REPORT => 76,
+        BOOK_SNAPSHOT => 20,
+        LEVEL_UPDATE => 36,
+        TRADE_TICK => 44,
         _ => return None,
     })
 }
@@ -422,7 +481,7 @@ impl Reader<'_> {
 }
 
 /// Message types a client sends.
-const INBOUND: std::ops::RangeInclusive<u8> = LOGIN..=MASS_CANCEL;
+const INBOUND: std::ops::RangeInclusive<u8> = LOGIN..=SUBSCRIBE;
 
 /// The type and length of the message at the start of `buf`, once the header is there.
 /// Only message types of the direction being read, `inbound` or not, are known.
@@ -492,6 +551,7 @@ pub fn encode_inbound(message: &Inbound, out: &mut Vec<u8>) {
             .u64(qty)
             .done(),
         Inbound::MassCancel => Writer::new(out, MASS_CANCEL).done(),
+        Inbound::Subscribe => Writer::new(out, SUBSCRIBE).done(),
     }
 }
 
@@ -549,6 +609,7 @@ pub fn decode_inbound(buf: &[u8]) -> Result<Option<(Inbound, usize)>, ProtocolEr
             qty: r.u64(),
         },
         MASS_CANCEL => Inbound::MassCancel,
+        SUBSCRIBE => Inbound::Subscribe,
         other => return Err(ProtocolError::UnknownType(other)),
     };
     let mut canonical = Vec::with_capacity(len);
@@ -666,6 +727,27 @@ pub fn encode_outbound(message: &Outbound, out: &mut Vec<u8>) {
                 .i64(f.aux)
                 .done();
         }
+        Outbound::BookSnapshot { seq, levels } => Writer::new(out, BOOK_SNAPSHOT)
+            .u64(seq)
+            .u32(levels)
+            .zeros(4)
+            .done(),
+        Outbound::LevelUpdate(level) => Writer::new(out, LEVEL_UPDATE)
+            .u64(level.seq)
+            .u8(side_code(level.side))
+            .zeros(3)
+            .u32(level.orders)
+            .i64(level.price)
+            .u64(level.qty)
+            .done(),
+        Outbound::TradeTick(trade) => Writer::new(out, TRADE_TICK)
+            .u64(trade.seq)
+            .u64(trade.trade_id)
+            .u8(side_code(trade.side))
+            .zeros(7)
+            .i64(trade.price)
+            .u64(trade.qty)
+            .done(),
     }
 }
 
@@ -765,6 +847,35 @@ pub fn decode_outbound(buf: &[u8]) -> Result<Option<(Outbound, usize)>, Protocol
                 order_id,
                 client_ref,
                 kind,
+            })
+        }
+        BOOK_SNAPSHOT => Outbound::BookSnapshot {
+            seq: r.u64(),
+            levels: r.u32(),
+        },
+        LEVEL_UPDATE => {
+            let seq = r.u64();
+            let side = side_of(r.u8())?;
+            r.skip(3);
+            let orders = r.u32();
+            Outbound::LevelUpdate(LevelUpdate {
+                seq,
+                side,
+                orders,
+                price: r.i64(),
+                qty: r.u64(),
+            })
+        }
+        TRADE_TICK => {
+            let (seq, trade_id) = (r.u64(), r.u64());
+            let side = side_of(r.u8())?;
+            r.skip(7);
+            Outbound::TradeTick(TradeTick {
+                seq,
+                trade_id,
+                side,
+                price: r.i64(),
+                qty: r.u64(),
             })
         }
         other => return Err(ProtocolError::UnknownType(other)),

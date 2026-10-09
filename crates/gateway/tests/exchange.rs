@@ -1113,3 +1113,110 @@ fn a_closing_sessions_orders_are_reported_to_the_next_session() {
         ]
     );
 }
+
+/// A client that subscribes in the middle of trading, applying the snapshot and then every
+/// update, holds exactly the book's depth after every publish; trades come as ticks.
+#[test]
+fn market_data_rebuilds_the_depth() {
+    for seed in 0..20u64 {
+        let accounts: Vec<Account> = (1..=3).map(account).collect();
+        let mut exchange = exchange(&accounts);
+        let mut mail = Mail::default();
+        for (session, id) in [(0, 1), (1, 2), (2, 3)] {
+            logged_in(&mut exchange, session, id, &mut mail);
+        }
+        let mut rng = orderbook::workload::SplitMix64::new(seed);
+        let subscribe_at = rng.below(200);
+        // The client's view: price levels by side and price.
+        let mut view: std::collections::BTreeMap<(bool, i64), (u64, u32)> = Default::default();
+        let mut subscribed = false;
+        let mut last_seq = 0;
+        let mut ticks = 0;
+        for step in 0..400u64 {
+            if step == subscribe_at {
+                exchange.receive(2, Inbound::Subscribe, 1, &mut mail);
+                subscribed = true;
+            }
+            let session = rng.below(3) as usize;
+            let side = if rng.below(2) == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let price = 95 + rng.below(11) as i64;
+            let message = match rng.below(10) {
+                0..=5 => Inbound::NewOrder(NewOrder {
+                    client_ref: step,
+                    side,
+                    qty: 1 + rng.below(5),
+                    kind: OrderKind::Limit {
+                        price,
+                        tif: TimeInForce::Gtc,
+                        display: (rng.below(4) == 0).then_some(1),
+                    },
+                }),
+                6 => Inbound::NewOrder(NewOrder {
+                    client_ref: step,
+                    side,
+                    qty: 1 + rng.below(8),
+                    kind: OrderKind::Market,
+                }),
+                7..=8 => Inbound::Cancel {
+                    order_id: 1 + rng.below(step + 1),
+                },
+                _ => Inbound::Modify {
+                    order_id: 1 + rng.below(step + 1),
+                    price,
+                    qty: 1 + rng.below(5),
+                },
+            };
+            exchange.receive(session, message, 1, &mut mail);
+            if rng.below(3) == 0 {
+                exchange.flush(&mut mail).unwrap();
+                exchange.publish(&mut mail);
+            }
+            // The client reads what it got.
+            for message in mail.take(2) {
+                match message {
+                    Outbound::BookSnapshot { seq, levels } => {
+                        view.clear();
+                        last_seq = seq;
+                        assert!(levels < 100);
+                    }
+                    Outbound::LevelUpdate(update) => {
+                        assert!(update.seq >= last_seq, "seed {seed}: updates go forward");
+                        last_seq = update.seq;
+                        let key = (update.side == Side::Buy, update.price);
+                        if update.orders == 0 {
+                            assert_eq!(update.qty, 0);
+                            view.remove(&key);
+                        } else {
+                            view.insert(key, (update.qty, update.orders));
+                        }
+                    }
+                    Outbound::TradeTick(tick) => {
+                        assert!(tick.seq >= last_seq);
+                        ticks += 1;
+                    }
+                    _ => {}
+                }
+            }
+            mail.sent.clear();
+            if subscribed && !exchange.has_batch() {
+                let book: std::collections::BTreeMap<(bool, i64), (u64, u32)> =
+                    [Side::Buy, Side::Sell]
+                        .into_iter()
+                        .flat_map(|side| {
+                            exchange
+                                .book()
+                                .depth(side)
+                                .map(move |l| ((side == Side::Buy, l.price), (l.qty, l.orders)))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                assert_eq!(view, book, "seed {seed}, step {step}");
+            }
+        }
+        assert!(ticks > 0, "seed {seed}");
+    }
+}

@@ -20,10 +20,11 @@ use std::fmt;
 
 use engine::storage::Storage;
 use engine::{Engine, Error, Output, Seq};
+use marketdata::Depth;
 use orderbook::{Command, Event, OrderBook, OrderId, Side};
 use protocol::{
-    Inbound, LoginError, LogoutReason, NewOrder, OrderKind, Outbound, RejectCode, Report,
-    ReportKind, VERSION,
+    Inbound, LevelUpdate, LoginError, LogoutReason, NewOrder, OrderKind, Outbound, RejectCode,
+    Report, ReportKind, TradeTick, VERSION,
 };
 
 use crate::accounts::Account;
@@ -100,6 +101,8 @@ struct Session {
     refilled: u64,
     /// Set once the session is being closed: nothing more is taken from or sent to it.
     closing: bool,
+    /// Whether it gets market data.
+    subscribed: bool,
 }
 
 impl Session {
@@ -156,6 +159,16 @@ pub struct Exchange {
     last_seq: Seq,
     /// The time passed with the latest call.
     now: u64,
+    /// The book's depth, kept from the events.
+    depth: Depth,
+    /// Trades delivered and not yet published.
+    trades: Vec<TradeTick>,
+    /// The sequence number of the last command whose events were delivered, and of the
+    /// last one whose effect on the depth was published.
+    delivered: Seq,
+    published: Seq,
+    /// Scratch space for the changed levels.
+    updates: Vec<LevelUpdate>,
 }
 
 impl Exchange {
@@ -200,6 +213,11 @@ impl Exchange {
             in_flight: VecDeque::new(),
             last_seq,
             now: 0,
+            depth: Depth::of(book),
+            trades: Vec::new(),
+            delivered: last_seq,
+            published: last_seq,
+            updates: Vec::new(),
         };
         for (id, account) in live {
             if id > last_seq {
@@ -254,6 +272,7 @@ impl Exchange {
             tokens: 0,
             refilled: now,
             closing: false,
+            subscribed: false,
         });
     }
 
@@ -284,6 +303,7 @@ impl Exchange {
             }
             Inbound::Logout => self.end(session, LogoutReason::Requested, mail),
             Inbound::Heartbeat => {}
+            Inbound::Subscribe => self.subscribe(session, mail),
             entry => {
                 let client_ref = match entry {
                     Inbound::NewOrder(order) => order.client_ref,
@@ -436,7 +456,7 @@ impl Exchange {
                 qty,
             },
             Inbound::MassCancel => Command::CancelAll { owner: account },
-            Inbound::Login { .. } | Inbound::Logout | Inbound::Heartbeat => {
+            Inbound::Login { .. } | Inbound::Logout | Inbound::Heartbeat | Inbound::Subscribe => {
                 unreachable!("not an order-entry message")
             }
         };
@@ -514,6 +534,79 @@ impl Exchange {
         self.batch = batch;
         self.batch.clear();
         result.map(|_| ()).inspect_err(|_| self.shut_down(mail))
+    }
+
+    /// Sends the subscribed sessions what changed in the market since the last call: the
+    /// trades, then the levels that changed, as they are now, all under the sequence number
+    /// of the last command delivered. The network layer calls it after delivering events.
+    pub fn publish(&mut self, mail: &mut impl Mailbox) {
+        let seq = self.delivered;
+        self.updates.clear();
+        self.updates
+            .extend(self.depth.changes().map(|update| LevelUpdate {
+                seq,
+                side: update.side,
+                price: update.price,
+                qty: update.level.qty,
+                orders: update.level.orders,
+            }));
+        self.published = seq;
+        if self.trades.is_empty() && self.updates.is_empty() {
+            return;
+        }
+        for session in 0..self.sessions.len() {
+            if self.sessions[session]
+                .as_ref()
+                .is_some_and(|s| s.subscribed && s.open())
+            {
+                for &trade in &self.trades {
+                    mail.send(session, Outbound::TradeTick(trade));
+                }
+                for &level in &self.updates {
+                    mail.send(session, Outbound::LevelUpdate(level));
+                }
+                self.sessions[session]
+                    .as_mut()
+                    .expect("a session")
+                    .last_sent = self.now;
+            }
+        }
+        self.trades.clear();
+    }
+
+    /// Sends `session` the book as it was last published, and marks it for what follows.
+    /// Subscribing again sends the book again: a client that lost track starts over.
+    fn subscribe(&mut self, session: SessionId, mail: &mut impl Mailbox) {
+        // What was delivered but not yet published goes out first, to the others, so the
+        // book sent here is the one the next changes start from.
+        self.publish(mail);
+        let seq = self.published;
+        let levels = [Side::Buy, Side::Sell]
+            .iter()
+            .map(|&side| self.depth.levels(side).count())
+            .sum::<usize>();
+        let levels = u32::try_from(levels).expect("fewer levels than u32::MAX");
+        self.send(session, Outbound::BookSnapshot { seq, levels }, mail);
+        for side in [Side::Buy, Side::Sell] {
+            for (price, level) in self.depth.levels(side) {
+                let update = LevelUpdate {
+                    seq,
+                    side,
+                    price,
+                    qty: level.qty,
+                    orders: level.orders,
+                };
+                mail.send(session, Outbound::LevelUpdate(update));
+            }
+        }
+        if let Some(state) = self.sessions[session].as_mut() {
+            state.subscribed = true;
+        }
+    }
+
+    /// The book's depth, as the delivered events left it.
+    pub fn depth(&self) -> &Depth {
+        &self.depth
     }
 
     /// The engine failed and takes no more commands: every session is logged out, and the
@@ -644,6 +737,24 @@ impl Exchange {
     /// sessions it concerns. Events must come in sequence order.
     pub fn deliver(&mut self, seq: Seq, event: Event, mail: &mut impl Mailbox) {
         let command = self.command(seq);
+        self.depth.apply(&event);
+        self.delivered = seq;
+        if let Event::Trade {
+            trade_id,
+            taker_side,
+            price,
+            qty,
+            ..
+        } = event
+        {
+            self.trades.push(TradeTick {
+                seq,
+                trade_id,
+                side: taker_side,
+                price,
+                qty,
+            });
+        }
         match event {
             Event::Accepted { id } => self.tell_owner(seq, id, ReportKind::Accepted, mail),
             Event::Rejected { id, reason } => {

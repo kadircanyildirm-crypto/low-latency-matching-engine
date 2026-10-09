@@ -62,7 +62,7 @@ enum Step {
 }
 
 /// A random scenario: orders of every kind, cancels and modifies of recent ids, mass
-/// cancels, reconnects.
+/// cancels, reconnects, subscriptions to market data.
 fn scenario(seed: u64, len: usize) -> Vec<Step> {
     let mut rng = SplitMix64::new(seed);
     let mut next_ref = 0;
@@ -122,6 +122,7 @@ fn scenario(seed: u64, len: usize) -> Vec<Step> {
                 ),
                 30 => Step::Send(session, Inbound::MassCancel),
                 31 => Step::Reconnect(session),
+                32 => Step::Send(session, Inbound::Subscribe),
                 _ => Step::Flush,
             }
         })
@@ -210,6 +211,7 @@ fn the_pipeline_replies_as_the_engine_does() {
         let mut direct = Mail::default();
         play(&steps, &mut exchange, &mut direct, |exchange, mail| {
             exchange.flush(&mut engine, mail).unwrap();
+            exchange.publish(mail);
         });
 
         // The pipeline.
@@ -235,6 +237,7 @@ fn the_pipeline_replies_as_the_engine_does() {
         let mut piped = Mail::default();
         play(&steps, &mut exchange, &mut piped, |exchange, mail| {
             settle(&mut pipeline, exchange, mail);
+            exchange.publish(mail);
         });
         if let Some(at) =
             (0..piped.0.len().max(direct.0.len())).find(|&i| piped.0.get(i) != direct.0.get(i))

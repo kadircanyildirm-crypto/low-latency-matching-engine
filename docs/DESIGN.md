@@ -2,7 +2,7 @@
 
 This document explains what the order book in `crates/orderbook` does, how, and why. It
 also says what it deliberately does not do yet. Every claim here is backed by a test.
-The [verification](#10-verification) section says which one.
+The [verification](#11-verification) section says which one.
 
 ## 1. Goals
 
@@ -11,7 +11,7 @@ The [verification](#10-verification) section says which one.
 | Deterministic | One thread, no clocks, no randomness, no iteration over hash maps. The event stream is a pure function of the command stream, so state can be rebuilt by replay (Phase 2) and mirrored by a standby (Phase 6). |
 | Predictable latency | No heap allocation after construction, O(1) work per order touched, cache-friendly layout. |
 | Exchange-grade semantics | Price-time priority, owner checks, FIX-style modifies, self-trade prevention, price protection, explicit rejections. |
-| Safe | No `unsafe` code; quantity sums cannot overflow for any input (§8); property tests feed extreme values (`u64::MAX` quantities, `i64::MIN`/`MAX` prices) without a panic. |
+| Safe | No `unsafe` code; quantity sums cannot overflow for any input (§9); property tests feed extreme values (`u64::MAX` quantities, `i64::MIN`/`MAX` prices) without a panic. |
 
 ## 2. Data model
 
@@ -43,7 +43,7 @@ The [verification](#10-verification) section says which one.
  stop ladders: two more ladders of the same shape, keyed by trigger level; buy stops
                run like asks (lowest trigger first), sell stops like bids
  iceberg parts: (display, visible) per slot, beside the slab; a level's total counts
-                what its orders show
+                what its orders show, and the level counts its icebergs
  owner lists: one list per owner, head/tail in a table indexed by owner id,
               prev/next in a links array indexed by order slot
 ```
@@ -111,14 +111,16 @@ does not need to record it.
 
 | Command | Events |
 |---|---|
-| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention, and `Replenished` right after a trade that uses up an iceberg's tranche), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only |
+| `Limit` / `Market` | `Rejected` alone, or `Accepted`, then `Trade`s (with `Cancelled{SelfTrade}` for resting orders removed by self-trade prevention, and `Replenished` right after a trade that uses up an iceberg's tranche), then at most one of `Rested` or `Cancelled` for the remainder. A fill-or-kill order that cannot fill emits `Accepted` and `Cancelled{FillOrKill}` only. In a call phase a limit order emits `Accepted` and `Rested` only. A market order that the band stops, with `auction_on_band`, is followed by `PhaseChanged{Auction}` |
 | `Cancel` | `Cancelled{Requested}` or `Rejected` |
 | `Modify` | `Rejected`, or `Modified` followed, if priority is lost, by the events of a new limit order |
 | `Stop` | `Rejected`, or `Accepted` and `StopPlaced` |
 | `CancelAll` | `Cancelled{MassCancel}` for each of the owner's resting orders in book order, then each of its pending stops in trigger order, then `MassCancelled{owner, count}`. Never rejected; `count` is zero if the owner had nothing |
+| `SetPhase` | Leaving a call phase: the uncross's `Trade`s, each followed by `Replenished` for the icebergs whose tranche it used up (the buy order's first). Then `PhaseChanged{phase}`. Never rejected |
 | any command that trades | then, for each stop its trades reached, `Triggered` and the events of the order the stop becomes |
 
 Every `Trade` carries the trade id and both sides' remaining open quantity (`leaves`).
+An uncross trade has no aggressor; it reports the buy order as the `taker`.
 A participant can therefore track its orders from events alone; the soak test checks
 exactly that. Sequence numbers are deliberately absent. The sequencer numbers commands
 when it journals them (Phase 2), and the publisher numbers outgoing messages (Phase 4).
@@ -138,6 +140,7 @@ The engine itself has no notion of time or transport.
 | `Modify` | FIX cancel/replace on **total** quantity; see below. Only the owner may modify. |
 | `Stop` | Waits off the book, invisible to market data, until a trade reaches its trigger; then works as a market order, or as a GTC limit order if it has a limit price. See below. |
 | `CancelAll` | Removes every resting order and pending stop of one owner, as on a session disconnect. |
+| `SetPhase` | Moves the book to another trading phase; leaving a call phase uncrosses it. See §7. |
 
 **Modify uses total quantity, as FIX does.** Suppose a participant sends "reduce 10 to 8"
 while 5 lots are filling:
@@ -214,7 +217,7 @@ random sequence.
 | Maximum order size | `qty` must be in `1..=max_order_qty` (`InvalidQuantity`). |
 | Price protection | Measured from the opposite best price when the order arrives. A market order stops trading `price_protection` ticks beyond it (`Cancelled{PriceProtection}`). A limit or modify priced further through is rejected (`PriceOutsideProtection`). If the opposite side is empty, there is nothing to protect against. |
 | Price band | Measured from the reference price: the last trade, or the configured `reference_price` (a previous close, say) before the first one. A limit or modify priced more than `price_band` ticks through it is rejected (`PriceOutsideBand`), and a market order stops there (`Cancelled{PriceBand}`). With both controls on, a market order stops at the tighter cap and names it; a tie names price protection. The reference is part of the state, in snapshots and the digest. |
-| Self-trade prevention | Two orders of the same owner never trade. `CancelResting` removes the resting order and keeps matching. `CancelIncoming` cancels the rest of the incoming order and leaves the book untouched. |
+| Self-trade prevention | Two orders of the same owner never trade in continuous trading. `CancelResting` removes the resting order and keeps matching. `CancelIncoming` cancels the rest of the incoming order and leaves the book untouched. The uncross does not apply it (§7). |
 | Owner ids | A new order must come from an owner id below `max_owners` (`InvalidOwner`). This is the first check, before quantity and price. |
 | Ownership | Cancels and modifies of someone else's order are rejected as `UnknownOrder`, exactly like a missing order, so others' order ids do not leak. |
 
@@ -237,11 +240,106 @@ whose participants price off a fair value that drifts on its own, with four owne
 Pulling the band's reference into the current spread barely helped (72-85% one-sided at
 1-4 ticks), and it let a stale quote above the last trade move the reference, the very
 weakness the band is meant to avoid, so it was dropped. Exchanges re-anchor a band
-differently: a breach halts trading, and a reopening auction sets a new reference.
-Halts and auctions are the next step on the roadmap. Until then, a band suits flows that
-trade within it, and the banded soak flow uses a 10-tick band for that reason.
+differently: a breach halts trading, and a reopening auction sets a new reference. The
+book can do that too (`auction_on_band`, §7), and the same experiment shows it keeps the
+book alive at a price in time spent in calls.
 
-## 7. Capacity and admission
+## 7. Trading phases and auctions
+
+| Phase | Accepts | Trades |
+|---|---|---|
+| `Continuous` | everything | on arrival, as in §4 |
+| `Auction`: a call (opening, closing, reopening) | limit orders, stops, modifies, cancels; refuses market, IOC and FOK orders (`AuctionCall`) | nothing until the call ends, so the book may cross |
+| `Halted` | cancels and mass cancels only (`TradingHalted`) | nothing |
+| `Closed` | cancels and mass cancels only (`MarketClosed`) | nothing |
+
+`SetPhase` moves the book between phases. The sequencer decides when, so phases are part
+of the command stream and replay like any other command. It is never rejected, and setting
+the phase the book is already in only reports it. Continuous trading pays one branch on the
+phase per order.
+
+**In a call phase nothing trades on arrival.** So price protection and the band, which
+guard against what an order trades on arrival, do not apply: the uncross is what finds the
+new price, and a reopening call held to the band could never move it. Post-only keeps its
+rule not to cross the opposite side. And since no match frees a slot, a full book refuses
+every new order, crossing or not.
+
+**The uncross.** Every way out of a call executes everything that can trade, at one price.
+The candidates are the prices of the orders on the book and the reference price. At each,
+the executable quantity is the smaller of the bids at or above it and the asks at or below
+it, hidden iceberg quantity included. The rules, each breaking the ties the previous one
+leaves:
+
+1. the most executable quantity;
+2. the least surplus, the quantity left over on the larger side;
+3. market pressure: if every remaining price leaves its surplus on the buy side, the
+   highest; if every one leaves it on the sell side, the lowest;
+4. the closest to the reference price;
+5. the lowest.
+
+No price between two candidates executes more: there, the bids add up to what they do at
+the candidate above and the asks to what they do at the candidate below. Rule 4 never
+ties. The reference is itself a candidate, and when it lies between two tied prices it ties
+too, because the bid sum only falls and the ask sum only rises with the price. So the
+closest tied price is simply the reference clamped to the tied range, and rule 5 decides
+only when there is no reference price. The random tests found this: "the lower of two
+equally close" never happened, and the proof explains why.
+
+Execution follows price-time priority on both sides. The oldest order at the best bid
+trades with the oldest at the best ask, at the auction price, as much as both show, until
+one side has nothing left at or through that price. Icebergs go one tranche at a time,
+each new tranche to the back of its level, as in continuous trading. One side fills
+completely, and the other in priority order, so the last order it reaches may fill in part.
+At the volume-maximizing price this always leaves the book uncrossed: a bid and an ask left
+crossing each other would mark a price that executes more. The auction price becomes the
+reference price and so re-anchors the band.
+
+**Cost.** The price search walks the occupied levels between the best ask and the best bid
+and reads each level's total in O(1); only a level where an iceberg rests has its queue
+summed, for the hidden quantity. Each level counts its icebergs, in four bytes that were
+padding. The first version summed every order in the crossed range, and the latency bench
+caught it: phase changes took 23 µs on average and 4 ms at p99.9. Now they take 0.6 µs on
+average, 5.5 µs at p99 and 10 µs at p99.9. The uncross allocates nothing.
+
+**Decisions.**
+
+- *Market, IOC and FOK orders are refused in a call.* They exist to trade at once. Many
+  exchanges accept market orders into auctions, with priority at the auction price; that
+  is a deferral (§12).
+- *No self-trade prevention in the uncross.* Removing an order that crosses the auction
+  price can leave the rest crossed at another price, which one price cannot clear. Take
+  one owner's bid of 10 at 101 and ask of 10 at 99, and another owner's ask of 5 at 100.
+  The auction price is 99, where the first owner's two orders match exactly. Cancel the
+  ask to prevent the self-trade, and the bid stays crossed with the ask at 100. So an
+  owner whose orders cross each other at the auction price trades with itself.
+- *Stops.* The uncross's trades reach triggers like any others, and the stops they reach
+  are released once the new phase is in force. A released stop becomes its order under that
+  phase: in continuous trading it trades; in a call a stop-limit rests and a stop-market is
+  cancelled (`TradingPhase`); while halted or closed, both are cancelled. A halt leaves
+  pending stops pending, since nothing trades, and they can still be cancelled.
+- *Invariant.* A crossed book exists only in a call phase. `validate()` checks it, and
+  `restore()` refuses a crossed snapshot in any other phase.
+
+**A volatility interruption keeps a banded book alive, measured.** With `auction_on_band`,
+a market order that the band stops short of liquidity beyond it moves the book into a call.
+The market-health experiment (§6) adds rows in which the experiment, as the sequencer,
+reopens with an uncross 100 or 1,000 commands later:
+
+| Control | One-sided | In a call | Calls | Trades |
+|---|---:|---:|---:|---:|
+| band 1 / 2 / 4 / 8 / 50 ticks, alone | 70 / 90 / 83 / 62 / 46% | 0% | 0 | 216 / 621 / 9k / 34k / 96k |
+| the same, reopened after 100 commands | 0% | 84 / 73 / 60 / 33 / 6% | 4,152 ... 255 | 152k / 144k / 155k / 168k / 196k |
+| the same, reopened after 1,000 commands | 0% | 91 / 84 / 71 / 49 / 5% | 456 ... 28 | 137k / 156k / 147k / 164k / 196k |
+
+Every reopening re-anchors the band, so the book never freezes: no sample finds it
+one-sided, and it trades 69-98% as much as with no control at all. The price is time in
+calls. A band tight against the flow's drift is breached by the next market order after
+nearly every reopening, so at 1-2 ticks the book spends 73-91% of its time in calls, where
+the flow's market orders are refused. At 50 ticks it is in a call 5-6% of the time and
+trades within 2% of an unrestricted book. A halt is therefore a remedy for a band that is
+rarely breached, not a substitute for choosing its width.
+
+## 8. Capacity and admission
 
 The book holds at most `max_orders` resting orders and pending stops. A new stop needs a
 free slot. When the book is full, a new GTC or
@@ -254,9 +352,10 @@ orders never rest, so they are never refused. A crossing order always finds a sl
 
 Under `CancelIncoming` the remainder is cancelled instead of resting. A modify frees its
 own slot before it re-enters. So the pool can never be exhausted mid-command. `alloc`
-still asserts this, so a bug fails loudly instead of corrupting state.
+still asserts this, so a bug fails loudly instead of corrupting state. In a call phase
+nothing matches, so a full book refuses every new order that would rest (§7).
 
-## 8. Overflow safety
+## 9. Overflow safety
 
 `BookConfig` requires `max_orders × max_order_qty ≤ u64::MAX` and asserts it at
 construction. Every quantity sum in the book is a sum over at most `max_orders` orders,
@@ -268,18 +367,19 @@ This rule exists because an earlier version had no limit. Two orders of `u64::MA
 lots at one price made the level total wrap to 1 in release builds, and the old
 `validate()` wrapped the same way and reported success.
 
-## 9. Snapshots and state digest
+## 10. Snapshots and state digest
 
 `snapshot()` returns the book's complete state:
 - its configuration;
-- the trade counter;
-- every resting order with its owner, price, and open and filled quantity.
+- the trade counter, the reference price and the trading phase;
+- every resting order with its owner, price, and open and filled quantity;
+- every pending stop.
 
 Orders come in canonical order: bids best price first, then asks best price first, and
 each level in time priority. `restore()` rebuilds a book from a snapshot directly,
 without replaying commands. It refuses snapshots the engine could never have produced:
-too many orders, duplicate ids, orders that could not rest, a crossed book, or an
-exhausted trade counter.
+too many orders, duplicate ids, orders that could not rest, a crossed book outside a call
+phase, or an exhausted trade counter.
 
 Two properties make snapshots safe to build on:
 
@@ -298,27 +398,27 @@ macOS. The digest detects accidental divergence; it is not a cryptographic hash.
 
 Snapshots are plain data. Writing them to disk, and deciding when, belongs to Phase 2.
 
-## 10. Verification
+## 11. Verification
 
 | Layer | What it shows |
 |---|---|
 | `tests/scenarios.rs` | One rule per test, with the exact expected event sequence. |
-| `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. |
-| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; exactly the stops the command's trades reached trigger, in the order the rules release them; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. Each part of a command, its own effect and then each stop it releases, yields the state the rules say it must leave, and the engine's book must equal the end of that chain. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
+| `tests/differential.rs` | Over random configurations and command sequences, the engine and a deliberately naive reference (`BTreeMap` + `VecDeque`, no shared code) produce identical events and books, with `validate()` checked after every command. Two runs in three change phases; the reference finds the auction price by scoring every candidate and filtering the list rule by rule. A second strategy builds small calls whose sums tie, so every auction rule gets to decide. |
+| `tests/properties.rs` | Specification checks that do not rely on a second implementation, after every command: each trade is with the next order in price-time priority, at the maker's price, within the limit or protection cap, never between the same owner, and as large as possible; leaves, trade ids and quantity add up; a remainder rests only when nothing more can trade; orders the command did not reach are unchanged; rejected commands change nothing; icebergs trade only what they show and replenish at the back of the queue; no command emits more events than its rules allow for the orders on the book; exactly the stops the command's trades reached trigger, in the order the rules release them, and become what the phase lets them; in a call phase orders rest without trading; each uncross trades at one price that no candidate beats under the auction rules, pairs both sides in priority order and leaves the book uncrossed; and a command is rejected exactly when a rule requires it, with that rule's reason. The events are replayed against a copy of the opposite side, so the checker follows iceberg tranches as they move. Each part of a command, its own effect and then each stop it releases, yields the state the rules say it must leave, and the engine's book must equal the end of that chain. The last check runs in both directions: an order that should have been refused but was accepted can leave a perfectly healthy-looking book, so acceptance has to be justified too. |
 | `tests/soak.rs` | Hundreds of thousands of commands of realistic multi-participant flow against the reference, under both self-trade policies; participants rebuild the book from events alone. |
-| `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for three flows that between them cover both self-trade policies, protection and band stops, and rejections. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
-| `tests/market_health.rs` | An ignored experiment, run by hand: how long each price control leaves one side of the book empty under a harsh flow (see §6). |
+| `tests/soak.rs` (golden) | Pinned fingerprints of all events, and pinned digests of the final book, for four flows that between them cover both self-trade policies, protection and band stops, rejections, and trading phases with their uncrosses and volatility interruptions. CI runs them on Linux, Windows and macOS, which shows the output is identical across platforms. |
+| `tests/market_health.rs` | An ignored experiment, run by hand: how long each price control leaves one side of the book empty under a harsh flow, with and without volatility interruptions (§6, §7). |
 | `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |
-| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), in a deep book, and under frequent mass cancels, and none when computing the digest. |
+| `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), in a deep book, under frequent mass cancels, and through phase changes and uncrosses, and none when computing the digest. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
-| Mutation testing | `cargo mutants` injects 340 small faults into the engine. The tests detect every one of the 319 that compile ([results](../README.md#mutation-testing)). |
+| Mutation testing | Before trading phases, `cargo mutants` injected 340 small faults into the engine, and the tests detected every one of the 319 that compile ([results](../README.md#mutation-testing)). The phase code has not been through a run yet. |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just
 outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, with
 `max_order_qty` itself either small or at the overflow limit.
 
-## 11. Known limitations and deliberate deferrals
+## 12. Known limitations and deliberate deferrals
 
 | Limitation | Plan |
 |---|---|
@@ -326,8 +426,11 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
-| A price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6) | Next: trading halts and a reopening auction that sets a new reference |
+| Without `auction_on_band`, a price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6). With it, a band tight against the market's moves keeps the book in calls most of the time (§7) | The band's width is a configuration choice; widening the band during a call, as some exchanges do, is not implemented |
+| Calls refuse market orders; there are no auction-only order types, no published imbalance, and no collar on the auction price besides the static band. Market data can read `indicative_uncross()` | Phase 7 |
+| The uncross does not prevent self-trades (§7) | Phase 7, with per-order self-trade instructions |
+| Calls end only when the sequencer says so; the engine has no timers or random call ends | Phase 4: the sequencer schedules phase changes |
+| An uncross sums the queues of the crossed levels where icebergs rest, so its cost grows with those orders | Measure first; a per-level hidden quantity would remove it at 8 bytes per level per side |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
-| No market states: trading halts, opening and closing auctions | Phase 7 |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |

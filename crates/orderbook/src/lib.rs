@@ -56,8 +56,8 @@ mod types;
 pub mod workload;
 
 pub use book::{
-    BookConfig, BookSnapshot, Depth, LevelInfo, OrderBook, OrderInfo, Queue, QueuedOrder,
-    SnapshotError, SnapshotOrder, StopOrder, Stops,
+    BookConfig, BookSnapshot, ConfigError, Depth, LevelInfo, OrderBook, OrderInfo, Queue,
+    QueuedOrder, SnapshotError, SnapshotOrder, StopOrder, Stops,
 };
 pub use types::{
     CancelReason, Command, Event, EventSink, OrderId, OwnerId, Phase, Price, Qty, RejectReason,

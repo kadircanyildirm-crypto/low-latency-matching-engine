@@ -499,6 +499,114 @@ fn configs_that_could_overflow_are_refused() {
     });
 }
 
+/// `check` names each problem `OrderBook::new` would panic on, and accepts the limits.
+#[test]
+fn config_check_names_each_problem() {
+    use orderbook::ConfigError::*;
+    let base = BookConfig::new(1, 100, 2);
+    let cases = [
+        (
+            BookConfig {
+                max_price: 0,
+                ..base
+            },
+            EmptyBand,
+        ),
+        (
+            BookConfig {
+                min_price: 0,
+                max_price: i64::from(u32::MAX) - 1,
+                ..base
+            },
+            BandTooWide,
+        ),
+        (
+            BookConfig {
+                max_orders: 0,
+                ..base
+            },
+            MaxOrdersOutOfRange,
+        ),
+        (
+            BookConfig {
+                max_orders: u32::MAX,
+                max_order_qty: 1,
+                ..base
+            },
+            MaxOrdersOutOfRange,
+        ),
+        (
+            BookConfig {
+                max_order_qty: 0,
+                ..base
+            },
+            ZeroMaxOrderQty,
+        ),
+        (
+            BookConfig {
+                max_owners: 0,
+                ..base
+            },
+            ZeroMaxOwners,
+        ),
+        (
+            BookConfig {
+                max_order_qty: u64::MAX / 2 + 1,
+                ..base
+            },
+            CapacityOverflow,
+        ),
+        (
+            BookConfig {
+                reference_price: Some(0),
+                ..base
+            },
+            ReferenceOutsideBand,
+        ),
+        (
+            BookConfig {
+                reference_price: Some(101),
+                ..base
+            },
+            ReferenceOutsideBand,
+        ),
+    ];
+    for (config, error) in cases {
+        assert_eq!(config.check(), Err(error), "{config:?}");
+        assert!(!error.to_string().is_empty());
+    }
+    let limits = [
+        BookConfig {
+            max_price: 1,
+            ..base
+        },
+        BookConfig {
+            min_price: 0,
+            max_price: i64::from(u32::MAX) - 2,
+            max_orders: 1,
+            ..base
+        },
+        BookConfig {
+            max_orders: u32::MAX - 1,
+            max_order_qty: 1,
+            max_owners: 1,
+            ..base
+        },
+        BookConfig {
+            max_order_qty: u64::MAX / 2,
+            reference_price: Some(1),
+            ..base
+        },
+        BookConfig {
+            reference_price: Some(100),
+            ..base
+        },
+    ];
+    for config in limits {
+        assert_eq!(config.check(), Ok(()), "{config:?}");
+    }
+}
+
 #[test]
 fn full_book_refuses_orders_that_could_only_rest() {
     let mut b = OrderBook::new(BookConfig::new(1, 10_000, 2));

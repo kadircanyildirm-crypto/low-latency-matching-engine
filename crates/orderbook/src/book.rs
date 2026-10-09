@@ -89,7 +89,72 @@ impl BookConfig {
             self_trade: SelfTradePolicy::CancelResting,
         }
     }
+
+    /// Whether [`OrderBook::new`] accepts this configuration, and if not, why.
+    pub fn check(&self) -> Result<(), ConfigError> {
+        let levels = i128::from(self.max_price) - i128::from(self.min_price) + 1;
+        if levels < 1 {
+            return Err(ConfigError::EmptyBand);
+        }
+        if levels >= i128::from(u32::MAX) {
+            return Err(ConfigError::BandTooWide);
+        }
+        if self.max_orders == 0 || self.max_orders == NIL {
+            return Err(ConfigError::MaxOrdersOutOfRange);
+        }
+        if self.max_order_qty == 0 {
+            return Err(ConfigError::ZeroMaxOrderQty);
+        }
+        if self.max_owners == 0 {
+            return Err(ConfigError::ZeroMaxOwners);
+        }
+        if u128::from(self.max_orders) * u128::from(self.max_order_qty) > u128::from(u64::MAX) {
+            return Err(ConfigError::CapacityOverflow);
+        }
+        if self
+            .reference_price
+            .is_some_and(|price| price < self.min_price || price > self.max_price)
+        {
+            return Err(ConfigError::ReferenceOutsideBand);
+        }
+        Ok(())
+    }
 }
+
+/// Why [`OrderBook::new`] refuses a configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `max_price` is below `min_price`.
+    EmptyBand,
+    /// The band spans `u32::MAX` levels or more.
+    BandTooWide,
+    /// `max_orders` is zero or `u32::MAX`.
+    MaxOrdersOutOfRange,
+    /// `max_order_qty` is zero.
+    ZeroMaxOrderQty,
+    /// `max_owners` is zero.
+    ZeroMaxOwners,
+    /// `max_orders * max_order_qty` does not fit in a `u64`.
+    CapacityOverflow,
+    /// `reference_price` lies outside the price band.
+    ReferenceOutsideBand,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EmptyBand => "max_price must be >= min_price",
+            Self::BandTooWide => "price band too wide",
+            Self::MaxOrdersOutOfRange => "max_orders out of range",
+            Self::ZeroMaxOrderQty => "max_order_qty must be positive",
+            Self::ZeroMaxOwners => "max_owners must be positive",
+            Self::CapacityOverflow => "max_orders * max_order_qty must fit in a u64",
+            Self::ReferenceOutsideBand => "reference_price outside the price band",
+        })
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Aggregated view of one price level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,33 +442,18 @@ impl OrderBook {
     ///
     /// # Panics
     ///
-    /// If `max_price < min_price`, the band spans `u32::MAX` levels or more, `max_orders`
-    /// is zero or `u32::MAX`, `max_order_qty` is zero, `max_orders * max_order_qty`
-    /// does not fit in a `u64`, or `reference_price` lies outside the price band.
+    /// If [`BookConfig::check`] refuses the configuration: `max_price < min_price`, the
+    /// band spans `u32::MAX` levels or more, `max_orders` is zero or `u32::MAX`,
+    /// `max_order_qty` or `max_owners` is zero, `max_orders * max_order_qty` does not fit in
+    /// a `u64`, or `reference_price` lies outside the price band.
     pub fn new(config: BookConfig) -> Self {
-        let levels = i128::from(config.max_price) - i128::from(config.min_price) + 1;
-        assert!(levels >= 1, "max_price must be >= min_price");
-        assert!(levels < i128::from(u32::MAX), "price band too wide");
-        assert!(
-            config.max_orders > 0 && config.max_orders < NIL,
-            "max_orders out of range"
-        );
-        assert!(config.max_order_qty > 0, "max_order_qty must be positive");
-        assert!(config.max_owners > 0, "max_owners must be positive");
-        assert!(
-            u128::from(config.max_orders) * u128::from(config.max_order_qty)
-                <= u128::from(u64::MAX),
-            "max_orders * max_order_qty must fit in a u64"
-        );
-        let levels = levels as usize;
-        let reference = config.reference_price.map(|price| {
-            let offset = i128::from(price) - i128::from(config.min_price);
-            assert!(
-                (0..levels as i128).contains(&offset),
-                "reference_price outside the price band"
-            );
-            offset as u32
-        });
+        if let Err(error) = config.check() {
+            panic!("{error}");
+        }
+        let levels = (i128::from(config.max_price) - i128::from(config.min_price) + 1) as usize;
+        let reference = config
+            .reference_price
+            .map(|price| (i128::from(price) - i128::from(config.min_price)) as u32);
         Self {
             config,
             bids: HalfBook::new(Side::Buy, levels),

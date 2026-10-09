@@ -1,0 +1,12 @@
+[package]
+name = "marketdata"
+version = "0.1.0"
+description = "Market data: the book's depth by price level, kept from its events, and what changed."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+orderbook = { path = "../orderbook" }

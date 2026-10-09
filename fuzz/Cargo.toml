@@ -65,3 +65,10 @@ path = "fuzz_targets/gateway.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "web"
+path = "fuzz_targets/web.rs"
+test = false
+doc = false
+bench = false

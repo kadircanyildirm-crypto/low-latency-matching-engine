@@ -186,6 +186,12 @@ impl OrderBook {
         let (mut supply, mut choice, mut level) = (0, Choice::new(), ask);
         loop {
             supply += self.leaves_at(&self.asks, level);
+            // Every candidate from the best ask to the best bid executes something, since
+            // both best levels take part; past the best bid nothing would.
+            debug_assert!(
+                demand > 0 && supply > 0,
+                "candidate {level} executes nothing"
+            );
             choice.offer(level, demand, supply);
             demand -= self.leaves_at(&self.bids, level);
             let above = level as usize + 1;

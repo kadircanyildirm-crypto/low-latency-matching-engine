@@ -15,7 +15,10 @@ use gateway::client::Client;
 use gateway::load::{self, LoadConfig};
 use gateway::{Account, Core, Exchange, Pipeline, PipelineConfig, Server, ServerConfig, Timing};
 use orderbook::{BookConfig, CancelReason, Side, TimeInForce};
-use protocol::{Inbound, LogoutReason, NewOrder, OrderKind, Outbound, Report, ReportKind};
+use protocol::{
+    Inbound, LevelUpdate, LogoutReason, NewOrder, OrderKind, Outbound, Report, ReportKind,
+    TradeTick,
+};
 
 /// A directory removed when the test ends.
 struct TempDir(PathBuf);
@@ -473,4 +476,52 @@ fn a_pipelined_gateway_keeps_its_orders_across_a_restart() {
         ReportKind::Fill { leaves: 0, .. }
     ));
     assert_eq!(gateway.stop(), 0);
+}
+
+/// A subscriber over TCP gets the book, then the trades and level changes, through either
+/// core.
+#[test]
+fn market_data_reaches_subscribers() {
+    for pipelined in [false, true] {
+        let dir = TempDir::new(if pipelined {
+            "md-pipeline"
+        } else {
+            "md-thread"
+        });
+        let gateway = Gateway::start_with(&dir, ServerConfig::default(), pipelined);
+        let mut seller = gateway.login(1);
+        seller.send(&limit(1, Side::Sell, 101, 5)).unwrap();
+        report(&mut seller);
+        report(&mut seller);
+        let mut watcher = gateway.login(3);
+        watcher.send(&Inbound::Subscribe).unwrap();
+        assert_eq!(
+            watcher.receive().unwrap(),
+            Outbound::BookSnapshot { seq: 1, levels: 1 }
+        );
+        let level = |seq, side, price, qty, orders| {
+            Outbound::LevelUpdate(LevelUpdate {
+                seq,
+                side,
+                price,
+                qty,
+                orders,
+            })
+        };
+        assert_eq!(watcher.receive().unwrap(), level(1, Side::Sell, 101, 5, 1));
+        let mut buyer = gateway.login(2);
+        buyer.send(&limit(2, Side::Buy, 101, 2)).unwrap();
+        assert_eq!(
+            watcher.receive().unwrap(),
+            Outbound::TradeTick(TradeTick {
+                seq: 2,
+                trade_id: 1,
+                side: Side::Buy,
+                price: 101,
+                qty: 2
+            })
+        );
+        assert_eq!(watcher.receive().unwrap(), level(2, Side::Sell, 101, 3, 1));
+        gateway.stop();
+    }
 }

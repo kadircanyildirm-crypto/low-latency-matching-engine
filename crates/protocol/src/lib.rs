@@ -29,6 +29,7 @@
 //! | 103 | `Heartbeat` | 4 | |
 //! | 104 | `Logout` | 12 | reason `u8`, zero ×7 |
 //! | 105 | `Reject` | 20 | reason `u8`, zero ×7, client ref `u64` |
+//! | 106 | `Balance` | 36 | cash, position, cash held, position held (`i64` each) |
 //! | 110 | `Report` | 76 | kind, side, code, flags (`u8` each), zero `u32`, sequence number, order id, client ref (`u64`), price `i64`, quantity, leaves, trade id (`u64`), aux `i64` |
 //! | 120 | `BookSnapshot` | 20 | sequence number `u64`, levels `u32`, zero `u32` |
 //! | 121 | `LevelUpdate` | 36 | sequence number `u64`, side `u8`, zero ×3, orders `u32`, price `i64`, quantity `u64` |
@@ -176,6 +177,21 @@ pub enum Outbound {
     LevelUpdate(LevelUpdate),
     /// A trade.
     TradeTick(TradeTick),
+    /// A paper-trading account's money and position, after a change.
+    Balance(Balance),
+}
+
+/// A paper-trading account's money and position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Balance {
+    /// Cash, in price ticks times lots.
+    pub cash: i64,
+    /// Lots held.
+    pub position: i64,
+    /// Cash held for open buy orders: their open quantity times their price.
+    pub cash_held: i64,
+    /// Lots held for open sell orders.
+    pub position_held: i64,
 }
 
 /// A price level, in market data.
@@ -246,6 +262,12 @@ pub enum RejectCode {
     Throttled,
     /// The exchange cannot accept commands now.
     Unavailable,
+    /// The account's cash or position not already held for its orders does not cover the
+    /// order.
+    InsufficientFunds,
+    /// The account may not send this kind of message: a paper-trading account places limit
+    /// orders and cancels them, nothing else.
+    NotAllowed,
 }
 
 /// An event of the book, as reported to a client.
@@ -384,6 +406,7 @@ const LOGIN_REJECTED: u8 = 102;
 const HEARTBEAT_OUT: u8 = 103;
 const LOGOUT_OUT: u8 = 104;
 const REJECT: u8 = 105;
+const BALANCE: u8 = 106;
 const REPORT: u8 = 110;
 const BOOK_SNAPSHOT: u8 = 120;
 const LEVEL_UPDATE: u8 = 121;
@@ -401,7 +424,7 @@ fn length_of(kind: u8) -> Option<usize> {
         LOGIN_REJECTED | LOGOUT_OUT => 12,
         REPORT => 76,
         BOOK_SNAPSHOT => 20,
-        LEVEL_UPDATE => 36,
+        LEVEL_UPDATE | BALANCE => 36,
         TRADE_TICK => 44,
         _ => return None,
     })
@@ -727,6 +750,12 @@ pub fn encode_outbound(message: &Outbound, out: &mut Vec<u8>) {
                 .i64(f.aux)
                 .done();
         }
+        Outbound::Balance(balance) => Writer::new(out, BALANCE)
+            .i64(balance.cash)
+            .i64(balance.position)
+            .i64(balance.cash_held)
+            .i64(balance.position_held)
+            .done(),
         Outbound::BookSnapshot { seq, levels } => Writer::new(out, BOOK_SNAPSHOT)
             .u64(seq)
             .u32(levels)
@@ -849,6 +878,12 @@ pub fn decode_outbound(buf: &[u8]) -> Result<Option<(Outbound, usize)>, Protocol
                 kind,
             })
         }
+        BALANCE => Outbound::Balance(Balance {
+            cash: r.i64(),
+            position: r.i64(),
+            cash_held: r.i64(),
+            position_held: r.i64(),
+        }),
         BOOK_SNAPSHOT => Outbound::BookSnapshot {
             seq: r.u64(),
             levels: r.u32(),
@@ -935,6 +970,8 @@ codes!(reject_code, reject_of, RejectCode, "reject reason", [
     RejectCode::TooManyOrders => 1,
     RejectCode::Throttled => 2,
     RejectCode::Unavailable => 3,
+    RejectCode::InsufficientFunds => 4,
+    RejectCode::NotAllowed => 5,
 ]);
 codes!(reject_reason_code, reject_reason_of, RejectReason, "reject reason", [
     RejectReason::InvalidQuantity => 1,

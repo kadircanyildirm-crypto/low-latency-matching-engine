@@ -4,9 +4,9 @@
 use orderbook::{CancelReason, Phase, RejectReason, Side, TimeInForce};
 use proptest::prelude::*;
 use protocol::{
-    HEADER_SIZE, Inbound, LevelUpdate, LoginError, LogoutReason, MAX_MESSAGE_SIZE, NewOrder,
-    OrderKind, Outbound, ProtocolError, RejectCode, Report, ReportKind, TradeTick, decode_inbound,
-    decode_outbound, encode_inbound, encode_outbound,
+    Balance, HEADER_SIZE, Inbound, LevelUpdate, LoginError, LogoutReason, MAX_MESSAGE_SIZE,
+    NewOrder, OrderKind, Outbound, ProtocolError, RejectCode, Report, ReportKind, TradeTick,
+    decode_inbound, decode_outbound, encode_inbound, encode_outbound,
 };
 
 fn side() -> impl Strategy<Value = Side> {
@@ -158,6 +158,8 @@ fn outbound() -> impl Strategy<Value = Outbound> {
                 Just(RejectCode::TooManyOrders),
                 Just(RejectCode::Throttled),
                 Just(RejectCode::Unavailable),
+                Just(RejectCode::InsufficientFunds),
+                Just(RejectCode::NotAllowed),
             ],
             any::<u64>()
         )
@@ -172,6 +174,14 @@ fn outbound() -> impl Strategy<Value = Outbound> {
         ),
         (any::<u64>(), any::<u32>())
             .prop_map(|(seq, levels)| Outbound::BookSnapshot { seq, levels }),
+        (any::<i64>(), any::<i64>(), any::<i64>(), any::<i64>()).prop_map(
+            |(cash, position, cash_held, position_held)| Outbound::Balance(Balance {
+                cash,
+                position,
+                cash_held,
+                position_held
+            })
+        ),
         (
             any::<u64>(),
             side(),

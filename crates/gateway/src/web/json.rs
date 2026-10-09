@@ -7,7 +7,7 @@
 //!
 //! Exchange to client: the binary protocol's messages under snake-case names
 //! (`login_accepted`, `login_rejected`, `heartbeat`, `logout`, `reject`, `report`, `book`,
-//! `level`, `trade`), plus `registered` (`account`, `token`) and `error` (`message`). Codes
+//! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error` (`message`). Codes
 //! such as reasons and sides are snake-case strings. Tokens are 16 hexadecimal digits.
 
 use std::fmt::Debug;
@@ -253,6 +253,12 @@ enum WebOut {
         price: i64,
         qty: u64,
     },
+    Balance {
+        cash: i64,
+        position: i64,
+        cash_held: i64,
+        position_held: i64,
+    },
     Registered {
         account: u32,
         token: String,
@@ -407,6 +413,12 @@ pub fn outbound(message: &Outbound) -> String {
             price: level.price,
             qty: level.qty,
             orders: level.orders,
+        },
+        Outbound::Balance(balance) => WebOut::Balance {
+            cash: balance.cash,
+            position: balance.position,
+            cash_held: balance.cash_held,
+            position_held: balance.position_held,
         },
         Outbound::TradeTick(trade) => WebOut::Trade {
             seq: trade.seq,

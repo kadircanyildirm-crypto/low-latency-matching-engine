@@ -6,7 +6,8 @@ front of them, and the pipeline and market data of `crates/ring` and `crates/mar
 do, how, and why. It also says what they deliberately do not do yet. Every claim here is
 backed by a test: the [verification](#11-verification) section says which one for the
 book, [§14](#how-it-is-verified) for the engine, [§15](#how-it-is-verified-1) for the
-gateway and [§16](#how-it-is-verified-2) for the pipeline.
+gateway, [§16](#how-it-is-verified-2) for the pipeline and [§17](#how-it-is-verified-3) for
+the web demo.
 
 ## 1. Goals
 
@@ -553,8 +554,10 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 6, with per-stage timestamps for the latency breakdown: a second record format version |
 | One network thread reads, routes, publishes market data and writes every socket. On this laptop it, not the matcher, bounds throughput (§16) | Phase 6: measure on Linux first; then split the publisher's writes off, or shard sessions over network threads |
 | Plain TCP; tokens travel and are stored in the clear, and are compared in variable time | Phase 5 puts the public demo behind TLS; Phase 7 brings real account management |
-| A client that reconnects cannot ask what it missed: no order status, no replay of its reports from a sequence number, and orders recovered after a restart have lost their client references. Market data recovers by a new snapshot, not by replay | Phase 7, with the user-facing API: order status queries, and a report history per account |
-| Market data is one book's levels and trades over the order-entry protocol: no per-order (L3) feed, no multicast, and subscribers must log in | Phase 5 serves it to browsers over WebSocket; per-order feeds when an instrument needs them |
+| A client that reconnects cannot ask what it missed: it is told its open orders on login, but there is no replay of its reports from a sequence number, and orders placed after the last checkpoint lose their client references in a restart. Market data recovers by a new snapshot, not by replay | Phase 7, with the user-facing API: a report history per account |
+| Market data is one book's levels and trades over the order-entry protocol: no per-order (L3) feed, no multicast, and subscribers must log in | Per-order feeds when an instrument needs them |
+| Paper accounts place limit orders and cancel them, nothing else: market and stop orders have no price to hold against, and a modify could need more than is held while it waits | Holds at the price band's edge for market orders, and modifies checked against what the order already holds |
+| A visitor's account lives in the browser's local storage: clearing it loses the account, and nothing ties an account to a person | Phase 7: real accounts |
 | A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 8's standby to compare against |
 | Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal`. The gateway's own consumers do not need it: they recover from the book (§15, §16) | When an outside consumer of the journal appears, such as Phase 8's standby |
 
@@ -1199,3 +1202,100 @@ late. These are closed-loop numbers on a laptop with the clients beside the serv
 | `crates/marketdata/tests/depth.rs` | 40 flows of 3,000 commands of every kind, half through calls that end in an uncross: after every command the depth equals the book's, every changed level is reported, and a depth taken from the book matches the one kept. |
 | `crates/gateway/tests/exchange.rs`, `tests/server.rs` | A client that subscribes in the middle of trading rebuilds exactly the book's depth from the snapshot and the updates; market data reaches a subscriber over TCP through either core; the load generator trades through the pipeline, which also stops and restarts with its orders. |
 | `fuzz/fuzz_targets/gateway.rs` | Also subscribes sessions and publishes: the depth kept equals the book's after every flush, and market data reaches only logged-in sessions. |
+
+## 17. The web demo
+
+Phase 5 makes the exchange something anyone can open in a browser and trade on, with paper
+money, against bots, and keeps the market running across restarts of the server.
+
+### Browsers as sessions
+
+The server can listen on a second port for browsers. A connection there speaks HTTP until
+it asks for a file or upgrades to a WebSocket: the page and its two files are built into
+the binary and served under a content security policy that allows nothing from
+elsewhere, anything else gets a 404 or a 400, and a request not complete within ten
+seconds is dropped. An upgraded connection becomes a session like any other, with the
+same login, risk limits, reports and market data; its messages are JSON objects in
+WebSocket text frames, mapped one to one onto the binary protocol's, and the server's
+replies are encoded the same way.
+
+The three decoders are strict, for the same reason the binary protocol's is (§15): HTTP
+takes only `GET` without a body and the handshake of RFC 6455; WebSocket frames must be
+masked, whole, text or control frames, within a size limit, with lengths in their shortest
+form; JSON must have a known `"type"`. A `web` fuzz target runs arbitrary bytes through
+all three.
+
+Two things differ for browsers. A browser's orders stay on the book when its connection
+goes, since reloading the page should not cancel them; it is told its open orders when it
+logs in again, as every session now is. And a browser may ask for an account: `register`
+creates one with the lowest free id of a range kept for guests and a random token, one per
+connection, and appends it to a file, synced, before answering, so that an account a
+visitor was told of survives a crash.
+
+### Paper money
+
+An account can start with cash, in price ticks times lots, and a position, in lots: it is
+then a paper-trading account, and the gateway checks its orders against what it owns
+before they reach the batch. A buy order holds its open quantity times its limit price in
+cash, a sell order holds its open quantity in lots, and an order that would hold more than
+the account has free is refused with `InsufficientFunds`. Holds follow the order's open
+quantity through the book's events: it rests, trades, is cancelled or rejected. A trade
+settles at its own price, which for a buy order is never above its limit, so what was held
+for the quantity that traded covers what it cost, and the rest comes back. Paper accounts
+place limit orders and cancel them, nothing else (`NotAllowed`): a market or stop order has
+no price to hold against, and a modify could need more than is held while it waits to be
+applied. Accounts without funds, such as the bots', are not checked. A session is told its
+balance on login and after every round in which it changed.
+
+### Checkpoints
+
+The engine rebuilds the book after a restart (§14). The exchange's own state, paper money
+above all, was lost; now it is a projection of the journal, snapshotted like the book. A
+checkpoint holds the paper accounts' cash and positions and every open order's account,
+client reference, side, price and open quantity, as of a sequence number at which every
+command's events have been delivered; what orders hold follows from the orders, and the
+depth from the book. The server saves one every `--checkpoint-every` commands (10,000 by
+default) and when it stops, written to a temporary file, synced, renamed into place and the
+directory synced, keeping the one before.
+
+On start, `recovery::open` finds the newest checkpoint that reads and opens the engine with
+the checkpoint's sequence number as where its consumer stands (`Output::resume_after`). The
+engine starts from a snapshot no later than that and replays the commands and events after
+it, now with each command before its events (`Output::on_command`), so the exchange learns
+who placed the orders it has not seen. It then requires the orders it knows to be exactly
+those on the recovered book, with the same open quantities, and refuses to start
+otherwise. The journal must reach back to the checkpoint, which is why checkpoints come at
+most every `--snapshot-every` commands: retention keeps the journal after the oldest kept
+snapshot.
+
+### Bots and the page
+
+Bots are ordinary clients of the binary protocol with accounts of their own, watching the
+market through its market data: market makers quote five levels each side of a fair price
+that takes random steps and is pulled back towards the start and the last trade, replacing
+their quotes every interval; noise traders cross the spread with small IOC orders; trend
+followers trade with the recent move. They reconnect when the gateway restarts.
+
+The page has no dependencies and no build step. It keeps the account in local storage,
+reconnects with backoff, sends heartbeats so it is not logged out as idle, and draws the
+book and tape at most once a frame. Every second the server tells it the commands per
+second, how long the turns that handed commands to the engine took, and the sessions and
+resting orders.
+
+### Deployment
+
+`deploy/` holds an image built from source with the gateway and the bots, and a compose
+file that runs them with Caddy in front for HTTPS; only ports 80 and 443 are reachable from
+outside, and the exchange's directory is a volume. CI builds the image on every push.
+
+### How it is verified
+
+| Test | What it shows |
+|---|---|
+| `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
+| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; statistics every second; a guest's money and orders, with their references, across a stop and restart. |
+| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. |
+| `crates/gateway/tests/recovery.rs` | 40 random runs with checkpoints now and then and a power failure, in order and out of order, on the simulated disk: the exchange comes back exactly, only the client references of orders placed after the checkpoint lost. A damaged newest checkpoint falls back to the one before; one that contradicts the book is refused. |
+| `crates/engine/tests/operations.rs` | Commands reach an output before their events, live and on replay from where it stands. |
+| `crates/gateway/tests/server.rs` | Bots make a market within a second: both sides quoted, trades. |
+| `fuzz/fuzz_targets/web.rs` | Arbitrary bytes through the HTTP parser, the frame decoder and the JSON: nothing panics, frames take exactly their bytes, and a stream cut anywhere decodes the same frames up to the cut. |

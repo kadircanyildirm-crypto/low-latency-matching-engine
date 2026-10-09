@@ -8,7 +8,8 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 
 **Status:** Phases 1 to 4 of 9 are complete: the matching core, the journal and crash
 recovery around it, a TCP gateway in front of them, and a pipeline of threads with market
-data. The next phases lead to a public
+data. Phase 5, a public web demo with paper trading against bots, is built and packaged,
+and waits for a server to run on. The next phases lead to a public
 web demo with paper trading, then to outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
 decision is in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -337,6 +338,31 @@ bottleneck in both modes, and the pipeline adds two hops between threads to ever
 trip. What it changes is where the disk's stalls land. Phase 6 measures it properly, on
 Linux. Details in [DESIGN.md §16](docs/DESIGN.md#16-the-pipeline-and-market-data).
 
+## Phase 5: the web demo
+
+The gateway also serves browsers: its own page, and sessions over WebSocket that speak
+JSON. A visitor gets a paper-trading account on the first visit and trades against bots
+that keep the market moving.
+
+```sh
+sh deploy/make-accounts.sh       # six accounts for the bots, in deploy/bots.txt
+cargo run --release -p gateway --bin gateway -- --dir data --accounts deploy/bots.txt --web 127.0.0.1:8080
+cargo run --release -p gateway --bin bots -- --accounts deploy/bots.txt
+```
+
+Then open `http://127.0.0.1:8080`.
+
+| Property | How |
+|---|---|
+| Browsers are sessions like any other | A second listener speaks HTTP for the page and upgrades to WebSocket; the session then has the same login, risk limits, reports and market data as a binary one. HTTP, WebSocket frames and JSON are decoded strictly and fuzzed. |
+| Paper money | An account can start with cash and shares. Before an order is accepted, the gateway checks that the account can pay for it in full and holds that: cash for a buy, shares for a sell. Trades settle at their own price and give back what was held for less. A property test lets accounts trade only with each other: money and shares are never made or lost, and each account holds exactly what its orders on the book need. |
+| The market survives restarts | The exchange's own state, paper money above all, is checkpointed and rebuilt on start from the checkpoint and the journal after it, which the engine replays to it; it must then agree with the recovered book. Crash tests cut the power at random points; an end-to-end test stops and restarts the gateway under a visitor's account. |
+| A live market | Bots: market makers quoting around a wandering fair price, noise traders crossing the spread, trend followers. |
+| The page | No dependencies and no build step: depth, tape, chart, order entry, the paper account with profit, open orders and fills, and a panel with commands per second and how long the engine's turns take. Served under a content security policy that allows nothing from elsewhere. |
+| Deployment | An image, a compose file with Caddy in front for HTTPS, and a guide in [deploy/README.md](deploy/README.md). CI builds the image on every push. |
+
+Details in [DESIGN.md §17](docs/DESIGN.md#17-the-web-demo).
+
 ## Running
 
 ```sh
@@ -359,7 +385,7 @@ compare/run.sh fetch && compare/run.sh export && compare/run.sh all   # comparis
 ```
 
 The fuzz targets are `differential`, `snapshot_roundtrip`, `restore`, `recovery`,
-`protocol` and `gateway`. Each needs its
+`protocol`, `gateway` and `web`. Each needs its
 tool first: `cargo install cargo-fuzz`, `cargo install --locked kani-verifier && cargo kani
 setup`, or `cargo install cargo-llvm-cov` with the nightly `llvm-tools-preview` component.
 Windows needs a different fuzzing setup, described in

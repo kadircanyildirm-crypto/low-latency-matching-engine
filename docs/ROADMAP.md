@@ -10,7 +10,7 @@ documented are worth more than five half-finished ones.
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ✅ Done |
 | 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ✅ Done |
-| 5 | Public web demo: paper trading against bots, live order book | ⏳ Next |
+| 5 | Public web demo: paper trading against bots, live order book | 🚀 Built; waits for a server |
 | 6 | End-to-end measurement and optimisation on Linux | — |
 | 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
 | 8 | Hot standby replication and failover | — |
@@ -199,23 +199,32 @@ Linux, Windows and macOS). Both met.
 
 ---
 
-## Phase 5 — Public web demo
+## Phase 5 — Public web demo 🚀
 
 **Goal:** a link anyone can open to watch and use a live market, for a CV and a first
 audience. Paper money only: running a real-money exchange needs a licence (in Turkey from
 the Capital Markets Board, SPK), customer identification and custody, and is out of scope.
 
-- A WebSocket gateway next to the binary one, speaking JSON to browsers.
-- A browser interface: live order book depth, trades, a price chart, order entry and
-  cancel, the visitor's own orders and fills.
-- Paper-trading accounts with a starting balance, and position and balance checks before
-  an order is accepted.
-- Bots that make the market lively: market makers, noise traders, a trend follower.
-- A live performance panel: commands per second and the engine's latency percentiles.
-- Deployed on a small Linux server, with the journal and snapshots surviving restarts.
+**Delivered** (`crates/gateway`: `web/`, `wallet.rs`, `recovery.rs`, `bots.rs`, `web/*.html`,
+`deploy/`, [DESIGN.md §17](DESIGN.md#17-the-web-demo))
+- A web gateway on the gateway's own event loop: the page over HTTP, and sessions over
+  WebSocket speaking JSON, with the same login, risk limits, reports and market data as
+  binary ones; strict HTTP, WebSocket and JSON decoders, fuzzed.
+- A browser interface: live depth, trades, a price chart, order entry and cancel, the
+  visitor's open orders and fills, the paper account with profit.
+- Paper-trading accounts created on a visitor's first visit, with a starting balance, and
+  balance and position checks before an order is accepted, with holds and settlement.
+- Bots: market makers, noise traders, a trend follower.
+- A live performance panel: commands per second, and how long the engine's turns take.
+- The market keeps running across restarts: the exchange's state is checkpointed and
+  rebuilt from the journal after the checkpoint, which the engine now replays with its
+  commands.
+- An image, a compose file with HTTPS in front, and a guide (`deploy/README.md`); CI builds
+  the image.
 
 **Acceptance criteria:** the public link works; a visitor can trade against the bots; the
-market keeps running across a restart of the server.
+market keeps running across a restart of the server. The last two are met locally and in
+tests (`crates/gateway/tests/web.rs`, `tests/recovery.rs`); the first waits for a server.
 
 ---
 

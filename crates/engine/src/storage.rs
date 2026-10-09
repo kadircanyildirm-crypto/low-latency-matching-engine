@@ -17,7 +17,7 @@ pub trait Storage {
     /// Takes the exclusive lock on `dir`, or returns `None` if someone else holds it.
     fn lock(&mut self, dir: &Path) -> io::Result<Option<Self::Lock>>;
 
-    /// Creates `dir` and its parents if they do not exist.
+    /// Creates `dir` and its parents if they do not exist, durably.
     fn create_dir_all(&mut self, dir: &Path) -> io::Result<()>;
     /// Names of the files in `dir`.
     fn list(&mut self, dir: &Path) -> io::Result<Vec<String>>;
@@ -94,8 +94,20 @@ impl Storage for FsStorage {
         }
     }
 
+    /// Syncs the parent of every directory it creates, so the new directory itself survives
+    /// a power failure.
     fn create_dir_all(&mut self, dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)
+        if dir.as_os_str().is_empty() || dir.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = dir.parent() {
+            self.create_dir_all(parent)?;
+        }
+        std::fs::create_dir(dir)?;
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => self.sync_dir(parent),
+            _ => self.sync_dir(Path::new(".")),
+        }
     }
 
     fn list(&mut self, dir: &Path) -> io::Result<Vec<String>> {
@@ -143,15 +155,25 @@ impl Storage for FsStorage {
         std::fs::remove_file(path)
     }
 
-    /// On Unix, syncs the directory itself, which makes its entries durable. Windows has no
-    /// portable way to open a directory for that; NTFS journals its metadata, and the
-    /// journal never relies on a rename being durable before a later write is (see
-    /// DESIGN.md).
+    /// Syncs the directory itself, which makes its entries durable: `fsync` on the
+    /// directory on Unix, and on Windows `FlushFileBuffers` on a handle to it, which needs
+    /// write access and `FILE_FLAG_BACKUP_SEMANTICS` to open.
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
-        if cfg!(unix) {
-            std::fs::File::open(dir)?.sync_all()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)?
+                .sync_all()
         }
-        Ok(())
+        #[cfg(not(windows))]
+        {
+            std::fs::File::open(dir)?.sync_all()
+        }
     }
 }
 

@@ -10,7 +10,7 @@
 use std::fmt;
 
 use super::{BookConfig, OrderBook, OrderNode, StopOrder};
-use crate::types::{OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side};
+use crate::types::{OrderId, OwnerId, Phase, Price, Qty, SelfTradePolicy, Side};
 
 /// A resting order as recorded in a [`BookSnapshot`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +50,8 @@ pub struct BookSnapshot {
     /// The price band's reference: the last trade price, or the configured reference
     /// price before the first trade.
     pub reference_price: Option<Price>,
+    /// The trading phase.
+    pub phase: Phase,
     /// Resting orders: bids best price first, then asks best price first, and within each
     /// price level in time priority.
     pub orders: Vec<SnapshotOrder>,
@@ -74,7 +76,7 @@ pub enum SnapshotError {
     /// iceberg between one lot and its display, and `max_iceberg_tranches` of its display
     /// cover its total.
     InvalidOrder(OrderId),
-    /// The best bid is at or above the best ask.
+    /// The best bid is at or above the best ask outside a call phase.
     Crossed,
     /// The trade count leaves no room for another trade id.
     TradeCountExhausted,
@@ -88,7 +90,9 @@ impl fmt::Display for SnapshotError {
             Self::TooManyOrders => f.write_str("more orders than max_orders"),
             Self::DuplicateOrderId(id) => write!(f, "order id {id} appears twice"),
             Self::InvalidOrder(id) => write!(f, "order {id} cannot rest in this book"),
-            Self::Crossed => f.write_str("the best bid is at or above the best ask"),
+            Self::Crossed => {
+                f.write_str("the best bid is at or above the best ask outside a call phase")
+            }
             Self::TradeCountExhausted => f.write_str("no trade ids left"),
             Self::InvalidReferencePrice => f.write_str("the reference price is outside the band"),
         }
@@ -105,6 +109,7 @@ impl BookSnapshot {
             &self.config,
             self.trade_count,
             self.reference_price,
+            self.phase,
             self.orders.len(),
         );
         self.orders.iter().for_each(|order| hash.order(order));
@@ -123,6 +128,7 @@ impl OrderBook {
             config: self.config,
             trade_count: self.trade_count(),
             reference_price: self.reference_price(),
+            phase: self.phase,
             orders,
             stops: self.all_stops().collect(),
         }
@@ -209,8 +215,9 @@ impl OrderBook {
             ));
             book.place(slot);
         }
+        book.phase = snapshot.phase;
         if let (Some(bid), Some(ask)) = (book.bids.best, book.asks.best) {
-            if bid >= ask {
+            if bid >= ask && snapshot.phase != Phase::Auction {
                 return Err(SnapshotError::Crossed);
             }
         }
@@ -230,6 +237,7 @@ impl OrderBook {
             &self.config,
             self.trade_count(),
             self.reference_price(),
+            self.phase,
             self.order_count() - stops,
         );
         self.for_each_order(|order| hash.order(&order));
@@ -275,6 +283,7 @@ impl Digest {
         config: &BookConfig,
         trade_count: u64,
         reference_price: Option<Price>,
+        phase: Phase,
         orders: usize,
     ) -> Self {
         let mut hash = Self(0xcbf2_9ce4_8422_2325);
@@ -297,8 +306,15 @@ impl Digest {
         });
         hash.optional_u64(config.price_band.map(u64::from));
         hash.optional_u64(config.reference_price.map(|price| price as u64));
+        hash.u64(u64::from(config.auction_on_band));
         hash.u64(trade_count);
         hash.optional_u64(reference_price.map(|price| price as u64));
+        hash.u64(match phase {
+            Phase::Continuous => 0,
+            Phase::Auction => 1,
+            Phase::Halted => 2,
+            Phase::Closed => 3,
+        });
         hash.u64(orders as u64);
         hash
     }

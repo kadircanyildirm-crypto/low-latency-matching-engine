@@ -13,7 +13,7 @@
 //!
 //! Run: `cargo bench --bench latency`
 //! Env: `LAT_COMMANDS` measured commands per run (default 2,000,000), `LAT_RUNS` (default 3),
-//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep,protected`.
+//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep,protected,sessions`.
 //! Writes merged HdrHistogram percentile files to `target/latency/<scenario>.hgrm`
 //! (plot at https://hdrhistogram.github.io/HdrHistogram/plotFiles.html).
 
@@ -27,7 +27,9 @@ use hdrhistogram::Histogram;
 use orderbook::workload::{EventCounts, Mix, TifMix, Workload, WorkloadConfig};
 use orderbook::{BookConfig, Command, Event, EventSink, OrderBook, Side};
 
-const KINDS: [&str; 7] = ["all", "limit", "market", "cancel", "modify", "mass", "stop"];
+const KINDS: [&str; 8] = [
+    "all", "limit", "market", "cancel", "modify", "mass", "stop", "phase",
+];
 
 struct Scenario {
     name: &'static str,
@@ -66,6 +68,7 @@ fn scenarios() -> Vec<Scenario> {
             mass_cancel: 0,
             stop: 4,
             modify: 5,
+            session: 0,
         },
         tif: TifMix {
             ioc: 30,
@@ -73,6 +76,14 @@ fn scenarios() -> Vec<Scenario> {
             post_only: 20,
         },
         iceberg: 20,
+        ..WorkloadConfig::default()
+    };
+    let sessions = WorkloadConfig {
+        mix: Mix {
+            cancel: 23,
+            session: 2,
+            ..WorkloadConfig::default().mix
+        },
         ..WorkloadConfig::default()
     };
     vec![
@@ -105,6 +116,7 @@ fn scenarios() -> Vec<Scenario> {
                     mass_cancel: 0,
                     stop: 0,
                     modify: 5,
+                    session: 0,
                 },
                 ..WorkloadConfig::default()
             },
@@ -120,6 +132,21 @@ fn scenarios() -> Vec<Scenario> {
             book: BookConfig {
                 price_protection: Some(2),
                 ..protected.book_config()
+            },
+            warmup: 500_000,
+        },
+        // Phase changes two commands in a hundred, and a band that interrupts trading with
+        // a call whenever it stops a market order: what calls and uncrosses cost.
+        Scenario {
+            name: "sessions",
+            about: "calls, halts and the close; 10-tick band with interruptions",
+            workload: sessions,
+            book: BookConfig {
+                price_protection: None,
+                price_band: Some(10),
+                reference_price: Some(sessions.initial_mid),
+                auction_on_band: true,
+                ..sessions.book_config()
             },
             warmup: 500_000,
         },
@@ -244,14 +271,16 @@ fn run_scenario(scenario: &Scenario, commands: usize, runs: usize, clock: &Clock
     println!("\n== {} ({})", scenario.name, scenario.about);
     println!("  book after warm-up : {shape}");
     println!(
-        "  events per run     : {} trades, {} rests, {} cancels ({} self-trade, {} protection), {} modifies, {} rejects",
+        "  events per run     : {} trades, {} rests, {} cancels ({} self-trade, {} protection, {} band), {} modifies, {} rejects, {} calls",
         counts.trades,
         counts.rested,
         counts.cancelled,
         counts.self_trade_cancels,
         counts.protection_cancels,
+        counts.band_cancels,
         counts.modified,
-        counts.rejected
+        counts.rejected,
+        counts.calls
     );
     println!("  per run (ns):");
     print!("{summary}");
@@ -320,6 +349,7 @@ fn kind_index(command: &Command) -> usize {
         Command::Modify { .. } => 4,
         Command::CancelAll { .. } => 5,
         Command::Stop { .. } => 6,
+        Command::SetPhase { .. } => 7,
     }
 }
 

@@ -8,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use orderbook::workload::{EventCounts, Mix, TifMix, Workload, WorkloadConfig};
-use orderbook::{Event, EventSink, OrderBook};
+use orderbook::{BookConfig, Event, EventSink, OrderBook};
 
 struct CountingAllocator;
 
@@ -50,8 +50,17 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn assert_no_allocations(cfg: WorkloadConfig, warmup: usize, measured: usize) -> EventCounts {
+    assert_no_allocations_in(cfg, cfg.book_config(), warmup, measured)
+}
+
+fn assert_no_allocations_in(
+    cfg: WorkloadConfig,
+    book_cfg: BookConfig,
+    warmup: usize,
+    measured: usize,
+) -> EventCounts {
     let before_setup = allocations();
-    let mut book = OrderBook::new(cfg.book_config());
+    let mut book = OrderBook::new(book_cfg);
     let mut workload = Workload::new(cfg);
     assert!(
         allocations() > before_setup,
@@ -157,6 +166,44 @@ fn every_order_type_never_allocates() {
         "{counts:?}"
     );
     assert!(counts.stops_triggered > 1_000, "{counts:?}");
+}
+
+/// Calls, halts and the close, uncrosses that walk the crossed part of the book twice to
+/// find their price and then trade it, and calls started by the price band: none of it
+/// needs a buffer, so none of it may allocate.
+#[test]
+fn phase_changes_and_uncrosses_never_allocate() {
+    let cfg = WorkloadConfig {
+        tif: TifMix {
+            ioc: 20,
+            fok: 10,
+            post_only: 10,
+        },
+        iceberg: 20,
+        mix: Mix {
+            cancel: 18,
+            stop: 5,
+            session: 2,
+            ..WorkloadConfig::default().mix
+        },
+        ..WorkloadConfig::default()
+    };
+    let book_cfg = BookConfig {
+        price_protection: None,
+        price_band: Some(10),
+        reference_price: Some(cfg.initial_mid),
+        auction_on_band: true,
+        ..cfg.book_config()
+    };
+    let counts = assert_no_allocations_in(cfg, book_cfg, 100_000, 1_000_000);
+    assert!(
+        counts.calls > 1_000 && counts.phase_changes > 10_000,
+        "{counts:?}"
+    );
+    assert!(
+        counts.band_cancels > 100 && counts.phase_cancels > 100,
+        "{counts:?}"
+    );
 }
 
 /// A deep book (100k resting orders), where the index and the pool are large.

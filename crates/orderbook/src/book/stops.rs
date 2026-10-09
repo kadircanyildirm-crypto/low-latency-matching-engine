@@ -12,11 +12,17 @@
 //! reach more triggers, so release repeats until none is left. When both sides have stops to
 //! release, buy stops go first; within a side, the trigger prices reached first go first,
 //! and at one trigger the oldest stop.
+//!
+//! The trades of an uncross reach triggers like any others, and the stops they reach are
+//! released once the new phase is in force. A released stop becomes the order it was
+//! waiting to become, under that phase's rules: in continuous trading it trades; in a call
+//! phase a stop-limit rests without trading; anything else cannot work and is cancelled. A
+//! halt or the close leaves pending stops pending: nothing trades, so nothing triggers.
 
 use super::{HalfBook, Halt, OrderBook};
 use crate::pool::{NIL, OrderKind, OrderNode, OrderPool};
 use crate::types::{
-    CancelReason, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason, Side,
+    CancelReason, Event, EventSink, OrderId, OwnerId, Phase, Price, Qty, RejectReason, Side,
 };
 
 /// A pending stop order as seen from outside the book.
@@ -122,6 +128,7 @@ impl OrderBook {
             None => None,
             Some(price) => Some(self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?),
         };
+        self.check_phase(false)?;
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -174,8 +181,9 @@ impl OrderBook {
         }
     }
 
-    /// Turns the pending stop in `slot` into the order it was waiting to become. A stop-limit
-    /// that rests keeps its slot, so it never needs a free one.
+    /// Turns the pending stop in `slot` into the order it was waiting to become, under the
+    /// current phase's rules. A stop-limit that rests keeps its slot, so it never needs a
+    /// free one.
     fn trigger<S: EventSink>(&mut self, slot: u32, sink: &mut S) {
         let node = *self.pool.get(slot);
         let (ladder, pool) = self.ladder_and_pool(slot);
@@ -189,10 +197,29 @@ impl OrderBook {
         } = node;
         sink.on_event(Event::Triggered { id });
 
-        if node.kind == OrderKind::StopMarket {
-            self.execute_market(id, owner, side, qty, sink);
-            self.retire(slot);
-            return;
+        match (self.phase, node.kind) {
+            (Phase::Continuous, OrderKind::StopMarket) => {
+                self.execute_market(id, owner, side, qty, sink);
+                self.retire(slot);
+                return;
+            }
+            (Phase::Continuous, _) => {}
+            // A call phase collects limit orders without matching or price controls.
+            (Phase::Auction, OrderKind::StopLimit) => {
+                return self.rest_stop(slot, node.limit, qty, sink);
+            }
+            // A market order cannot work outside continuous trading, nor can anything
+            // while trading is halted or closed. The stop was accepted long ago, so it is
+            // cancelled rather than rejected.
+            _ => {
+                self.retire(slot);
+                sink.on_event(Event::Cancelled {
+                    id,
+                    qty,
+                    reason: CancelReason::TradingPhase,
+                });
+                return;
+            }
         }
         // A stop-limit is checked against the price controls when it triggers, as a new
         // limit order would be; it was accepted long ago, so it is cancelled, not rejected.
@@ -223,13 +250,20 @@ impl OrderBook {
             });
             return;
         }
-        // The rest becomes a resting GTC order in the stop's own slot, at the back of its
-        // level's queue and of its owner's list.
+        self.rest_stop(slot, level, remaining, sink);
+    }
+
+    /// Rests `remaining` of a triggered stop-limit as a GTC order at `level`, in the stop's
+    /// own slot, at the back of its level's queue and of its owner's list.
+    fn rest_stop<S: EventSink>(&mut self, slot: u32, level: u32, remaining: Qty, sink: &mut S) {
         let resting = self.pool.get_mut(slot);
         resting.kind = OrderKind::Resting;
         resting.level = level;
         resting.limit = NIL;
         resting.remaining = remaining;
+        let OrderNode {
+            id, owner, side, ..
+        } = *resting;
         self.owners.unlink(slot, owner);
         self.place(slot);
         sink.on_event(Event::Rested {

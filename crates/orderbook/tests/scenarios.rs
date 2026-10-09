@@ -6,14 +6,14 @@
 
 use orderbook::CancelReason::{
     FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceBand, PriceProtection, Requested,
-    SelfTrade,
+    SelfTrade, TradingPhase,
 };
 use orderbook::Event::*;
 use orderbook::RejectReason::*;
 use orderbook::Side::{Buy, Sell};
 use orderbook::{
-    BookConfig, Command, Event, EventSink, LevelInfo, OrderBook, OrderId, OwnerId, Price, Qty,
-    SelfTradePolicy, Side, TimeInForce,
+    BookConfig, Command, Event, EventSink, LevelInfo, OrderBook, OrderId, OwnerId, Phase, Price,
+    Qty, SelfTradePolicy, Side, TimeInForce,
 };
 
 const CFG: BookConfig = BookConfig::new(1, 10_000, 1_024);
@@ -1448,6 +1448,560 @@ fn protection_needs_an_opposite_price_to_measure_from() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Trading phases and auctions
+
+fn set_phase(phase: Phase) -> Command {
+    Command::SetPhase { phase }
+}
+
+/// A book built from `cfg`, in a call phase.
+fn call_with(cfg: BookConfig) -> OrderBook {
+    let mut b = OrderBook::new(cfg);
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Auction)),
+        [PhaseChanged {
+            phase: Phase::Auction
+        }]
+    );
+    b
+}
+
+fn call() -> OrderBook {
+    call_with(CFG)
+}
+
+/// An uncross trade: the buy order is reported as the taker.
+fn crossing(
+    trade_id: u64,
+    buy: OrderId,
+    sell: OrderId,
+    price: Price,
+    qty: Qty,
+    buy_leaves: Qty,
+    sell_leaves: Qty,
+) -> Event {
+    Trade {
+        trade_id,
+        taker: buy,
+        maker: sell,
+        taker_side: Buy,
+        price,
+        qty,
+        taker_leaves: buy_leaves,
+        maker_leaves: sell_leaves,
+    }
+}
+
+fn opens() -> Event {
+    PhaseChanged {
+        phase: Phase::Continuous,
+    }
+}
+
+#[test]
+fn a_call_collects_orders_without_matching() {
+    let mut b = call();
+    run(&mut b, limit(1, Sell, 100, 5));
+    assert_eq!(
+        run(&mut b, limit(2, Buy, 105, 3)),
+        [Accepted { id: 2 }, rested(2, Buy, 105, 3)]
+    );
+    // The book is crossed, and nothing has traded.
+    assert_eq!(b.best_bid(), level(105, 3, 1));
+    assert_eq!(b.best_ask(), level(100, 5, 1));
+    assert_eq!(b.trade_count(), 0);
+    // What the uncross would do, as market data publishes it during the call.
+    assert_eq!(b.indicative_uncross(), Some((100, 3)));
+}
+
+#[test]
+fn orders_that_must_trade_at_once_are_refused_in_a_call() {
+    let mut b = call();
+    run(&mut b, limit(1, Sell, 100, 5));
+    assert_eq!(run(&mut b, market(2, Buy, 1)), [rejected(2, AuctionCall)]);
+    for tif in [TimeInForce::Ioc, TimeInForce::Fok] {
+        assert_eq!(
+            run(&mut b, limit_tif(3, 3, Buy, 100, 1, tif)),
+            [rejected(3, AuctionCall)]
+        );
+    }
+    // Post-only keeps its promise not to cross; it rests if it does not.
+    let post_only = |price| limit_tif(4, 4, Buy, price, 1, TimeInForce::PostOnly);
+    assert_eq!(
+        run(&mut b, post_only(100)),
+        [rejected(4, PostOnlyWouldCross)]
+    );
+    assert_eq!(run(&mut b, post_only(99))[1], rested(4, Buy, 99, 1));
+    // Stops wait for a trade as always.
+    assert_eq!(
+        run(&mut b, stop(5, 5, Buy, 110, None, 1))[0],
+        Accepted { id: 5 }
+    );
+}
+
+#[test]
+fn price_controls_do_not_apply_in_a_call() {
+    // Protection and the band guard against what an order trades on arrival; in a call
+    // nothing does, and the uncross is what finds the new price.
+    let cfg = BookConfig {
+        price_protection: Some(1),
+        price_band: Some(1),
+        reference_price: Some(100),
+        ..CFG
+    };
+    let mut b = call_with(cfg);
+    run(&mut b, limit(1, Sell, 100, 5));
+    assert_eq!(
+        run(&mut b, limit(2, Buy, 150, 1))[1],
+        rested(2, Buy, 150, 1)
+    );
+    assert_eq!(
+        run(&mut b, limit(3, Sell, 50, 1))[1],
+        rested(3, Sell, 50, 1)
+    );
+    assert_eq!(
+        run(&mut b, modify(2, 160, 2)),
+        [modified(2, 160, 2, 2), rested(2, Buy, 160, 2)]
+    );
+}
+
+#[test]
+fn a_full_book_refuses_even_crossing_orders_in_a_call() {
+    // A crossing order frees a slot by trading, but nothing trades in a call.
+    let mut b = call_with(BookConfig::new(1, 10_000, 2));
+    run(&mut b, limit(1, Sell, 100, 1));
+    run(&mut b, limit(2, Buy, 99, 1));
+    assert_eq!(run(&mut b, limit(3, Buy, 101, 1)), [rejected(3, BookFull)]);
+}
+
+#[test]
+fn modifies_in_a_call_rest_again_without_trading() {
+    let mut b = call();
+    run(&mut b, limit(1, Sell, 100, 2));
+    run(&mut b, limit(2, Buy, 98, 1));
+    run(&mut b, limit(3, Buy, 98, 2));
+    assert_eq!(
+        run(&mut b, modify(2, 101, 1)),
+        [modified(2, 101, 1, 1), rested(2, Buy, 101, 1)]
+    );
+    // Shrinking in place keeps priority, as in continuous trading.
+    run(&mut b, limit(4, Buy, 98, 1));
+    assert_eq!(run(&mut b, modify(3, 98, 1)), [modified(3, 98, 1, 1)]);
+    assert_eq!(queue(&b, Buy, 98), [(3, 1), (4, 1)]);
+}
+
+#[test]
+fn leaving_a_call_uncrosses_at_one_price_in_priority_order() {
+    let mut b = call();
+    for (id, side, price, qty) in [
+        (1, Buy, 102, 3),
+        (2, Buy, 101, 4),
+        (3, Buy, 99, 5),
+        (4, Sell, 98, 2),
+        (5, Sell, 100, 4),
+        (6, Sell, 101, 3),
+    ] {
+        run(&mut b, limit(id, side, price, qty));
+    }
+    // At 101, 7 lots bid at or above meet 9 offered at or below: more than at any other
+    // price. Every bid that crosses fills; the last ask reached, #6, fills in part.
+    assert_eq!(b.indicative_uncross(), Some((101, 7)));
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Continuous)),
+        [
+            crossing(1, 1, 4, 101, 2, 1, 0),
+            crossing(2, 1, 5, 101, 1, 0, 3),
+            crossing(3, 2, 5, 101, 3, 1, 0),
+            crossing(4, 2, 6, 101, 1, 0, 2),
+            opens(),
+        ]
+    );
+    assert_eq!(b.best_bid(), level(99, 5, 1));
+    assert_eq!(b.best_ask(), level(101, 2, 1));
+    assert_eq!(b.reference_price(), Some(101));
+    assert_eq!(b.indicative_uncross(), None);
+}
+
+/// The book after a call with `orders`, uncrossed into continuous trading: the events.
+fn uncross(cfg: BookConfig, orders: &[(OrderId, Side, Price, Qty)]) -> Vec<Event> {
+    let mut b = call_with(cfg);
+    for &(id, side, price, qty) in orders {
+        run(&mut b, limit(id, side, price, qty));
+    }
+    run(&mut b, set_phase(Phase::Continuous))
+}
+
+#[test]
+fn the_auction_price_leaves_the_least_surplus_among_equal_volumes() {
+    // 4 lots trade at 100 and at 102 alike; 100 leaves 2 bid lots over, 102 only one
+    // offered lot.
+    let orders = [
+        (1, Buy, 102, 4),
+        (2, Buy, 100, 2),
+        (3, Sell, 100, 4),
+        (4, Sell, 102, 1),
+    ];
+    assert_eq!(
+        uncross(CFG, &orders),
+        [crossing(1, 1, 3, 102, 4, 0, 0), opens()]
+    );
+}
+
+#[test]
+fn market_pressure_moves_the_auction_price_toward_the_surplus() {
+    // 3 lots trade at 100 and at 102 alike, leaving the same surplus on the same side.
+    let buyers_left = [(1, Buy, 102, 5), (2, Sell, 100, 3)];
+    assert_eq!(
+        uncross(CFG, &buyers_left),
+        [crossing(1, 1, 2, 102, 3, 2, 0), opens()]
+    );
+    let sellers_left = [(1, Buy, 102, 3), (2, Sell, 100, 5)];
+    assert_eq!(
+        uncross(CFG, &sellers_left),
+        [crossing(1, 1, 2, 100, 3, 0, 2), opens()]
+    );
+}
+
+#[test]
+fn without_pressure_the_price_closest_to_the_reference_wins() {
+    // 3 lots trade at any price from 100 to 102, leaving nothing over.
+    let orders = [(1, Buy, 102, 3), (2, Sell, 100, 3)];
+    let price_with = |reference| {
+        let cfg = BookConfig {
+            reference_price: reference,
+            ..CFG
+        };
+        match uncross(cfg, &orders)[0] {
+            Trade { price, .. } => price,
+            other => panic!("expected a trade, got {other:?}"),
+        }
+    };
+    // The reference itself, when it is among the best prices...
+    assert_eq!(price_with(Some(101)), 101);
+    // ...otherwise the best price closest to it...
+    assert_eq!(price_with(Some(90)), 100);
+    assert_eq!(price_with(Some(110)), 102);
+    // ...and without a reference, the lowest.
+    assert_eq!(price_with(None), 100);
+}
+
+#[test]
+fn the_uncross_takes_icebergs_one_tranche_at_a_time() {
+    let mut b = call();
+    run(&mut b, iceberg(1, 1, Buy, 101, 4, 2));
+    run(&mut b, limit(2, Sell, 100, 3));
+    run(&mut b, limit(3, Sell, 101, 1));
+    // Hidden quantity counts: 4 lots trade at 101.
+    assert_eq!(b.indicative_uncross(), Some((101, 4)));
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Continuous)),
+        [
+            crossing(1, 1, 2, 101, 2, 2, 1),
+            replenished(1, Buy, 101, 2),
+            crossing(2, 1, 2, 101, 1, 1, 0),
+            crossing(3, 1, 3, 101, 1, 0, 0),
+            opens(),
+        ]
+    );
+    // When one trade uses up both tranches, the buy order replenishes first.
+    let mut b = call();
+    run(&mut b, iceberg(1, 1, Buy, 100, 4, 2));
+    run(&mut b, iceberg(2, 2, Sell, 100, 4, 2));
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Continuous)),
+        [
+            crossing(1, 1, 2, 100, 2, 2, 2),
+            replenished(1, Buy, 100, 2),
+            replenished(2, Sell, 100, 2),
+            crossing(2, 1, 2, 100, 2, 0, 0),
+            opens(),
+        ]
+    );
+}
+
+#[test]
+fn the_uncross_does_not_prevent_self_trades() {
+    // Removing either order would leave the other crossed at a price the uncross does not
+    // use, so an owner trades with itself at the auction price, under either policy.
+    for policy in [
+        SelfTradePolicy::CancelResting,
+        SelfTradePolicy::CancelIncoming,
+    ] {
+        let cfg = BookConfig {
+            self_trade: policy,
+            ..CFG
+        };
+        let mut b = call_with(cfg);
+        run(&mut b, limit_by(7, 1, Buy, 101, 2));
+        run(&mut b, limit_by(7, 2, Sell, 100, 2));
+        assert_eq!(
+            run(&mut b, set_phase(Phase::Continuous)),
+            [crossing(1, 1, 2, 100, 2, 0, 0), opens()]
+        );
+    }
+}
+
+#[test]
+fn a_book_that_does_not_cross_leaves_the_call_without_trading() {
+    let mut b = call();
+    run(&mut b, limit(1, Buy, 99, 1));
+    run(&mut b, limit(2, Sell, 100, 1));
+    assert_eq!(b.indicative_uncross(), None);
+    assert_eq!(run(&mut b, set_phase(Phase::Continuous)), [opens()]);
+    assert_eq!(b.order_count(), 2);
+}
+
+#[test]
+fn setting_the_current_phase_again_changes_nothing() {
+    let mut b = call();
+    run(&mut b, limit(1, Buy, 101, 1));
+    run(&mut b, limit(2, Sell, 100, 1));
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Auction)),
+        [PhaseChanged {
+            phase: Phase::Auction
+        }]
+    );
+    assert_eq!(b.trade_count(), 0);
+    assert_eq!(b.phase(), Phase::Auction);
+}
+
+#[test]
+fn every_way_out_of_a_call_uncrosses() {
+    for phase in [Phase::Halted, Phase::Closed] {
+        let mut b = call();
+        run(&mut b, limit(1, Buy, 101, 1));
+        run(&mut b, limit(2, Sell, 100, 1));
+        assert_eq!(
+            run(&mut b, set_phase(phase)),
+            [crossing(1, 1, 2, 100, 1, 0, 0), PhaseChanged { phase }]
+        );
+    }
+}
+
+#[test]
+fn the_auction_price_re_anchors_the_band() {
+    let cfg = BookConfig {
+        price_band: Some(2),
+        reference_price: Some(100),
+        ..CFG
+    };
+    let mut b = call_with(cfg);
+    run(&mut b, limit(1, Buy, 110, 1));
+    run(&mut b, limit(2, Sell, 110, 1));
+    run(&mut b, set_phase(Phase::Continuous));
+    assert_eq!(b.reference_price(), Some(110));
+    assert_eq!(run(&mut b, limit(3, Buy, 112, 1))[0], Accepted { id: 3 });
+    assert_eq!(
+        run(&mut b, limit(4, Buy, 113, 1)),
+        [rejected(4, PriceOutsideBand)]
+    );
+}
+
+#[test]
+fn a_halt_accepts_only_cancels_and_keeps_pending_stops() {
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, None, 1));
+    run(&mut b, limit_by(7, 11, Buy, 90, 1));
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Halted)),
+        [PhaseChanged {
+            phase: Phase::Halted
+        }]
+    );
+    assert_eq!(
+        run(&mut b, limit(20, Buy, 101, 1)),
+        [rejected(20, TradingHalted)]
+    );
+    assert_eq!(
+        run(&mut b, market(21, Buy, 1)),
+        [rejected(21, TradingHalted)]
+    );
+    assert_eq!(
+        run(&mut b, stop(7, 22, Buy, 110, None, 1)),
+        [rejected(22, TradingHalted)]
+    );
+    assert_eq!(
+        run(
+            &mut b,
+            Command::Modify {
+                id: 11,
+                owner: 7,
+                price: 90,
+                qty: 1
+            }
+        ),
+        [rejected(11, TradingHalted)]
+    );
+    assert_eq!(run(&mut b, cancel(5)), [cancelled(5, 5, Requested)]);
+    // Nothing trades, so the stop just waits, and trading resumes where it stopped.
+    assert!(b.stop(10).is_some());
+    run(&mut b, set_phase(Phase::Continuous));
+    let events = run(&mut b, limit(23, Buy, 102, 2));
+    assert!(events.contains(&Triggered { id: 10 }));
+    assert_eq!(
+        run(&mut b, Command::CancelAll { owner: 7 }),
+        [
+            cancelled(11, 1, MassCancel),
+            MassCancelled { owner: 7, count: 1 }
+        ]
+    );
+}
+
+#[test]
+fn the_close_accepts_only_cancels() {
+    let mut b = book();
+    run(&mut b, limit(1, Buy, 99, 1));
+    run(&mut b, set_phase(Phase::Closed));
+    assert_eq!(
+        run(&mut b, limit(2, Buy, 98, 1)),
+        [rejected(2, MarketClosed)]
+    );
+    assert_eq!(run(&mut b, market(3, Sell, 1)), [rejected(3, MarketClosed)]);
+    assert_eq!(run(&mut b, modify(1, 98, 1)), [rejected(1, MarketClosed)]);
+    assert_eq!(
+        run(&mut b, stop(4, 4, Sell, 90, None, 1)),
+        [rejected(4, MarketClosed)]
+    );
+    assert_eq!(run(&mut b, cancel(1)), [cancelled(1, 1, Requested)]);
+}
+
+#[test]
+fn stops_the_uncross_reaches_trigger_once_the_new_phase_is_in_force() {
+    // The last trade was at 100; the uncross trades at 102 and reaches the stop, which then
+    // buys in continuous trading.
+    let mut b = stop_book();
+    run(&mut b, stop(7, 10, Buy, 102, None, 2));
+    run(&mut b, set_phase(Phase::Auction));
+    run(&mut b, limit(20, Buy, 102, 2));
+    let bought = |trade_id, maker, price, leaves, maker_leaves| Trade {
+        trade_id,
+        taker: 10,
+        maker,
+        taker_side: Buy,
+        price,
+        qty: 1,
+        taker_leaves: leaves,
+        maker_leaves,
+    };
+    assert_eq!(
+        run(&mut b, set_phase(Phase::Continuous)),
+        [
+            crossing(2, 20, 1, 102, 1, 1, 0),
+            crossing(3, 20, 2, 102, 1, 0, 0),
+            opens(),
+            Triggered { id: 10 },
+            bought(4, 3, 103, 1, 0),
+            bought(5, 4, 104, 0, 4),
+        ]
+    );
+}
+
+#[test]
+fn stops_triggered_where_their_orders_cannot_work_are_cancelled() {
+    for phase in [Phase::Halted, Phase::Closed] {
+        let mut b = stop_book();
+        run(&mut b, stop(7, 10, Buy, 101, None, 2));
+        run(&mut b, stop(7, 11, Buy, 101, Some(103), 2));
+        run(&mut b, set_phase(Phase::Auction));
+        run(&mut b, limit(20, Buy, 101, 1));
+        assert_eq!(
+            run(&mut b, set_phase(phase)),
+            [
+                crossing(2, 20, 1, 101, 1, 0, 0),
+                PhaseChanged { phase },
+                Triggered { id: 10 },
+                cancelled(10, 2, TradingPhase),
+                Triggered { id: 11 },
+                cancelled(11, 2, TradingPhase),
+            ]
+        );
+    }
+}
+
+/// A 2-tick band around 100 that interrupts trading when it stops a market order; asks at
+/// 101 and 103.
+fn interrupting_book() -> OrderBook {
+    let mut b = OrderBook::new(BookConfig {
+        price_band: Some(2),
+        reference_price: Some(100),
+        auction_on_band: true,
+        ..CFG
+    });
+    run(&mut b, limit(1, Sell, 101, 1));
+    run(&mut b, limit(2, Sell, 103, 1));
+    b
+}
+
+#[test]
+fn a_market_order_the_band_stops_starts_a_call() {
+    let mut b = interrupting_book();
+    assert_eq!(
+        run(&mut b, market(3, Buy, 5)),
+        [
+            Accepted { id: 3 },
+            Trade {
+                trade_id: 1,
+                taker: 3,
+                maker: 1,
+                taker_side: Buy,
+                price: 101,
+                qty: 1,
+                taker_leaves: 4,
+                maker_leaves: 0
+            },
+            cancelled(3, 4, PriceBand),
+            PhaseChanged {
+                phase: Phase::Auction
+            },
+        ]
+    );
+    // The reopening auction may trade beyond the old band and re-anchors it.
+    run(&mut b, limit(4, Buy, 103, 1));
+    run(&mut b, set_phase(Phase::Continuous));
+    assert_eq!(b.reference_price(), Some(103));
+}
+
+#[test]
+fn only_the_band_starts_a_call() {
+    // The protection is tighter here, so it stops the order, and trading goes on.
+    let mut b = OrderBook::new(BookConfig {
+        price_protection: Some(0),
+        price_band: Some(2),
+        reference_price: Some(100),
+        auction_on_band: true,
+        ..CFG
+    });
+    run(&mut b, limit(1, Sell, 101, 1));
+    run(&mut b, limit(2, Sell, 103, 1));
+    let events = run(&mut b, market(3, Buy, 5));
+    assert_eq!(events.last(), Some(&cancelled(3, 4, PriceProtection)));
+    assert_eq!(b.phase(), Phase::Continuous);
+}
+
+#[test]
+fn stops_released_into_a_call_rest_or_are_cancelled() {
+    // The market order's trade at 101 reaches both stops, but the band then interrupts
+    // trading: the stop-limit rests in the call, crossing the ask at 103, and the
+    // stop-market cannot work.
+    let mut b = interrupting_book();
+    run(&mut b, stop(7, 10, Buy, 101, Some(104), 1));
+    run(&mut b, stop(7, 11, Buy, 101, None, 1));
+    let events = run(&mut b, market(3, Buy, 5));
+    assert_eq!(
+        &events[4..],
+        [
+            Triggered { id: 10 },
+            rested(10, Buy, 104, 1),
+            Triggered { id: 11 },
+            cancelled(11, 1, TradingPhase),
+        ]
+    );
+    assert_eq!(b.best_bid(), level(104, 1, 1));
+    assert_eq!(b.best_ask(), level(103, 1, 1));
+}
+
+// ---------------------------------------------------------------------------------------
 // API
 
 #[test]
@@ -1464,10 +2018,18 @@ fn commands_report_their_id_and_owner() {
         },
     ];
     for command in commands {
-        assert_eq!((command.id(), command.owner()), (Some(1), 7), "{command:?}");
+        assert_eq!(
+            (command.id(), command.owner()),
+            (Some(1), Some(7)),
+            "{command:?}"
+        );
     }
     let mass_cancel = Command::CancelAll { owner: 7 };
-    assert_eq!((mass_cancel.id(), mass_cancel.owner()), (None, 7));
+    assert_eq!((mass_cancel.id(), mass_cancel.owner()), (None, Some(7)));
+    let phase_change = Command::SetPhase {
+        phase: Phase::Halted,
+    };
+    assert_eq!((phase_change.id(), phase_change.owner()), (None, None));
 }
 
 #[test]

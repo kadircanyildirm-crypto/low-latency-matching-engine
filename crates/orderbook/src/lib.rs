@@ -15,6 +15,9 @@
 //!   orders, market orders, stop and stop-limit orders, owner-checked cancels and
 //!   modifies, FIX-style modifies on total quantity, mass cancel, self-trade prevention,
 //!   and price protection and a price band against fat-finger orders.
+//! - **Trading phases.** Continuous trading, call phases that end in an auction uncross at
+//!   a single price, halts and the close; optionally, a volatility interruption when the
+//!   price band stops a market order.
 //! - **Determinism.** The event stream is a pure function of the command stream, which is
 //!   the foundation for event sourcing and replay. Snapshots restore an identical book, and
 //!   a platform-independent digest identifies its state.
@@ -57,6 +60,6 @@ pub use book::{
     SnapshotError, SnapshotOrder, StopOrder, Stops,
 };
 pub use types::{
-    CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
+    CancelReason, Command, Event, EventSink, OrderId, OwnerId, Phase, Price, Qty, RejectReason,
     SelfTradePolicy, Side, TimeInForce, TradeId,
 };

@@ -6,8 +6,8 @@ mod common;
 
 use common::strategies::scenario;
 use orderbook::{
-    BookConfig, BookSnapshot, OrderBook, SelfTradePolicy, Side, SnapshotError, SnapshotOrder,
-    StopOrder,
+    BookConfig, BookSnapshot, OrderBook, Phase, SelfTradePolicy, Side, SnapshotError,
+    SnapshotOrder, StopOrder,
 };
 use proptest::prelude::*;
 
@@ -65,7 +65,7 @@ fn order(id: u64, side: Side, price: i64, leaves: u64, filled: u64) -> SnapshotO
 }
 
 /// Two bids at 50 (in time priority) and an ask at 60, with a band around a last trade
-/// at 55.
+/// at 55, while trading is halted.
 fn sample() -> BookSnapshot {
     BookSnapshot {
         config: BookConfig {
@@ -76,6 +76,7 @@ fn sample() -> BookSnapshot {
         },
         trade_count: 4,
         reference_price: Some(55),
+        phase: Phase::Halted,
         orders: vec![
             order(1, Side::Buy, 50, 5, 2),
             SnapshotOrder {
@@ -116,6 +117,7 @@ fn a_snapshot_round_trips_through_restore() {
     assert_eq!(book.digest(), snapshot.digest());
     assert_eq!(book.trade_count(), 4);
     assert_eq!(book.reference_price(), Some(55));
+    assert_eq!(book.phase(), Phase::Halted);
     let buy_stops: Vec<u64> = book.stops(Side::Buy).map(|s| s.id).collect();
     assert_eq!(buy_stops, [4, 5]);
     assert_eq!(book.stop(5), Some(stop(5, Side::Buy, 58, Some(59))));
@@ -164,6 +166,12 @@ fn the_digest_covers_every_field() {
     vary("band", |s| s.config.price_band = Some(21));
     vary("band off", |s| s.config.price_band = None);
     vary("initial reference", |s| s.config.reference_price = Some(53));
+    vary("volatility interruption", |s| {
+        s.config.auction_on_band = true
+    });
+    vary("continuous trading", |s| s.phase = Phase::Continuous);
+    vary("call phase", |s| s.phase = Phase::Auction);
+    vary("closed", |s| s.phase = Phase::Closed);
     vary("order id", |s| s.orders[0].id = 9);
     vary("owner", |s| s.orders[0].owner = 9);
     vary("side", |s| s.orders[2].side = Side::Buy);
@@ -202,7 +210,7 @@ fn the_digest_of_an_empty_book_is_pinned() {
     let book = OrderBook::new(BookConfig::new(-5, 5, 3));
     assert_eq!(
         book.digest(),
-        0x0e7f_5f37_e51c_8091,
+        0xa789_a9d5_272f_3cd1,
         "got {:#018x}",
         book.digest()
     );
@@ -217,6 +225,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
             config: cfg,
             trade_count,
             reference_price: None,
+            phase: Phase::Continuous,
             orders,
             stops: Vec::new(),
         })
@@ -322,6 +331,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
             config: cfg,
             trade_count: 0,
             reference_price: Some(price),
+            phase: Phase::Continuous,
             orders: Vec::new(),
             stops: Vec::new(),
         };
@@ -390,6 +400,43 @@ fn stops_the_engine_could_never_hold_are_refused() {
 }
 
 #[test]
+fn a_crossed_book_restores_only_in_a_call_phase() {
+    let crossed = |phase| BookSnapshot {
+        config: BookConfig::new(1, 100, 4),
+        trade_count: 0,
+        reference_price: None,
+        phase,
+        orders: vec![
+            order(1, Side::Buy, 51, 2, 0),
+            order(2, Side::Sell, 50, 3, 0),
+        ],
+        stops: Vec::new(),
+    };
+    for phase in [Phase::Continuous, Phase::Halted, Phase::Closed] {
+        assert_eq!(
+            OrderBook::restore(&crossed(phase)).err(),
+            Some(SnapshotError::Crossed),
+            "{phase:?}"
+        );
+    }
+    let mut book = OrderBook::restore(&crossed(Phase::Auction)).unwrap();
+    book.validate().unwrap();
+    assert_eq!(book.snapshot(), crossed(Phase::Auction));
+    // It uncrosses like the book it was taken from: 2 lots at 50, since both candidate
+    // prices leave a lot of surplus on the sell side, which pushes the price down.
+    let mut events = Vec::new();
+    book.process(
+        orderbook::Command::SetPhase {
+            phase: Phase::Continuous,
+        },
+        &mut events,
+    );
+    assert_eq!(book.trade_count(), 1);
+    assert_eq!(book.reference_price(), Some(50));
+    book.validate().unwrap();
+}
+
+#[test]
 fn errors_explain_themselves() {
     let messages = [
         (SnapshotError::TooManyOrders, "more orders than max_orders"),
@@ -403,7 +450,7 @@ fn errors_explain_themselves() {
         ),
         (
             SnapshotError::Crossed,
-            "the best bid is at or above the best ask",
+            "the best bid is at or above the best ask outside a call phase",
         ),
         (SnapshotError::TradeCountExhausted, "no trade ids left"),
         (

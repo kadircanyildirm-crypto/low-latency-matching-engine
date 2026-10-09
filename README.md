@@ -32,6 +32,7 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 | `Cancel` | Removes a resting order. Only its owner may cancel it. |
 | `Modify` | FIX cancel/replace on **total** quantity, so a modify that races a fill can never over-fill. Shrinking at the same price keeps queue priority; anything else re-enters at the back. Only the owner may modify. |
 | `CancelAll` | Cancels every resting order of one owner, as on a session disconnect. It costs O(k log k) in that owner's k orders, however large the rest of the book. |
+| `SetPhase` | Moves the book between continuous trading, call phases, halts and the close. In a call, limit orders rest without matching and the book may cross; leaving it uncrosses the book at one price: the most volume, then the least surplus, then market pressure, then the closest to the reference price. Halts and the close accept only cancels. |
 
 Risk controls built into the core:
 
@@ -41,8 +42,11 @@ Risk controls built into the core:
   opposite best price; limit orders priced further through are rejected.
 - **Price band:** the same, measured from the last trade price instead, so stale orders
   cannot move it. A measured comparison of both is in
-  [DESIGN.md §6](docs/DESIGN.md#6-risk-controls-in-the-core).
-- **Self-trade prevention:** cancel the resting order, or cancel the incoming one.
+  [DESIGN.md §6](docs/DESIGN.md#6-risk-controls-in-the-core). Optionally, a market order
+  the band stops starts a call, whose uncross re-anchors the band; measured in
+  [DESIGN.md §7](docs/DESIGN.md#7-trading-phases-and-auctions).
+- **Self-trade prevention:** cancel the resting order, or cancel the incoming one. The
+  uncross does not apply it.
 - **Ownership checks:** cancels and modifies of another participant's order are
   rejected, in a way that does not reveal the order exists. Owner ids are dense
   participant indices assigned by the gateway, so per-owner state needs no hashing.
@@ -58,7 +62,7 @@ point, restores it, and requires the copy to emit exactly the original's events 
 on, so nothing the book depends on can be left out. `digest()` hashes the same state into
 64 bits that are identical on every platform, without allocating. A replica or a replay
 can compare it against the live book. Details are in
-[DESIGN.md §9](docs/DESIGN.md#9-snapshots-and-state-digest).
+[DESIGN.md §10](docs/DESIGN.md#10-snapshots-and-state-digest).
 
 ### Data structures
 
@@ -77,11 +81,11 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 |---|---|
 | Scenario tests | One rule per test, with the exact expected event sequence. |
 | Differential property test | On random configurations and command sequences, the engine matches a deliberately naive reference book event for event and order for order. |
-| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. FOK orders fill exactly when the book could fill them; post-only orders never trade; icebergs trade only what they show; exactly the stops a command reaches trigger, in the right order; no command's work exceeds what the book in front of it allows. |
+| Specification checker | After every command, checks the outcome against the rules without relying on a second implementation: price-time priority, no trading through the limit or protection cap, no self-trades, maximal fills, quantity conservation, and untouched orders unchanged. A command must be rejected exactly when a rule requires it, with that rule's reason. FOK orders fill exactly when the book could fill them; post-only orders never trade; icebergs trade only what they show; exactly the stops a command reaches trigger, in the right order; each uncross trades at one price no candidate beats under the auction rules, in priority order on both sides; no command's work exceeds what the book in front of it allows. |
 | Invariant checker tests | `validate()` itself is tested: every corruption it checks for, from broken queue links to owner lists out of step with the book, must be detected. |
-| Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, and a price band. |
+| Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, a price band, and trading sessions with calls, uncrosses, halts and the close. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
-| Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, and computing the digest. |
+| Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, phase changes and uncrosses, and computing the digest. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
@@ -104,9 +108,10 @@ points at behaviour the tests do not pin down.
 
 Every one of the 319 mutants that compile was detected in the last full run, which
 includes the snapshot module's own run. `src/workload.rs`, the benchmark's order-flow
-generator, is excluded because it is not part of the engine. Every change since has been
-mutation-tested on the lines it touches (`cargo mutants --in-diff`), and none has left a
-mutant alive. A full run is repeated at the end of each milestone.
+generator, is excluded because it is not part of the engine. Every change since, up to
+stop orders, has been mutation-tested on the lines it touches (`cargo mutants --in-diff`),
+and none has left a mutant alive. Trading phases have not been through a run yet. A full
+run is repeated at the end of each milestone.
 
 The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
 `protection_cap`. The clamp turned out to have no effect: the matcher compares levels
@@ -134,6 +139,13 @@ without per-command timers.
 The protected scenario runs the paths the others never reach. About 5% of its commands are
 rejected, about a quarter of its market orders stop at the protection band, and
 self-trade prevention removes about 220k resting orders per run.
+
+A fifth scenario, sessions, changes phase two commands in a hundred, under a 10-tick band
+that starts a call whenever it stops a market order: about 15,000 calls in each run of 2M
+commands. Measured
+in a later session, in which baseline measured 90 ns at p50 and 205 ns at p99: 77 ns at
+p50, 213 ns at p99, 3.2 µs at p99.9 and 16.4–16.8M cmd/s. Phase changes themselves take
+0.6 µs on average and 5.5 µs at p99, uncross included.
 
 By command, in the baseline scenario:
 

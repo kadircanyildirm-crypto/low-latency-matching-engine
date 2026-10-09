@@ -1,5 +1,6 @@
 //! The limit order book and its matching logic.
 
+mod auction;
 mod snapshot;
 mod stops;
 
@@ -11,7 +12,7 @@ use crate::index::IdIndex;
 use crate::owners::Owners;
 use crate::pool::{NIL, OrderKind, OrderNode, OrderPool};
 use crate::types::{
-    CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty, RejectReason,
+    CancelReason, Command, Event, EventSink, OrderId, OwnerId, Phase, Price, Qty, RejectReason,
     SelfTradePolicy, Side, TimeInForce, TradeId,
 };
 
@@ -52,6 +53,11 @@ pub struct BookConfig {
     /// Reference price before the first trade, such as the previous close. `None` leaves
     /// the band inactive until something trades.
     pub reference_price: Option<Price>,
+    /// A volatility interruption: when the price band stops a market order short of
+    /// liquidity it would have taken, the book also switches to [`Phase::Auction`], whose
+    /// uncross sets a new reference price. The sequencer decides when the call ends. Without
+    /// it, the market order is just cut short.
+    pub auction_on_band: bool,
     /// What happens when an order would trade against an order of the same owner.
     pub self_trade: SelfTradePolicy,
 }
@@ -66,7 +72,7 @@ impl BookConfig {
 
     /// A config with the given band and capacity, [`Self::DEFAULT_MAX_OWNERS`] owners, the
     /// largest `max_order_qty` the capacity allows, [`Self::DEFAULT_MAX_ICEBERG_TRANCHES`],
-    /// no price protection, and `CancelResting` self-trade prevention.
+    /// no price protection or price band, and `CancelResting` self-trade prevention.
     pub const fn new(min_price: Price, max_price: Price, max_orders: u32) -> Self {
         let max_orders_nonzero = if max_orders == 0 { 1 } else { max_orders };
         Self {
@@ -79,6 +85,7 @@ impl BookConfig {
             price_protection: None,
             price_band: None,
             reference_price: None,
+            auction_on_band: false,
             self_trade: SelfTradePolicy::CancelResting,
         }
     }
@@ -139,8 +146,13 @@ pub struct QueuedOrder {
 struct Level {
     head: u32,
     tail: u32,
+    /// What the level's orders show.
     total_qty: Qty,
     order_count: u32,
+    /// How many of them are icebergs, whose hidden quantity `total_qty` leaves out. Where
+    /// there are none, an auction reads the level's open quantity from `total_qty` alone.
+    /// It fills what would otherwise be padding.
+    icebergs: u32,
 }
 
 // The ladder's memory is `2 * levels * size_of::<Level>()`; see docs/DESIGN.md.
@@ -152,6 +164,7 @@ impl Level {
         tail: NIL,
         total_qty: 0,
         order_count: 0,
+        icebergs: 0,
     };
 
     /// Removes the order at the head of the queue and frees its slot. The caller has
@@ -160,7 +173,11 @@ impl Level {
     fn pop_front(&mut self, pool: &mut OrderPool, index: &mut IdIndex, owners: &mut Owners) {
         let slot = self.head;
         let OrderNode {
-            id, next, owner, ..
+            id,
+            next,
+            owner,
+            iceberg,
+            ..
         } = *pool.get(slot);
         self.head = next;
         if next == NIL {
@@ -169,6 +186,7 @@ impl Level {
             pool.get_mut(next).prev = NIL;
         }
         self.order_count -= 1;
+        self.icebergs -= u32::from(iceberg);
         index.remove(&id);
         owners.unlink(slot, owner);
         pool.free(slot);
@@ -221,7 +239,7 @@ impl HalfBook {
     /// Appends the order in `slot` to the back of its level's queue.
     #[inline]
     fn push_back(&mut self, pool: &mut OrderPool, slot: u32) {
-        let level = pool.get(slot).level;
+        let OrderNode { level, iceberg, .. } = *pool.get(slot);
         let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
         let tail = lvl.tail;
@@ -236,6 +254,7 @@ impl HalfBook {
         lvl.tail = slot;
         lvl.total_qty += visible;
         lvl.order_count += 1;
+        lvl.icebergs += u32::from(iceberg);
         if lvl.order_count == 1 {
             self.occupied.insert(level as usize);
             self.best = Some(match (self.side, self.best) {
@@ -251,7 +270,11 @@ impl HalfBook {
     #[inline]
     fn unlink(&mut self, pool: &mut OrderPool, slot: u32) {
         let OrderNode {
-            level, prev, next, ..
+            level,
+            prev,
+            next,
+            iceberg,
+            ..
         } = *pool.get(slot);
         let visible = pool.visible(slot);
         let lvl = &mut self.levels[level as usize];
@@ -267,6 +290,7 @@ impl HalfBook {
         }
         lvl.total_qty -= visible;
         lvl.order_count -= 1;
+        lvl.icebergs -= u32::from(iceberg);
         if lvl.order_count == 0 {
             self.level_emptied(level);
         }
@@ -338,6 +362,9 @@ pub struct OrderBook {
     /// Lowest and highest level traded at during the current command; it decides which
     /// stops trigger.
     traded: Option<(u32, u32)>,
+    /// The trading phase. Continuous trading checks it once per order; the other phases
+    /// take the slow paths.
+    phase: Phase,
 }
 
 /// Sort key that puts an owner's orders in book order: side (bids first), price priority,
@@ -390,11 +417,12 @@ impl OrderBook {
             next_trade_id: 1,
             reference,
             traded: None,
+            phase: Phase::Continuous,
         }
     }
 
     /// Applies one command, reporting its outcome to `sink`, then releases the stops its
-    /// trades triggered.
+    /// trades triggered. A new book is in continuous trading.
     pub fn process<S: EventSink>(&mut self, command: Command, sink: &mut S) {
         self.traded = None;
         let (id, result) = match command {
@@ -435,6 +463,10 @@ impl OrderBook {
                 qty,
             } => (id, self.modify(id, owner, price, qty, sink)),
             Command::CancelAll { owner } => return self.cancel_all(owner, sink),
+            Command::SetPhase { phase } => {
+                self.set_phase(phase, sink);
+                return self.release_stops(sink);
+            }
         };
         if let Err(reason) = result {
             sink.on_event(Event::Rejected { id, reason });
@@ -444,7 +476,8 @@ impl OrderBook {
 
     // Each handler validates everything before emitting its first event, so a rejected
     // command leaves no trace besides the `Rejected` event. Stateless checks (owner,
-    // quantity, price band) come before stateful ones (ids, protection, capacity).
+    // quantity, price band) come before stateful ones: the phase first, then ids,
+    // protection and capacity.
 
     #[allow(clippy::too_many_arguments)]
     fn new_limit<S: EventSink>(
@@ -467,6 +500,11 @@ impl OrderBook {
             return Err(RejectReason::InvalidDisplay);
         }
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
+        // Continuous trading pays this one branch for phases.
+        if self.phase != Phase::Continuous {
+            return self
+                .new_limit_outside_continuous(id, owner, side, level, qty, tif, display, sink);
+        }
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -518,6 +556,40 @@ impl OrderBook {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A limit order outside continuous trading. A halt or the close refuses it, and a call
+    /// phase refuses one that must trade at once. Otherwise it rests without matching, and
+    /// without the price controls, which guard against what an order trades on arrival: in
+    /// a call nothing does, and the uncross finds the new price. Since nothing matches,
+    /// nothing frees a slot either, so a full book refuses every order.
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn new_limit_outside_continuous<S: EventSink>(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        level: u32,
+        qty: Qty,
+        tif: TimeInForce,
+        display: Option<Qty>,
+        sink: &mut S,
+    ) -> Result<(), RejectReason> {
+        let post_only = tif == TimeInForce::PostOnly;
+        self.check_phase(!matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly))?;
+        if self.index.contains_key(&id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if post_only && self.crosses(side, level) {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
+        if self.pool.is_full() {
+            return Err(RejectReason::BookFull);
+        }
+        sink.on_event(Event::Accepted { id });
+        self.rest(id, owner, side, level, qty, qty, post_only, display, sink);
         Ok(())
     }
 
@@ -578,6 +650,7 @@ impl OrderBook {
     ) -> Result<(), RejectReason> {
         self.check_owner(owner)?;
         self.check_qty(qty)?;
+        self.check_phase(true)?;
         if self.index.contains_key(&id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -620,6 +693,11 @@ impl OrderBook {
                 qty: unfilled,
                 reason,
             });
+            // The band stopped the order short of liquidity beyond it: a volatility
+            // interruption, if the book is set up for one.
+            if reason == CancelReason::PriceBand && self.config.auction_on_band {
+                self.set_phase(Phase::Auction, sink);
+            }
         }
     }
 
@@ -688,6 +766,7 @@ impl OrderBook {
     ) -> Result<(), RejectReason> {
         self.check_qty(qty)?;
         let level = self.level_of(price).ok_or(RejectReason::PriceOutOfRange)?;
+        self.check_phase(false)?;
         let slot = self.owned_slot(id, owner)?;
         let node = *self.pool.get(slot);
         if node.is_stop() {
@@ -723,11 +802,13 @@ impl OrderBook {
         }
 
         // Cancel/replace: back of the queue at the new price, trading on the way in. The
-        // order's own slot is freed first, so it can always rest again.
-        if self.outside_protection(node.side, level) {
+        // order's own slot is freed first, so it can always rest again. In a call phase it
+        // does not trade, and so the price controls do not apply.
+        let continuous = self.phase == Phase::Continuous;
+        if continuous && self.outside_protection(node.side, level) {
             return Err(RejectReason::PriceOutsideProtection);
         }
-        if self.outside_band(node.side, level) {
+        if continuous && self.outside_band(node.side, level) {
             return Err(RejectReason::PriceOutsideBand);
         }
         if node.post_only && self.crosses(node.side, level) {
@@ -745,9 +826,15 @@ impl OrderBook {
             leaves,
         });
         let (side, post_only) = (node.side, node.post_only);
-        self.execute_limit(
-            id, owner, side, level, leaves, qty, post_only, display, sink,
-        );
+        if continuous {
+            self.execute_limit(
+                id, owner, side, level, leaves, qty, post_only, display, sink,
+            );
+        } else {
+            self.rest(
+                id, owner, side, level, leaves, qty, post_only, display, sink,
+            );
+        }
         Ok(())
     }
 
@@ -779,6 +866,27 @@ impl OrderBook {
             });
             return;
         }
+        self.rest(
+            id, owner, side, level, remaining, total, post_only, display, sink,
+        );
+    }
+
+    /// Rests `remaining` of a validated limit order at the back of its level, in a free
+    /// slot, showing its first tranche if it is an iceberg.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn rest<S: EventSink>(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        level: u32,
+        remaining: Qty,
+        total: Qty,
+        post_only: bool,
+        display: Option<Qty>,
+        sink: &mut S,
+    ) {
         let slot = self.pool.alloc(OrderNode::new(
             id, owner, side, level, remaining, total, post_only,
         ));
@@ -975,6 +1083,20 @@ impl OrderBook {
         }
     }
 
+    /// Whether the phase accepts a new order or modify: everything in continuous trading,
+    /// all but orders that must trade at once (`immediate`) in a call phase, nothing while
+    /// halted or closed. Cancels and mass cancels are accepted in every phase.
+    #[inline]
+    fn check_phase(&self, immediate: bool) -> Result<(), RejectReason> {
+        match self.phase {
+            Phase::Continuous => Ok(()),
+            Phase::Auction if immediate => Err(RejectReason::AuctionCall),
+            Phase::Auction => Ok(()),
+            Phase::Halted => Err(RejectReason::TradingHalted),
+            Phase::Closed => Err(RejectReason::MarketClosed),
+        }
+    }
+
     #[inline]
     fn check_qty(&self, qty: Qty) -> Result<(), RejectReason> {
         if qty == 0 || qty > self.config.max_order_qty {
@@ -1093,6 +1215,11 @@ impl OrderBook {
         self.pool.live()
     }
 
+    /// The trading phase.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
     /// The price the band is measured from: the last trade, or the configured reference
     /// price before the first trade.
     pub fn reference_price(&self) -> Option<Price> {
@@ -1158,8 +1285,8 @@ impl OrderBook {
     /// Checks the book's internal invariants: queue links, per-order and per-level
     /// quantities (a level's total counts what its orders show), iceberg tranches,
     /// occupancy bits, best-price pointers, the id index, owner lists, the free list, and
-    /// that the book is not crossed. All arithmetic is checked, so an overflow is reported rather than
-    /// wrapped into a plausible-looking number.
+    /// that the book is not crossed outside a call phase. All arithmetic is checked, so an
+    /// overflow is reported rather than wrapped into a plausible-looking number.
     ///
     /// Walks the occupied levels via the bitset, so it costs `O(occupied levels + orders)`
     /// regardless of the band width. An order sitting in a level whose bit is missing is
@@ -1194,9 +1321,11 @@ impl OrderBook {
                 }
 
                 let (mut count, mut total, mut prev, mut cur) = (0u32, 0 as Qty, NIL, lvl.head);
+                let mut icebergs = 0u32;
                 while cur != NIL {
                     let node = self.pool.get(cur);
                     let id = node.id;
+                    icebergs += u32::from(node.iceberg);
                     if node.prev != prev {
                         return Err(format!("{side:?} {price}: broken back link at #{id}"));
                     }
@@ -1251,6 +1380,12 @@ impl OrderBook {
                         lvl.order_count, lvl.total_qty
                     ));
                 }
+                if icebergs != lvl.icebergs {
+                    return Err(format!(
+                        "{side:?} {price}: level counts {} icebergs but holds {icebergs}",
+                        lvl.icebergs
+                    ));
+                }
                 resting += count as usize;
             }
         }
@@ -1265,10 +1400,13 @@ impl OrderBook {
         }
         self.validate_owners()?;
         self.validate_free_list()?;
+        // Only a call phase collects orders without matching them; every way out of it
+        // uncrosses the book.
         if let (Some(bid), Some(ask)) = (self.bids.best, self.asks.best) {
-            if bid >= ask {
+            if bid >= ask && self.phase != Phase::Auction {
                 return Err(format!(
-                    "book is crossed: bid {} >= ask {}",
+                    "book is crossed in phase {:?}: bid {} >= ask {}",
+                    self.phase,
                     self.price_of(bid),
                     self.price_of(ask)
                 ));
@@ -1608,8 +1746,48 @@ mod validate_tests {
                 let s = b.pool.alloc(OrderNode::new(9, 9, Buy, l, 1, 1, false));
                 b.place(s);
             },
-            "crossed",
+            "book is crossed in phase Continuous: bid 105 >= ask 105",
         );
+    }
+
+    /// The healthy fixture moved into a call phase, where a bid at 106 crosses both asks.
+    fn crossed_call(b: &mut OrderBook) {
+        let mut events = Vec::new();
+        for command in [
+            Command::SetPhase {
+                phase: Phase::Auction,
+            },
+            Command::Limit {
+                id: 9,
+                owner: 9,
+                side: Buy,
+                price: 106,
+                qty: 1,
+                tif: TimeInForce::Gtc,
+                display: None,
+            },
+        ] {
+            b.process(command, &mut events);
+        }
+        b.validate()
+            .expect("a crossed book is healthy in a call phase");
+    }
+
+    #[test]
+    fn a_crossed_book_outside_a_call_phase() {
+        for (phase, name) in [
+            (Phase::Continuous, "Continuous"),
+            (Phase::Halted, "Halted"),
+            (Phase::Closed, "Closed"),
+        ] {
+            assert_detects(
+                |b| {
+                    crossed_call(b);
+                    b.phase = phase;
+                },
+                &format!("book is crossed in phase {name}: bid 106 >= ask 105"),
+            );
+        }
     }
 
     /// Adds #9, an iceberg of 10 showing 3, behind the bids at 99 of the healthy fixture.
@@ -1669,6 +1847,22 @@ mod validate_tests {
                 b.pool.iceberg_mut(s).visible = 2;
             },
             "aggregates say 2/4 but queue holds 2/3",
+        );
+        // An auction trusts the count to know where hidden quantity rests.
+        assert_detects(
+            |b| {
+                add_iceberg(b);
+                let l = level(b, 99);
+                b.bids.levels[l].icebergs = 0;
+            },
+            "Buy 99: level counts 0 icebergs but holds 1",
+        );
+        assert_detects(
+            |b| {
+                let l = level(b, 100);
+                b.bids.levels[l].icebergs = 1;
+            },
+            "Buy 100: level counts 1 icebergs but holds 0",
         );
     }
 

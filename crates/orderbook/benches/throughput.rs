@@ -26,6 +26,7 @@ fn scenarios() -> [(&'static str, WorkloadConfig); 2] {
                     mass_cancel: 0,
                     stop: 0,
                     modify: 0,
+                    session: 0,
                 },
                 ..WorkloadConfig::default()
             },

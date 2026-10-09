@@ -120,6 +120,7 @@ impl Fnv {
             .iter()
             .for_each(|&v| self.write_u64(v)),
             Triggered { id } => [9, id].iter().for_each(|&v| self.write_u64(v)),
+            PhaseChanged { phase } => [10, phase as u64].iter().for_each(|&v| self.write_u64(v)),
         }
     }
 

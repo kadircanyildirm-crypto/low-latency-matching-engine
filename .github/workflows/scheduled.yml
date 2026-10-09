@@ -21,8 +21,10 @@ env:
 jobs:
   # The full mutation test suite (README.md#mutation-testing), each crate over four runners.
   # Test infrastructure is left out: the benchmarks' flow generator, the simulated disk and
-  # the kill test's child process. A missed mutant fails the job. A mutant that makes the
-  # tests hang is detected too: cargo-mutants reports it as a timeout.
+  # the kill test's child process. Of the gateway, only its logic is mutated: the network
+  # layer, the client and the load generator are tested end to end, over real sockets whose
+  # timing no test controls. A missed mutant fails the job. A mutant that makes the tests
+  # hang is detected too: cargo-mutants reports it as a timeout.
   mutants:
     name: mutants (${{ matrix.crate }}, shard ${{ matrix.shard }} of 4)
     runs-on: ubuntu-latest
@@ -30,14 +32,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [orderbook, engine]
+        crate: [orderbook, engine, gateway]
         shard: [0, 1, 2, 3]
         include:
           - crate: orderbook
-            skip: --exclude crates/orderbook/src/workload.rs
+            scope: --exclude crates/orderbook/src/workload.rs
           - crate: engine
-            skip: >-
+            scope: >-
               --exclude crates/engine/src/sim.rs --exclude crates/engine/src/bin/engine-soak.rs
+          - crate: gateway
+            scope: >-
+              --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +57,7 @@ jobs:
           # 8 GiB makes such a test fail instead, which detects the mutant.
           ulimit -v 8388608
           status=0
-          cargo mutants -p ${{ matrix.crate }} ${{ matrix.skip }} \
+          cargo mutants -p ${{ matrix.crate }} ${{ matrix.scope }} \
             --shard ${{ matrix.shard }}/4 --sharding round-robin || status=$?
           for outcome in caught timeout unviable missed; do
             echo "$outcome: $(cat mutants.out/$outcome.txt 2>/dev/null | wc -l)"

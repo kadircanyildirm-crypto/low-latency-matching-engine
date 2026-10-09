@@ -9,9 +9,7 @@ use std::path::Path;
 
 use engine::sim::{CrashModel, SimStorage};
 use engine::storage::{Storage, StorageFile};
-use engine::{
-    Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq, SyncPolicy,
-};
+use engine::{Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq, SyncPolicy};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, Event, OrderBook};
 
@@ -466,8 +464,12 @@ fn a_new_rules_version_starts_from_the_old_versions_snapshot() {
         let (mut engine, report) =
             open(&storage, small(book)).unwrap_or_else(|e| panic!("{at}: {e}"));
         assert_eq!(engine.last_seq(), at as u64);
-        // The segment the snapshot ends ends there too, or goes if it holds nothing before.
-        assert_eq!(report.journal.removed_segments, if at == 25 { 1 } else { 2 });
+        // The old segment now ends at the snapshot, or goes if it would start right after
+        // it, and so do the empty ones after it.
+        assert_eq!(
+            report.journal.removed_segments,
+            if at == 25 { 1 } else { 2 }
+        );
         let capacity = u32::from_le_bytes(header(&storage, 21)[32..36].try_into().unwrap());
         assert_eq!(capacity, if at == 25 { 5 } else { 10 });
         assert_eq!(engine.book().digest(), digests[at]);
@@ -700,7 +702,10 @@ fn a_later_record_vouching_for_a_damaged_one_is_found_in_any_slot() {
     );
     match open(&storage, small(book)) {
         Err(Error::Corrupt { file, .. }) => {
-            assert!(file.ends_with("journal-00000000000000000011.log"), "{file:?}");
+            assert!(
+                file.ends_with("journal-00000000000000000011.log"),
+                "{file:?}"
+            );
         }
         other => panic!("{:?}", other.map(|(_, report)| report)),
     }
@@ -737,7 +742,12 @@ fn damaged_snapshots_go_with_the_snapshots_of_their_age() {
         let mut file = storage.clone().create(&damaged(seq)).unwrap();
         file.write_at(0, b"damaged").unwrap();
     }
-    let present = |seq: u64| storage.files().iter().any(|(name, _)| *name == damaged(seq));
+    let present = |seq: u64| {
+        storage
+            .files()
+            .iter()
+            .any(|(name, _)| *name == damaged(seq))
+    };
     engine.submit_batch(&commands[10..20], &mut events).unwrap();
     engine.snapshot().unwrap();
     // Snapshots at 10 and 20 are kept.

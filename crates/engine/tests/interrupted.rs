@@ -71,7 +71,9 @@ fn interrupt(config: EngineConfig, commands: &[Command], digests: &[u64], change
         } else {
             storage.revive();
         }
-        // Recovery dies too, now and then, after a random number of changes.
+        // Recovery dies too, now and then, after a random number of changes, and the
+        // power may fail after it.
+        let mut power = power;
         while rng.below(3) == 0 {
             storage.die_after(rng.below(40));
             let result = open(&storage, config);
@@ -80,7 +82,12 @@ fn interrupt(config: EngineConfig, commands: &[Command], digests: &[u64], change
                 "recovery failed without dying"
             );
             drop(result);
-            storage.revive();
+            if rng.below(2) == 0 {
+                storage = storage.crash(&mut rng, CrashModel::AnyOrder);
+                power = true;
+            } else {
+                storage.revive();
+            }
         }
         let label = format!("{config:?}, dead after {changes} changes, round {round}, seed {seed}");
         engine = open(&storage, config).unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -142,6 +149,31 @@ fn death_at_every_change_loses_nothing_durable() {
             for seed in 0..12 {
                 interrupt(config, &commands, &digests, changes, changes * 12 + seed);
             }
+        }
+    }
+}
+
+/// The same with segments large enough that the next one is prepared in several pieces,
+/// so the process also dies between pieces and with a segment half prepared; the points of
+/// death are sampled.
+#[test]
+fn death_while_segments_are_prepared_in_pieces() {
+    let (book, commands) = common::flow(41, 5_000);
+    let digests = common::digests(book, &commands);
+    for (sync, keep) in [(SyncPolicy::Always, 2), (SyncPolicy::Os, 1)] {
+        let config = EngineConfig {
+            sync,
+            // 2,000 records: 125 KiB of zeros, two pieces.
+            segment_capacity: 2_000,
+            snapshot_every: Some(1_500),
+            keep_snapshots: keep,
+            ..EngineConfig::new(book)
+        };
+        let total = changes_in_a_run(config, &commands);
+        let mut rng = SplitMix64::new(7);
+        for sample in 0..60 {
+            let changes = rng.below(total + 1);
+            interrupt(config, &commands, &digests, changes, sample);
         }
     }
 }

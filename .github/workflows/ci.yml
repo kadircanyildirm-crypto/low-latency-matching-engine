@@ -38,6 +38,24 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo bench --workspace --no-run --locked
 
+  # The ring buffer's unsafe code: under Miri, which detects undefined behaviour, data races
+  # included, while the tests run; and under loom, which runs its models in every
+  # interleaving of the two sides and every order the memory model allows their writes to be
+  # seen in.
+  ring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test -p ring --locked
+      - run: cargo test -p ring --test loom --release --locked
+        env:
+          RUSTFLAGS: --cfg loom
+          CARGO_TARGET_DIR: target/loom
+
   # The minimum supported Rust version declared in Cargo.toml.
   msrv:
     runs-on: ubuntu-latest

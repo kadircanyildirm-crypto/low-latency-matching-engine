@@ -6,6 +6,7 @@
 //! - [`exchange`]: the logic, without sockets: sessions, pre-trade risk, order ids, and the
 //!   routing of the book's events to the sessions they concern.
 //! - [`server`]: a single-threaded event loop that connects sockets to an exchange.
+//! - [`load`]: a load generator.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -13,6 +14,7 @@
 pub mod accounts;
 pub mod client;
 pub mod exchange;
+pub mod load;
 pub mod server;
 
 pub use accounts::{Account, AccountsError};

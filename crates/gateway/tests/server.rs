@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use engine::{Discard, Engine, EngineConfig};
 use gateway::client::Client;
+use gateway::load::{self, LoadConfig};
 use gateway::{Account, Exchange, Server, ServerConfig, Timing};
 use orderbook::{BookConfig, CancelReason, Side, TimeInForce};
 use protocol::{Inbound, LogoutReason, NewOrder, OrderKind, Outbound, Report, ReportKind};
@@ -358,4 +359,31 @@ fn a_connection_can_be_refused_by_a_bad_token() {
     drop(TcpStream::connect(gateway.addr).unwrap());
     let _ = gateway.login(1);
     gateway.stop();
+}
+
+/// The load generator's clients trade with each other until the time is up; every order is
+/// answered, and they leave nothing on the book.
+#[test]
+fn the_load_generator_trades_end_to_end() {
+    let dir = TempDir::new("load");
+    let gateway = Gateway::start(&dir, ServerConfig::default());
+    let config = LoadConfig {
+        duration: Duration::from_millis(500),
+        window: 8,
+        mid: 500,
+        max_resting: 50,
+        ..LoadConfig::default()
+    };
+    let accounts = [account(1), account(2), account(3)];
+    let report = load::run(gateway.addr, &accounts, config).unwrap();
+    assert!(report.orders > 0);
+    assert_eq!(report.latencies.len() as u64, report.orders);
+    assert_eq!(
+        report.accepted + report.rejected + report.refused,
+        report.orders
+    );
+    assert_eq!(report.refused, 0);
+    assert!(report.fills > 0);
+    assert!(report.percentile(0.5) <= report.percentile(1.0));
+    assert_eq!(gateway.stop(), 0);
 }

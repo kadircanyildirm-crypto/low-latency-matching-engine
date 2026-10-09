@@ -388,7 +388,8 @@ Orders come in canonical order: bids best price first, then asks best price firs
 each level in time priority. `restore()` rebuilds a book from a snapshot directly,
 without replaying commands. It refuses snapshots the engine could never have produced:
 too many orders, duplicate ids, orders that could not rest, a crossed book outside a call
-phase, or an exhausted trade counter.
+phase, or a trade count above 2⁶³ − 1, which keeps at least 2⁶³ trade ids for the
+restored book: at a billion trades a second, 292 years.
 
 Two properties make snapshots safe to build on:
 
@@ -543,7 +544,6 @@ cargo +nightly llvm-cov --package orderbook --branch --ignore-filename-regex 'wo
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
-| Trade ids come from a `u64` counter, and the trade that would get id `u64::MAX` overflows it: a debug build panics, a release build wraps. A live book needs 2⁶⁴ − 1 trades to get there, but `restore` accepts any trade count below `u64::MAX`, so a hand-made snapshot gets there in one trade. The `restore` fuzz target keeps clear of it | Phase 2, when snapshots come from disk: decide what an exhausted counter means (halt trading, or refuse such snapshots with a margin) |
 
 ## 13. Performance work
 

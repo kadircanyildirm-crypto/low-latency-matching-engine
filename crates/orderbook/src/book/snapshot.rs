@@ -59,6 +59,13 @@ pub struct BookSnapshot {
     pub stops: Vec<StopOrder>,
 }
 
+impl BookSnapshot {
+    /// The largest trade count [`OrderBook::restore`] accepts: 2⁶³ − 1. It leaves the
+    /// restored book 2⁶³ trade ids, which at a billion trades a second last 292 years, so
+    /// the counter can never run out. A book that starts empty has 2⁶⁴ − 1 ids.
+    pub const MAX_TRADE_COUNT: u64 = i64::MAX as u64;
+}
+
 /// Why a snapshot cannot be restored. Each variant names a state the engine itself can
 /// never reach, so it points at a corrupted or hand-edited snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +85,8 @@ pub enum SnapshotError {
     InvalidOrder(OrderId),
     /// The best bid is at or above the best ask outside a call phase.
     Crossed,
-    /// The trade count leaves no room for another trade id.
+    /// The trade count is above [`BookSnapshot::MAX_TRADE_COUNT`], too close to the end of
+    /// the trade id counter.
     TradeCountExhausted,
     /// The reference price lies outside the price band.
     InvalidReferencePrice,
@@ -93,7 +101,7 @@ impl fmt::Display for SnapshotError {
             Self::Crossed => {
                 f.write_str("the best bid is at or above the best ask outside a call phase")
             }
-            Self::TradeCountExhausted => f.write_str("no trade ids left"),
+            Self::TradeCountExhausted => f.write_str("too few trade ids left"),
             Self::InvalidReferencePrice => f.write_str("the reference price is outside the band"),
         }
     }
@@ -145,10 +153,10 @@ impl OrderBook {
         if snapshot.orders.len() + snapshot.stops.len() > snapshot.config.max_orders as usize {
             return Err(SnapshotError::TooManyOrders);
         }
-        book.next_trade_id = snapshot
-            .trade_count
-            .checked_add(1)
-            .ok_or(SnapshotError::TradeCountExhausted)?;
+        if snapshot.trade_count > BookSnapshot::MAX_TRADE_COUNT {
+            return Err(SnapshotError::TradeCountExhausted);
+        }
+        book.next_trade_id = snapshot.trade_count + 1;
         book.reference = match snapshot.reference_price {
             None => None,
             Some(price) => Some(

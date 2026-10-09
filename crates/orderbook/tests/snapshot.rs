@@ -340,10 +340,12 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
     for (orders, error) in cases {
         assert_eq!(restore(orders.clone(), 0), Err(error), "{orders:?}");
     }
-    assert_eq!(
-        restore(Vec::new(), u64::MAX),
-        Err(SnapshotError::TradeCountExhausted)
-    );
+    for trade_count in [BookSnapshot::MAX_TRADE_COUNT + 1, u64::MAX] {
+        assert_eq!(
+            restore(Vec::new(), trade_count),
+            Err(SnapshotError::TradeCountExhausted)
+        );
+    }
     for price in [0, 101] {
         let snapshot = BookSnapshot {
             config: cfg,
@@ -367,7 +369,7 @@ fn snapshots_the_engine_could_never_produce_are_refused() {
         },
         order(2, Side::Sell, 50, 1, 0),
     ];
-    assert_eq!(restore(edge, u64::MAX - 1), Ok(2));
+    assert_eq!(restore(edge, BookSnapshot::MAX_TRADE_COUNT), Ok(2));
 }
 
 #[test]
@@ -454,6 +456,35 @@ fn a_crossed_book_restores_only_in_a_call_phase() {
     book.validate().unwrap();
 }
 
+/// The largest trade count a snapshot may carry still leaves room for every trade.
+#[test]
+fn a_book_restored_at_the_trade_count_limit_keeps_trading() {
+    let mut book = OrderBook::restore(&BookSnapshot {
+        config: BookConfig::new(1, 100, 4),
+        trade_count: BookSnapshot::MAX_TRADE_COUNT,
+        reference_price: None,
+        phase: Phase::Continuous,
+        orders: vec![order(1, Side::Sell, 50, 3, 0)],
+        stops: Vec::new(),
+    })
+    .unwrap();
+    let mut events = Vec::new();
+    book.process(
+        orderbook::Command::Market {
+            id: 2,
+            owner: 2,
+            side: Side::Buy,
+            qty: 1,
+        },
+        &mut events,
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        orderbook::Event::Trade { trade_id, .. } if *trade_id == 1 << 63
+    )));
+    assert_eq!(book.trade_count(), 1 << 63);
+}
+
 #[test]
 fn errors_explain_themselves() {
     let messages = [
@@ -470,7 +501,7 @@ fn errors_explain_themselves() {
             SnapshotError::Crossed,
             "the best bid is at or above the best ask outside a call phase",
         ),
-        (SnapshotError::TradeCountExhausted, "no trade ids left"),
+        (SnapshotError::TradeCountExhausted, "too few trade ids left"),
         (
             SnapshotError::InvalidReferencePrice,
             "the reference price is outside the band",

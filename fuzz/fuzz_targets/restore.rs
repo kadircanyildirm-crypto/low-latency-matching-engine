@@ -154,8 +154,10 @@ enum StopChange {
 #[derive(Arbitrary, Debug)]
 enum TradeCountInput {
     Small(u16),
+    /// `BookSnapshot::MAX_TRADE_COUNT` minus 128 to plus 127.
+    NearLimit(i8),
     /// `u64::MAX` minus up to 255.
-    NearLimit(u8),
+    NearEnd(u8),
     Any(u64),
 }
 
@@ -246,7 +248,10 @@ impl Edit {
             Edit::TradeCount(count) => {
                 snapshot.trade_count = match *count {
                     TradeCountInput::Small(count) => u64::from(count),
-                    TradeCountInput::NearLimit(below) => u64::MAX - u64::from(below),
+                    TradeCountInput::NearLimit(offset) => {
+                        BookSnapshot::MAX_TRADE_COUNT.wrapping_add_signed(i64::from(offset))
+                    }
+                    TradeCountInput::NearEnd(below) => u64::MAX - u64::from(below),
                     TradeCountInput::Any(count) => count,
                 };
             }
@@ -294,7 +299,7 @@ fn broken_rules(snapshot: &BookSnapshot) -> Vec<SnapshotError> {
     if snapshot.orders.len() + snapshot.stops.len() > config.max_orders as usize {
         broken.push(SnapshotError::TooManyOrders);
     }
-    if snapshot.trade_count == u64::MAX {
+    if snapshot.trade_count > BookSnapshot::MAX_TRADE_COUNT {
         broken.push(SnapshotError::TradeCountExhausted);
     }
     if snapshot
@@ -428,11 +433,6 @@ fuzz_target!(|input: Input| {
         Err(error) => panic!("a restored book's own snapshot was refused: {error}"),
     }
 
-    // Trade ids are a u64 counter; keep clear of its end, which no command stream from an
-    // empty book can reach.
-    if snapshot.trade_count > u64::MAX / 2 {
-        return;
-    }
     let mut reference = reference_can_follow(&config).then(|| ReferenceBook::restore(&snapshot));
     let (mut got, mut want) = (Vec::new(), Vec::new());
     for (step, command) in input.after.iter().take(MAX_COMMANDS).enumerate() {

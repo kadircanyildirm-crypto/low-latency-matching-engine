@@ -6,8 +6,8 @@
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
 
-**Status:** Phase 1 of 7 (the matching core) is complete and hardened. See
-[docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design decision is in
+**Status:** Phases 1 and 2 of 7 are complete: the matching core, and the journal and crash
+recovery around it. See [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design decision is in
 [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Phase 1: the order book
@@ -88,7 +88,7 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, phase changes and uncrosses, and computing the digest. |
 | Fuzzing | [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) steers inputs toward code they have not reached yet. Three targets: the differential test over any configuration, bands out to the ends of `i64` included; the snapshot round trip; and `restore` on arbitrary snapshots, which must never panic and must accept exactly the snapshots the documented rules allow. Debug assertions and overflow checks stay on. Each target runs 30 seconds on every push and 20 minutes every week. |
 | Formal proofs | [Kani](https://github.com/model-checking/kani) checks every input within stated bounds: the bitset searches agree with a linear scan, the order pool's free list is a LIFO stack of exactly the free slots, the iceberg fill arithmetic is exact, and each owner's list holds its orders in the order they started resting. |
-| Coverage | The tests run **99.88%** of the engine's lines (3 of 2,488 missed) and **96.8%** of its branches (13 of 408 missed), measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) in CI. What they miss is defensive code, such as `validate()`'s overflow error that the capacity rule makes unreachable. |
+| Coverage | The tests run **99.84%** of the order book's lines (4 of 2,531 missed) and **97.0%** of its branches (13 of 432 missed), measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) in CI. What they miss is defensive code, such as `validate()`'s overflow error that the capacity rule makes unreachable. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
@@ -210,6 +210,56 @@ exchange-core comes closest on the million-order book, where both engines are bo
 cache misses. The method, all four scenarios, latency percentiles and caveats are in the
 document; `compare/run.sh` reruns everything.
 
+## Phase 2: the journal and recovery
+
+`crates/engine` puts the book behind a sequencer and a write-ahead journal. `Engine::submit`
+gives each command the next sequence number, appends it to the journal, syncs as the
+policy says, and only then applies it to the book. Because the book is deterministic,
+replaying the journal rebuilds its exact state; snapshots bound how much has to be
+replayed.
+
+```rust
+let (mut engine, report) = Engine::open("data", EngineConfig::new(book_config))?;
+let seq = engine.submit(command, &mut events)?; // journaled, synced, then applied
+```
+
+| Property | How |
+|---|---|
+| Write-ahead | The book never sees a command the journal lacks. Opening an engine loads the newest intact snapshot and replays the journal after it. |
+| Checksummed, fixed-size records | 64-byte records with a CRC-32 in preallocated segment files; the record for `seq` sits at a computed slot. Commands use a strict 40-byte encoding that decodes only what the encoder writes. |
+| Crash or damage, never confused | Each record carries the highest sequence number synced when it was written. A bad record that nothing later vouches for is the torn tail of a crash: recovery cuts the log there and zeroes what follows, so stale records cannot return after the next crash. If a later record shows the bad one had been synced, recovery refuses rather than drop acknowledged commands. |
+| Atomic snapshots | Written to a temporary file, synced, renamed. Loading checks two checksums, the decoding, the book's restore rules and its digest; a damaged snapshot is set aside and the previous one used. Old snapshots and the journal only they needed are deleted. |
+| Sync policies | `Always` syncs before `submit` returns, once per batch with `submit_batch` (group commit); `Os` leaves write-back to the OS. A failed write or sync poisons the engine until it is reopened. |
+| No allocation | Journaling, syncing and applying commands allocate nothing, shown with a counting allocator on the real file system. |
+
+**What a failure costs**: a killed process loses nothing it submitted; a power failure
+loses nothing acknowledged under `Always`, and only what came after the last sync under
+`Os`. In every case recovery keeps a prefix of the commands and rebuilds exactly the state
+after it.
+
+**Verification.** The acceptance test kills a real process 48 times at random points, in
+writes, syncs, segment rolls and snapshots, on Linux, Windows and macOS: each time, recovery
+keeps everything the process had reported durable and rebuilds exactly the state after it.
+A simulated disk that loses power (torn writes, reordered write-back, lost directory
+changes) drives 1,600 failures over 400 random configurations, and flips a bit anywhere in
+any file 300 times; a fuzz target combines all of these with any command stream. Removing
+any one of the four safety mechanisms in recovery fails a test.
+
+**Cost** (`cargo bench -p engine --bench journal`, same laptop, P-core, Windows):
+
+| | Throughput | p50 per command |
+|---|---:|---:|
+| Book alone | 8.7M cmd/s | 100 ns |
+| Journal, `Os`, 64 commands per write | 5.3M cmd/s | 122 ns |
+| Journal, `Os`, one command per write | 377k cmd/s | 2.1 µs |
+| Journal, `Always`, 512 commands per sync (group commit) | 366k cmd/s | 2.8 µs |
+| Journal, `Always`, one command per sync | about 500 cmd/s | 2.2 ms |
+
+A sync costs one to two milliseconds on this consumer NVMe drive however little it
+writes, so durability is affordable only with group commit. Replay runs at 11.9M cmd/s.
+Formats, the recovery algorithm and the reasoning are in
+[DESIGN.md §14](docs/DESIGN.md#14-the-journal-and-recovery).
+
 ## Running
 
 ```sh
@@ -217,14 +267,16 @@ cargo test                                # all tests
 cargo bench --bench latency               # latency per scenario; writes target/latency/*.hgrm
 LAT_CORE=2 cargo bench --bench latency    # the same, pinned to logical core 2 instead of the last
 cargo bench --bench throughput            # Criterion before/after comparison (includes generator cost)
+cargo bench -p engine --bench journal    # journaling cost per sync policy, replay and snapshot speed
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
+cargo mutants -p engine --exclude crates/engine/src/sim.rs --exclude crates/engine/src/bin/engine-soak.rs
 cargo +nightly fuzz run differential -s none -a -- -max_total_time=60 -len_control=0   # fuzzing
 (cd crates/orderbook && cargo kani)                                     # proofs (Linux, macOS)
-cargo +nightly llvm-cov -p orderbook --branch --ignore-filename-regex 'workload\.rs' --summary-only   # coverage
+cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|engine-soak)\.rs' --summary-only   # coverage
 compare/run.sh fetch && compare/run.sh export && compare/run.sh all   # comparison with other engines
 ```
 
-The fuzz targets are `differential`, `snapshot_roundtrip` and `restore`. Each needs its
+The fuzz targets are `differential`, `snapshot_roundtrip`, `restore` and `recovery`. Each needs its
 tool first: `cargo install cargo-fuzz`, `cargo install --locked kani-verifier && cargo kani
 setup`, or `cargo install cargo-llvm-cov` with the nightly `llvm-tools-preview` component.
 Windows needs a different fuzzing setup, described in

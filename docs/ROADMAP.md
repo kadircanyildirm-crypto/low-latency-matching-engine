@@ -7,8 +7,8 @@ documented are worth more than five half-finished ones.
 | Phase | Topic | Status |
 |-------|-------|--------|
 | 1 | Matching core + test infrastructure + benchmarks | ✅ Done |
-| 2 | Event sourcing: journal + replay | ⏳ Next |
-| 3 | Binary protocol + TCP gateway | — |
+| 2 | Event sourcing: journal + replay | ✅ Done |
+| 3 | Binary protocol + TCP gateway | ⏳ Next |
 | 4 | Pipeline: gateway → sequencer → matcher → publisher | — |
 | 5 | End-to-end measurement and optimisation on Linux | — |
 | 6 | Hot standby replication and failover | — |
@@ -46,8 +46,8 @@ allocates on the hot path.
 - Snapshots and a state digest: `snapshot()` / `restore()` rebuild an identical book
   without replay, and `digest()` is a platform-independent hash of the complete state.
 - Data structures: a dense price ladder per side with a two-level occupancy bitset,
-  intrusive FIFO queues in a preallocated slab, and an `FxHashMap` id index reserved at
-  twice the capacity.
+  intrusive FIFO queues in a preallocated slab, and an id index of 64-byte lines sized
+  once at twice the capacity.
 - Verification:
   - Scenario tests, one rule per test, with the exact expected event sequence.
   - A differential property test against a deliberately naive reference book.
@@ -58,8 +58,9 @@ allocates on the hot path.
   - Soak tests under both self-trade policies, and golden fingerprints that CI checks on
     Linux, Windows and macOS.
   - Zero-allocation tests with a counting global allocator.
-  - Mutation testing: every mutant that compiles is detected (market states await
-    their run).
+  - Mutation testing: every mutant that compiles is detected.
+  - Fuzzing, Kani proofs of the bitset, order pool and owner lists, and line and branch
+    coverage in CI.
 - Measurement: per-command latency with the TSC and HdrHistogram over four scenarios
   (`.hgrm` output), and Criterion throughput tracking.
 
@@ -68,22 +69,38 @@ path, latency report in the README. All met.
 
 ---
 
-## Phase 2 — Event sourcing: journal + replay
+## Phase 2 — Event sourcing: journal + replay ✅
 
 **Goal:** rebuild the system's exact state from the command log alone.
 
-- A sequencer that gives every command an increasing sequence number.
-- An append-only journal file: a fixed header plus length and CRC32 for each record.
-- Crash recovery: detect a half-written final record and truncate it.
-- Snapshots: write the book's state at intervals; on startup, load the snapshot and replay
-  the tail of the log. The book already provides `snapshot()` / `restore()`; this phase
-  adds the on-disk format and the schedule.
-- State hash: after a replay, the book's `digest()` must equal the live run's.
-- `fsync` policies (every command / group commit / leave it to the OS) and a benchmark of
-  each one's effect on latency.
+**Delivered** (`crates/engine`, [DESIGN.md §14](DESIGN.md#14-the-journal-and-recovery))
+- A sequencer: `Engine::submit` gives every command the next sequence number, journals it,
+  syncs as the policy says, and only then applies it to the book.
+- An append-only journal of preallocated segment files: a checksummed header per segment,
+  and 64-byte records, each with its length, CRC-32, sequence number and a strict 40-byte
+  encoding of the command.
+- Crash recovery: a torn or half-written tail is cut and zeroed, so stale records cannot
+  return after a later crash. Each record carries the highest sequence number synced when
+  it was written, so recovery tells a crash from damage to synced data and refuses the
+  latter instead of dropping acknowledged commands.
+- Snapshots written atomically (temporary file, sync, rename) on a schedule or on request;
+  recovery loads the newest intact one, falls back to an older one if it is damaged, and
+  replays the journal after it. Old snapshots and the journal only they needed are
+  deleted.
+- State hash: every snapshot records the book's digest, checked after loading; every
+  recovery test compares the recovered digest with a run that never failed.
+- Sync policies: every call (`Always`; with `submit_batch`, group commit) or left to the OS
+  (`Os`), with a benchmark of each one's cost. A failed write or sync poisons the engine.
+- Zero allocation on the journaling path, shown with a counting allocator.
+- Verification: a simulated disk that loses power (torn and reordered writes, lost
+  directory changes) and flips bits, 1,600 failures over 400 random configurations, a
+  test per way the files can be damaged, a fuzz target combining all of it, and fault
+  injection showing that each safety mechanism is needed.
 
 **Acceptance criteria:** a test proving that a process killed at a random point returns to
-exactly the same state through replay; the cost of journal writes measured.
+exactly the same state through replay (`crates/engine/tests/kill.rs`: 48 kills on Linux,
+Windows and macOS); the cost of journal writes measured (README and DESIGN.md §14). Both
+met.
 
 ---
 

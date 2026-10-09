@@ -61,6 +61,8 @@ jobs:
           path: mutants.out
 
   # The bitset search proofs, too slow for every push: up to half an hour or more each.
+  # Each band size of the dense proofs has a job of its own: run together, they did not
+  # finish within the five-hour limit.
   kani:
     name: kani (${{ matrix.proofs }})
     runs-on: ubuntu-latest
@@ -69,8 +71,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - proofs: dense bitsets
-            harnesses: --harness dense_sets
+          - proofs: dense bitsets, up to one word
+            harnesses: >-
+              --harness dense_sets_with_no_levels --harness dense_sets_in_a_partial_word
+              --harness dense_sets_in_one_full_word
+          - proofs: dense bitsets, two full words
+            harnesses: --harness dense_sets_in_two_full_words
+          - proofs: dense bitsets, a partial third word
+            harnesses: --harness dense_sets_in_a_partial_third_word
           - proofs: sparse bitsets, two summary words
             harnesses: --harness sparse_sets_in_two_summary_words
           - proofs: sparse bitsets, two full summary words

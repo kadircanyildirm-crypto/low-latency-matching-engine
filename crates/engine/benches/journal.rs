@@ -1,5 +1,6 @@
 //! What journaling costs: per-command latency and throughput of `Engine::submit` under each
-//! sync policy and batch size, against the book alone; how fast recovery replays; and how
+//! sync policy and batch size, against the book alone, with the slowest call, which a
+//! segment roll can cause; how fast recovery replays; and how
 //! long a snapshot takes to write and load.
 //!
 //! Runs on the real file system, in a directory under the system's temporary directory
@@ -72,7 +73,7 @@ impl Run {
     fn print(&self) {
         let per = |q: f64| self.calls.value_at_quantile(q) as f64 / self.batch as f64;
         println!(
-            "  {:<32} {:>9.1} {:>10.0} {:>10.0} {:>10.0} {:>11.0} {:>12.0}",
+            "  {:<32} {:>9.1} {:>10.0} {:>10.0} {:>10.0} {:>11.0} {:>12.0} {:>12.0}",
             self.label,
             self.commands as f64 / self.elapsed.as_secs_f64() / 1e3,
             per(0.5),
@@ -80,6 +81,7 @@ impl Run {
             per(0.999),
             self.calls.value_at_quantile(0.5) as f64,
             self.calls.value_at_quantile(0.99) as f64,
+            self.calls.max() as f64,
         );
     }
 }
@@ -165,8 +167,15 @@ fn main() {
 
     println!();
     println!(
-        "  {:<32} {:>9} {:>10} {:>10} {:>10} {:>11} {:>12}",
-        "", "k cmd/s", "p50 ns/cmd", "p99 ns/cmd", "p99.9", "p50 ns/call", "p99 ns/call"
+        "  {:<32} {:>9} {:>10} {:>10} {:>10} {:>11} {:>12} {:>12}",
+        "",
+        "k cmd/s",
+        "p50 ns/cmd",
+        "p99 ns/cmd",
+        "p99.9",
+        "p50 ns/call",
+        "p99 ns/call",
+        "max ns/call"
     );
     measure_book(book, &commands, warmup).print();
     let os = EngineConfig {

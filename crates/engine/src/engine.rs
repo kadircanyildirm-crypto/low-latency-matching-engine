@@ -50,13 +50,13 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// [`SyncPolicy::Always`], segments of 2²⁰ records (64 MiB), snapshots only on
+    /// [`SyncPolicy::Always`], segments of 2¹⁶ records (4 MiB), snapshots only on
     /// request, the last two kept, and replay verified on opening.
     pub fn new(book: BookConfig) -> Self {
         EngineConfig {
             book,
             sync: SyncPolicy::Always,
-            segment_capacity: 1 << 20,
+            segment_capacity: 1 << 16,
             snapshot_every: None,
             keep_snapshots: 2,
             verify_replay: true,

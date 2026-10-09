@@ -8,6 +8,7 @@
 //! - [`server`]: an event loop that connects sockets to an exchange, with a [`Core`] that
 //!   runs the engine: on the same thread, or on threads of its own in a [`pipeline`].
 //! - [`load`]: a load generator.
+//! - [`wallet`]: paper money, held by open orders and settled by trades.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -18,9 +19,10 @@ pub mod exchange;
 pub mod load;
 pub mod pipeline;
 pub mod server;
+pub mod wallet;
 pub mod web;
 
-pub use accounts::{Account, AccountsError};
+pub use accounts::{Account, AccountsError, Funds};
 pub use exchange::{Exchange, Mailbox, SessionId, SetupError, Timing};
 pub use pipeline::{Pipeline, PipelineConfig};
 pub use server::{Core, Server, ServerConfig, ServerError};

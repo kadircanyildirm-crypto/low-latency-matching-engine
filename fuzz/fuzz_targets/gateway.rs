@@ -220,6 +220,7 @@ fuzz_target!(|steps: Vec<Step>| {
             token: u64::from(id),
             max_open_orders: MAX_OPEN,
             messages_per_second: 50,
+            funds: None,
         })
         .collect();
     let timing = Timing {

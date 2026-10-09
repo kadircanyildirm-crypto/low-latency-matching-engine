@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 
-use crate::accounts::Account;
+use crate::accounts::{self, Account, Funds};
 use crate::exchange::Exchange;
 
 /// The page and its files, built into the binary.
@@ -49,6 +49,8 @@ pub struct Guests {
     pub max_open_orders: u32,
     /// A guest's order-entry messages per second.
     pub messages_per_second: u32,
+    /// What a guest starts with: guests trade paper money if this is set.
+    pub funds: Option<Funds>,
 }
 
 impl Guests {
@@ -65,15 +67,12 @@ impl Guests {
             token: u64::from_le_bytes(token),
             max_open_orders: self.max_open_orders,
             messages_per_second: self.messages_per_second,
+            funds: self.funds,
         };
         // Saved before it is used: an account the visitor was told of exists after a crash.
         if let Some(path) = &self.file {
             let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-            writeln!(
-                file,
-                "{} {} {} {}",
-                account.id, account.token, account.max_open_orders, account.messages_per_second
-            )?;
+            writeln!(file, "{}", accounts::format(&account))?;
             file.sync_data()?;
         }
         exchange

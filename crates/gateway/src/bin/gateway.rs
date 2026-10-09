@@ -12,6 +12,8 @@
 //! `--web` also serves browsers on `<addr>`: the exchange's page, and sessions over
 //! WebSocket. Visitors may create accounts with ids from `--guest-ids`, which are saved to
 //! the `--guests` file (`<dir>/guests.txt` by default) and loaded from it on the next start.
+//! They trade paper money: `--guest-cash` (in price ticks times lots) and
+//! `--guest-position` (in lots) to start with.
 //!
 //! The accounts file holds one account per line: id, token, open-order limit and message
 //! rate. The book's settings are part of the journal: a directory opens only with the ones
@@ -27,7 +29,8 @@ use std::sync::atomic::AtomicBool;
 use engine::{Discard, Engine, EngineConfig, SyncPolicy};
 use gateway::web::Guests;
 use gateway::{
-    Account, Core, Exchange, Pipeline, PipelineConfig, Server, ServerConfig, Timing, accounts,
+    Account, Core, Exchange, Funds, Pipeline, PipelineConfig, Server, ServerConfig, Timing,
+    accounts,
 };
 use orderbook::BookConfig;
 use ring::Wait;
@@ -36,7 +39,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--sync always|os] [--min-price <n>] [--max-price <n>] [--max-orders <n>] \
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
-[--guests <file>] [--guest-ids <from>..<to>]";
+[--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -126,6 +129,10 @@ fn run() -> Result<(), String> {
             ));
         }
     };
+    let funds = Funds {
+        cash: parse(take("guest-cash"), "10000000", "guest-cash")?,
+        position: parse(take("guest-position"), "1000", "guest-position")?,
+    };
     if let Some(name) = args.keys().next() {
         return Err(format!("unknown flag --{name}\n{USAGE}"));
     }
@@ -139,6 +146,7 @@ fn run() -> Result<(), String> {
         ids: guest_ids,
         max_open_orders: 50,
         messages_per_second: 20,
+        funds: Some(funds),
     };
     let web = web.map(|addr| (addr, guests));
     let config = EngineConfig {

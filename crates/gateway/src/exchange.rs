@@ -21,13 +21,14 @@ use std::fmt;
 use engine::storage::Storage;
 use engine::{Engine, Error, Output, Seq};
 use marketdata::Depth;
-use orderbook::{Command, Event, OrderBook, OrderId, Side};
+use orderbook::{Command, Event, OrderBook, OrderId, Price, Qty, Side};
 use protocol::{
     Inbound, LevelUpdate, LoginError, LogoutReason, NewOrder, OrderKind, Outbound, RejectCode,
     Report, ReportKind, TradeTick, VERSION,
 };
 
 use crate::accounts::Account;
+use crate::wallet::Wallet;
 
 /// A connection's handle, chosen by the network layer.
 pub type SessionId = usize;
@@ -123,13 +124,33 @@ struct AccountState {
     session: Option<SessionId>,
     /// Its orders and pending stops, counting those waiting in the batch.
     open: u32,
+    /// A paper-trading account's money and position.
+    wallet: Option<Wallet>,
 }
 
-/// A live order: whose it is.
+impl AccountState {
+    fn new(account: Account) -> AccountState {
+        AccountState {
+            account,
+            session: None,
+            open: 0,
+            wallet: account.funds.map(Wallet::new),
+        }
+    }
+}
+
+/// A live order: whose it is, and what it holds of its account's wallet.
 #[derive(Clone, Copy, Debug)]
 struct Live {
     account: u32,
     client_ref: u64,
+    side: Side,
+    /// Its limit price: none for a market or stop-market order.
+    price: Option<Price>,
+    /// Its open quantity.
+    leaves: Qty,
+    /// What it holds of a paper-trading account's wallet.
+    held: i64,
 }
 
 /// A command handed over whose events may still come.
@@ -172,6 +193,8 @@ pub struct Exchange {
     published: Seq,
     /// Scratch space for the changed levels.
     updates: Vec<LevelUpdate>,
+    /// Accounts whose wallets changed since the last publication.
+    changed_wallets: Vec<u32>,
 }
 
 impl Exchange {
@@ -190,21 +213,20 @@ impl Exchange {
             let state = states
                 .get_mut(account.id as usize)
                 .ok_or(SetupError::AccountOutOfRange(account.id))?;
-            *state = Some(AccountState {
-                account: *account,
-                session: None,
-                open: 0,
-            });
+            *state = Some(AccountState::new(*account));
         }
         let mut live = HashMap::new();
         for side in [Side::Buy, Side::Sell] {
             for level in book.depth(side) {
                 for order in book.queue(side, level.price) {
-                    live.insert(order.id, order.owner);
+                    live.insert(
+                        order.id,
+                        (order.owner, side, Some(level.price), order.leaves),
+                    );
                 }
             }
             for stop in book.stops(side) {
-                live.insert(stop.id, stop.owner);
+                live.insert(stop.id, (stop.owner, side, stop.limit, stop.qty));
             }
         }
         let mut exchange = Exchange {
@@ -221,23 +243,16 @@ impl Exchange {
             delivered: last_seq,
             published: last_seq,
             updates: Vec::new(),
+            changed_wallets: Vec::new(),
         };
-        for (id, account) in live {
+        for (id, (account, side, price, leaves)) in live {
             if id > last_seq {
                 return Err(SetupError::ForeignOrder(id));
             }
-            let client_ref = 0;
-            exchange.live.insert(
-                id,
-                Live {
-                    account,
-                    client_ref,
-                },
-            );
-            if let Some(state) = exchange.accounts[account as usize].as_mut() {
-                state.open += 1;
-            }
+            exchange.place(id, account, 0, side, price, 0);
+            exchange.set_leaves(id, leaves);
         }
+        exchange.changed_wallets.clear();
         Ok(exchange)
     }
 
@@ -256,12 +271,13 @@ impl Exchange {
         if state.is_some() {
             return Err(SetupError::AccountExists(account.id));
         }
-        *state = Some(AccountState {
-            account,
-            session: None,
-            open: 0,
-        });
+        *state = Some(AccountState::new(account));
         Ok(())
+    }
+
+    /// A paper-trading account's wallet.
+    pub fn wallet(&self, account: u32) -> Option<Wallet> {
+        self.accounts.get(account as usize)?.as_ref()?.wallet
     }
 
     /// Whether an account with id `id` exists.
@@ -378,6 +394,9 @@ impl Exchange {
         state.refilled = self.now;
         let last_seq = self.last_seq;
         self.send(session, Outbound::LoginAccepted { account, last_seq }, mail);
+        if let Some(wallet) = self.wallet(account) {
+            self.send(session, Outbound::Balance(wallet.balance()), mail);
+        }
     }
 
     fn limits(&self, account: u32) -> Account {
@@ -418,23 +437,36 @@ impl Exchange {
                 kind,
             }) => {
                 let state = self.accounts[account as usize]
-                    .as_mut()
+                    .as_ref()
                     .expect("an account");
                 if state.open >= state.account.max_open_orders {
                     let reason = RejectCode::TooManyOrders;
                     return self.send(session, Outbound::Reject { reason, client_ref }, mail);
                 }
-                state.open += 1;
+                let price = match kind {
+                    OrderKind::Limit { price, .. } => Some(price),
+                    OrderKind::Stop { limit, .. } => limit,
+                    OrderKind::Market => None,
+                };
+                // A paper-trading account places limit orders it can pay for in full.
+                if let Some(wallet) = state.wallet {
+                    let refusal = match (kind, price) {
+                        (OrderKind::Limit { .. }, Some(price)) => {
+                            match Wallet::hold_of(side, price, qty) {
+                                Some(hold) if hold >= 0 && wallet.covers(side, hold) => None,
+                                _ => Some(RejectCode::InsufficientFunds),
+                            }
+                        }
+                        _ => Some(RejectCode::NotAllowed),
+                    };
+                    if let Some(reason) = refusal {
+                        return self.send(session, Outbound::Reject { reason, client_ref }, mail);
+                    }
+                }
                 // An order's id is the sequence number of the command that places it:
                 // unique, increasing, and recovered with the journal.
                 let id = self.last_seq + 1;
-                self.live.insert(
-                    id,
-                    Live {
-                        account,
-                        client_ref,
-                    },
-                );
+                self.place(id, account, client_ref, side, price, qty);
                 let owner = account;
                 match kind {
                     OrderKind::Limit {
@@ -470,6 +502,19 @@ impl Exchange {
                 id: order_id,
                 owner: account,
             },
+            // A paper-trading account cancels and places again instead: a modify could need
+            // more than it holds while it waits to be applied.
+            Inbound::Modify { .. } if self.wallet(account).is_some() => {
+                let reason = RejectCode::NotAllowed;
+                return self.send(
+                    session,
+                    Outbound::Reject {
+                        reason,
+                        client_ref: 0,
+                    },
+                    mail,
+                );
+            }
             Inbound::Modify {
                 order_id,
                 price,
@@ -576,6 +621,19 @@ impl Exchange {
                 orders: update.level.orders,
             }));
         self.published = seq;
+        for index in 0..self.changed_wallets.len() {
+            let account = self.changed_wallets[index];
+            let Some(state) = self.accounts[account as usize].as_ref() else {
+                continue;
+            };
+            if let (Some(session), Some(wallet)) = (state.session, state.wallet) {
+                let open = self.sessions[session].as_ref().is_some_and(Session::open);
+                if open {
+                    self.send(session, Outbound::Balance(wallet.balance()), mail);
+                }
+            }
+        }
+        self.changed_wallets.clear();
         if self.trades.is_empty() && self.updates.is_empty() {
             return;
         }
@@ -732,8 +790,72 @@ impl Exchange {
         }
     }
 
-    /// The order has left the book.
+    /// A new order, holding `qty` at its price if its account trades paper money.
+    fn place(
+        &mut self,
+        id: OrderId,
+        account: u32,
+        client_ref: u64,
+        side: Side,
+        price: Option<Price>,
+        qty: Qty,
+    ) {
+        if let Some(state) = self.accounts[account as usize].as_mut() {
+            state.open += 1;
+        }
+        let live = Live {
+            account,
+            client_ref,
+            side,
+            price,
+            leaves: 0,
+            held: 0,
+        };
+        self.live.insert(id, live);
+        self.set_leaves(id, qty);
+    }
+
+    /// The order's open quantity is now `leaves`: what it holds follows.
+    fn set_leaves(&mut self, id: OrderId, leaves: Qty) {
+        let Some(live) = self.live.get_mut(&id) else {
+            return;
+        };
+        live.leaves = leaves;
+        let Some(state) = self.accounts[live.account as usize].as_mut() else {
+            return;
+        };
+        let Some(wallet) = state.wallet.as_mut() else {
+            return;
+        };
+        let held = live
+            .price
+            .and_then(|price| Wallet::hold_of(live.side, price, leaves))
+            .unwrap_or(0);
+        if held != live.held {
+            wallet.hold(live.side, held - live.held);
+            live.held = held;
+            self.changed_wallets.push(live.account);
+        }
+    }
+
+    /// The order traded `qty` at `price`, and has `leaves` open.
+    fn traded(&mut self, id: OrderId, price: Price, qty: Qty, leaves: Qty) {
+        let Some(live) = self.live.get(&id).copied() else {
+            return;
+        };
+        if let Some(wallet) = self.accounts[live.account as usize]
+            .as_mut()
+            .and_then(|state| state.wallet.as_mut())
+        {
+            wallet.settle(live.side, price, qty);
+            self.changed_wallets.push(live.account);
+        }
+        self.set_leaves(id, leaves);
+    }
+
+    /// The order has left the book: what it held goes back.
     fn retire(&mut self, id: OrderId) {
+        self.set_leaves(id, 0);
         if let Some(live) = self.live.remove(&id) {
             if let Some(state) = self.accounts[live.account as usize].as_mut() {
                 state.open -= 1;
@@ -828,6 +950,7 @@ impl Exchange {
                         leaves,
                     };
                     self.tell_owner(seq, id, kind, mail);
+                    self.traded(id, price, qty, leaves);
                     if leaves == 0 {
                         self.retire(id);
                     }
@@ -847,6 +970,7 @@ impl Exchange {
                     visible,
                 };
                 self.tell_owner(seq, id, kind, mail);
+                self.set_leaves(id, qty);
             }
             Event::Replenished {
                 id,
@@ -872,6 +996,10 @@ impl Exchange {
                 leaves,
             } => {
                 self.tell_owner(seq, id, ReportKind::Modified { price, qty, leaves }, mail);
+                if let Some(live) = self.live.get_mut(&id) {
+                    live.price = Some(price);
+                }
+                self.set_leaves(id, leaves);
                 if leaves == 0 {
                     self.retire(id);
                 }

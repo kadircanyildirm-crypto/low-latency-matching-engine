@@ -62,6 +62,7 @@ impl Gateway {
                 token: 101,
                 max_open_orders: 100,
                 messages_per_second: 10_000,
+                funds: None,
             };
             let exchange =
                 Exchange::new(engine.book(), engine.last_seq(), &[bot], Timing::default()).unwrap();
@@ -72,6 +73,7 @@ impl Gateway {
                 ids: 10..12,
                 max_open_orders: 5,
                 messages_per_second: 100,
+                funds: None,
             };
             server.serve_web(addr, Some(guests)).unwrap();
             let addrs = (

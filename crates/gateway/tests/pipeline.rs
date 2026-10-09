@@ -48,6 +48,7 @@ fn accounts() -> Vec<Account> {
             token: u64::from(id),
             max_open_orders: 40,
             messages_per_second: 1_000_000,
+            funds: None,
         })
         .collect()
 }

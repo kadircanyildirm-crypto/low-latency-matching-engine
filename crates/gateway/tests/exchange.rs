@@ -115,6 +115,7 @@ fn account(id: u32) -> Account {
         token: 100 + u64::from(id),
         max_open_orders: 10,
         messages_per_second: 1_000,
+        funds: None,
     }
 }
 
@@ -146,9 +147,10 @@ fn login(account: u32) -> Inbound {
 fn logged_in(exchange: &mut Exchange, session: SessionId, account: u32, mail: &mut Mail) {
     exchange.connect(session, 0);
     exchange.receive(session, login(account), 0, mail);
+    // A paper-trading account is told its balance too.
     assert!(matches!(
         mail.take(session)[..],
-        [Outbound::LoginAccepted { .. }]
+        [Outbound::LoginAccepted { .. }, ..]
     ));
 }
 
@@ -1218,5 +1220,233 @@ fn market_data_rebuilds_the_depth() {
             }
         }
         assert!(ticks > 0, "seed {seed}");
+    }
+}
+
+fn paper(id: u32, cash: i64, position: i64) -> Account {
+    Account {
+        funds: Some(gateway::Funds { cash, position }),
+        ..account(id)
+    }
+}
+
+fn balance(mail: &mut Mail, session: SessionId) -> protocol::Balance {
+    mail.take(session)
+        .into_iter()
+        .rev()
+        .find_map(|message| match message {
+            Outbound::Balance(balance) => Some(balance),
+            _ => None,
+        })
+        .expect("a balance")
+}
+
+/// A paper-trading account's orders hold what they need, trades settle at their own price
+/// and give back what was held for less, and what it cannot pay for or may not send is
+/// refused.
+#[test]
+fn paper_money_is_held_and_settled() {
+    let mut exchange = exchange(&[paper(1, 10_000, 100), account(2)]);
+    let mut mail = Mail::default();
+    exchange.connect(0, 0);
+    exchange.receive(0, login(1), 0, &mut mail);
+    assert_eq!(
+        balance(&mut mail, 0),
+        protocol::Balance {
+            cash: 10_000,
+            position: 100,
+            cash_held: 0,
+            position_held: 0
+        }
+    );
+    logged_in(&mut exchange, 1, 2, &mut mail);
+    // The market maker offers 6 at 98; the account bids 10 at 100 and takes them.
+    exchange.receive(1, limit(1, Side::Sell, 98, 6), 1, &mut mail);
+    exchange.receive(0, limit(2, Side::Buy, 100, 10), 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    exchange.publish(&mut mail);
+    assert_eq!(
+        balance(&mut mail, 0),
+        protocol::Balance {
+            cash: 10_000 - 6 * 98,
+            position: 106,
+            cash_held: 4 * 100,
+            position_held: 0
+        }
+    );
+    let refused = |reason| Outbound::Reject {
+        reason,
+        client_ref: 3,
+    };
+    // More than is left: 9,412 cash, 400 of it held.
+    exchange.receive(0, limit(3, Side::Buy, 100, 91), 1, &mut mail);
+    assert_eq!(mail.take(0), [refused(RejectCode::InsufficientFunds)]);
+    exchange.receive(0, limit(3, Side::Sell, 120, 107), 1, &mut mail);
+    assert_eq!(mail.take(0), [refused(RejectCode::InsufficientFunds)]);
+    // Nothing but limit orders and cancels.
+    for kind in [
+        OrderKind::Market,
+        OrderKind::Stop {
+            trigger: 90,
+            limit: Some(90),
+        },
+    ] {
+        let order = Inbound::NewOrder(NewOrder {
+            client_ref: 3,
+            side: Side::Sell,
+            qty: 1,
+            kind,
+        });
+        exchange.receive(0, order, 1, &mut mail);
+        assert_eq!(mail.take(0), [refused(RejectCode::NotAllowed)]);
+    }
+    let modify = Inbound::Modify {
+        order_id: 2,
+        price: 99,
+        qty: 10,
+    };
+    exchange.receive(0, modify, 1, &mut mail);
+    let reason = RejectCode::NotAllowed;
+    assert_eq!(
+        mail.take(0),
+        [Outbound::Reject {
+            reason,
+            client_ref: 0
+        }]
+    );
+    // Every lot it has, offered; the bid is cancelled and its cash comes back.
+    exchange.receive(0, limit(4, Side::Sell, 120, 106), 1, &mut mail);
+    exchange.receive(0, Inbound::Cancel { order_id: 2 }, 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    exchange.publish(&mut mail);
+    assert_eq!(
+        balance(&mut mail, 0),
+        protocol::Balance {
+            cash: 9_412,
+            position: 106,
+            cash_held: 0,
+            position_held: 106
+        }
+    );
+    // The market maker buys 50 of them at 120.
+    exchange.receive(1, limit(5, Side::Buy, 120, 50), 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    exchange.publish(&mut mail);
+    assert_eq!(
+        balance(&mut mail, 0),
+        protocol::Balance {
+            cash: 9_412 + 50 * 120,
+            position: 56,
+            cash_held: 0,
+            position_held: 56
+        }
+    );
+    // A disconnect cancels the rest, and releases what it held.
+    exchange.disconnect(0);
+    exchange.flush(&mut mail).unwrap();
+    assert_eq!(exchange.wallet(1).unwrap().position_held, 0);
+}
+
+/// Accounts that all trade paper money with each other: whatever they do, the money and the
+/// lots they own in total do not change, no account ever holds more than it owns, and
+/// every account holds exactly what its orders on the book need.
+#[test]
+fn paper_money_is_neither_made_nor_lost() {
+    for seed in 0..30u64 {
+        let accounts: Vec<Account> = (1..=4).map(|id| paper(id, 20_000, 200)).collect();
+        let mut exchange = exchange(&accounts);
+        let mut mail = Mail::default();
+        for (session, id) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            logged_in(&mut exchange, session, id, &mut mail);
+        }
+        let mut rng = orderbook::workload::SplitMix64::new(seed);
+        // What each account owns, from the fills it is told of.
+        let mut owned = [(20_000i64, 200i64); 4];
+        for step in 0..600u64 {
+            let session = rng.below(4) as usize;
+            let side = if rng.below(2) == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let message = if rng.below(4) == 0 {
+                Inbound::Cancel {
+                    order_id: 1 + rng.below(step + 1),
+                }
+            } else {
+                Inbound::NewOrder(NewOrder {
+                    client_ref: step,
+                    side,
+                    qty: 1 + rng.below(40),
+                    kind: OrderKind::Limit {
+                        price: 90 + rng.below(21) as i64,
+                        tif: [TimeInForce::Gtc, TimeInForce::Ioc][rng.below(2) as usize],
+                        display: (rng.below(5) == 0).then_some(2),
+                    },
+                })
+            };
+            exchange.receive(session, message, step, &mut mail);
+            if rng.below(3) > 0 {
+                continue;
+            }
+            exchange.flush(&mut mail).unwrap();
+            for (session, message) in std::mem::take(&mut mail.sent) {
+                if let Outbound::Report(Report {
+                    kind:
+                        ReportKind::Fill {
+                            side, price, qty, ..
+                        },
+                    ..
+                }) = message
+                {
+                    let (cash, lots) = &mut owned[session];
+                    let (amount, qty) = (price * qty as i64, qty as i64);
+                    match side {
+                        Side::Buy => (*cash, *lots) = (*cash - amount, *lots + qty),
+                        Side::Sell => (*cash, *lots) = (*cash + amount, *lots - qty),
+                    }
+                }
+            }
+            let wallets: Vec<_> = (1..=4).map(|id| exchange.wallet(id).unwrap()).collect();
+            for (wallet, owned) in wallets.iter().zip(owned) {
+                assert_eq!((wallet.cash, wallet.position), owned, "seed {seed}");
+            }
+            assert_eq!(
+                wallets.iter().map(|w| w.cash).sum::<i64>(),
+                80_000,
+                "seed {seed}"
+            );
+            assert_eq!(
+                wallets.iter().map(|w| w.position).sum::<i64>(),
+                800,
+                "seed {seed}"
+            );
+            for (index, wallet) in wallets.iter().enumerate() {
+                let owner = index as u32 + 1;
+                assert!(wallet.cash >= wallet.cash_held, "seed {seed}: {wallet:?}");
+                assert!(
+                    wallet.position >= wallet.position_held,
+                    "seed {seed}: {wallet:?}"
+                );
+                let (mut cash, mut lots) = (0, 0);
+                for side in [Side::Buy, Side::Sell] {
+                    for level in exchange.book().depth(side) {
+                        for order in exchange.book().queue(side, level.price) {
+                            if order.owner == owner {
+                                match side {
+                                    Side::Buy => cash += order.leaves as i64 * level.price,
+                                    Side::Sell => lots += order.leaves as i64,
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    (wallet.cash_held, wallet.position_held),
+                    (cash, lots),
+                    "seed {seed}"
+                );
+            }
+        }
     }
 }

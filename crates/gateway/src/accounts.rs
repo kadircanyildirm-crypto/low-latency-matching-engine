@@ -14,6 +14,18 @@ pub struct Account {
     /// Order-entry messages (new orders, cancels, modifies, mass cancels) a session may send
     /// per second, with bursts of up to the same number.
     pub messages_per_second: u32,
+    /// What a paper-trading account starts with; `None` for an account whose orders are
+    /// not checked against money or position, such as a market maker's.
+    pub funds: Option<Funds>,
+}
+
+/// What a paper-trading account starts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Funds {
+    /// Cash, in price ticks times lots.
+    pub cash: i64,
+    /// Lots.
+    pub position: i64,
 }
 
 /// Why an accounts file cannot be read.
@@ -33,9 +45,10 @@ impl fmt::Display for AccountsError {
 
 impl std::error::Error for AccountsError {}
 
-/// Reads accounts, one per line: id, token, open-order limit and message rate, separated by
-/// whitespace. Blank lines and lines starting with `#` are skipped. Ids must be unique and
-/// below `max_owners`, the book's limit.
+/// Reads accounts, one per line: id, token, open-order limit and message rate, then, for a
+/// paper-trading account, the cash and position it starts with, separated by whitespace.
+/// Blank lines and lines starting with `#` are skipped. Ids must be unique and below
+/// `max_owners`, the book's limit.
 pub fn parse(text: &str, max_owners: u32) -> Result<Vec<Account>, AccountsError> {
     let mut accounts: Vec<Account> = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -49,15 +62,33 @@ pub fn parse(text: &str, max_owners: u32) -> Result<Vec<Account>, AccountsError>
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let [id, token, max_open_orders, messages_per_second] = fields[..] else {
-            return Err(fail(
-                "expected: id token max-open-orders messages-per-second",
-            ));
+        let (id, token, max_open_orders, messages_per_second, funds) = match fields[..] {
+            [id, token, open, rate] => (id, token, open, rate, None),
+            [id, token, open, rate, cash, position] => {
+                (id, token, open, rate, Some((cash, position)))
+            }
+            _ => {
+                return Err(fail(
+                    "expected: id token max-open-orders messages-per-second [cash position]",
+                ));
+            }
         };
         let number = |field: &str, name: &str| {
             field
                 .parse::<u64>()
                 .map_err(|_| fail(&format!("{name} is not a number")))
+        };
+        let signed = |field: &str, name: &str| {
+            field
+                .parse::<i64>()
+                .map_err(|_| fail(&format!("{name} is not a number")))
+        };
+        let funds = match funds {
+            None => None,
+            Some((cash, position)) => Some(Funds {
+                cash: signed(cash, "cash")?,
+                position: signed(position, "position")?,
+            }),
         };
         let account = Account {
             id: u32::try_from(number(id, "id")?).map_err(|_| fail("id is too large"))?,
@@ -66,6 +97,7 @@ pub fn parse(text: &str, max_owners: u32) -> Result<Vec<Account>, AccountsError>
                 .map_err(|_| fail("max-open-orders is too large"))?,
             messages_per_second: u32::try_from(number(messages_per_second, "messages-per-second")?)
                 .map_err(|_| fail("messages-per-second is too large"))?,
+            funds,
         };
         if account.id >= max_owners {
             return Err(fail(&format!(
@@ -80,13 +112,25 @@ pub fn parse(text: &str, max_owners: u32) -> Result<Vec<Account>, AccountsError>
     Ok(accounts)
 }
 
+/// The line [`parse`] reads back as `account`.
+pub fn format(account: &Account) -> String {
+    let mut line = format!(
+        "{} {} {} {}",
+        account.id, account.token, account.max_open_orders, account.messages_per_second
+    );
+    if let Some(funds) = account.funds {
+        line.push_str(&format!(" {} {}", funds.cash, funds.position));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn accounts_are_read_and_checked() {
-        let text = "# id token open rate\n\n1 42 100 1000\n  2 7 5 10  \n";
+        let text = "# id token open rate [cash position]\n\n1 42 100 1000\n  2 7 5 10 500 -3 \n";
         let accounts = parse(text, 8).unwrap();
         assert_eq!(
             accounts,
@@ -95,24 +139,35 @@ mod tests {
                     id: 1,
                     token: 42,
                     max_open_orders: 100,
-                    messages_per_second: 1_000
+                    messages_per_second: 1_000,
+                    funds: None,
                 },
                 Account {
                     id: 2,
                     token: 7,
                     max_open_orders: 5,
-                    messages_per_second: 10
+                    messages_per_second: 10,
+                    funds: Some(Funds {
+                        cash: 500,
+                        position: -3
+                    }),
                 }
             ]
         );
+        for account in &accounts {
+            assert_eq!(parse(&format(account), 8).unwrap(), [*account]);
+        }
         for (text, line) in [
             ("1 2 3", 1),
+            ("1 2 3 4 5", 1),
             ("x 2 3 4", 1),
             ("1 2 3 4\n1 5 6 7", 2),
             ("9 2 3 4", 1),
             ("1 2 99999999999 4", 1),
             ("4294967296 1 1 1", 1),
             ("1 2 3 99999999999", 1),
+            ("1 2 3 4 x 0", 1),
+            ("1 2 3 4 0 x", 1),
         ] {
             let error = parse(text, 8).unwrap_err();
             assert_eq!(error.line, line, "{text}");

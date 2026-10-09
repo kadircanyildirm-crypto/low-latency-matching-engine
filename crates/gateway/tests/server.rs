@@ -43,6 +43,7 @@ fn account(id: u32) -> Account {
         token: 100 + u64::from(id),
         max_open_orders: 1_000,
         messages_per_second: 100_000,
+        funds: None,
     }
 }
 

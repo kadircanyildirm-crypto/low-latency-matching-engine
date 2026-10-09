@@ -3,10 +3,15 @@
 //! Usage: `gateway --dir <dir> --accounts <file> [--listen 127.0.0.1:9000] [--sync always|os]
 //! [--min-price 1] [--max-price 100000] [--max-orders 1000000] [--max-owners 1024]
 //! [--snapshot-every 1000000] [--max-sessions 1024] [--engine thread|pipeline]
-//! [--wait spin|backoff] [--cores network,writer,matcher]`
+//! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
+//! [--guests <file>] [--guest-ids 100..1024]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
+//!
+//! `--web` also serves browsers on `<addr>`: the exchange's page, and sessions over
+//! WebSocket. Visitors may create accounts with ids from `--guest-ids`, which are saved to
+//! the `--guests` file (`<dir>/guests.txt` by default) and loaded from it on the next start.
 //!
 //! The accounts file holds one account per line: id, token, open-order limit and message
 //! rate. The book's settings are part of the journal: a directory opens only with the ones
@@ -15,18 +20,23 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use engine::{Discard, Engine, EngineConfig, SyncPolicy};
-use gateway::{Core, Exchange, Pipeline, PipelineConfig, Server, ServerConfig, Timing, accounts};
+use gateway::web::Guests;
+use gateway::{
+    Account, Core, Exchange, Pipeline, PipelineConfig, Server, ServerConfig, Timing, accounts,
+};
 use orderbook::BookConfig;
 use ring::Wait;
 
 const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <addr>] \
 [--sync always|os] [--min-price <n>] [--max-price <n>] [--max-orders <n>] \
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
-[--wait spin|backoff] [--cores <network>,<writer>,<matcher>]";
+[--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
+[--guests <file>] [--guest-ids <from>..<to>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -94,14 +104,43 @@ fn run() -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?,
     };
+    let web: Option<SocketAddr> = match take("web") {
+        None => None,
+        Some(addr) => Some(
+            addr.parse()
+                .map_err(|_| format!("--web: cannot read {addr}"))?,
+        ),
+    };
+    let guests_file = take("guests")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&dir).join("guests.txt"));
+    let guest_ids = take("guest-ids").unwrap_or_else(|| format!("100..{}", book.max_owners));
+    let guest_ids = match guest_ids.split_once("..") {
+        Some((from, to)) => match (from.parse::<u32>(), to.parse::<u32>()) {
+            (Ok(from), Ok(to)) if from < to && to <= book.max_owners => from..to,
+            _ => return Err(format!("--guest-ids: {guest_ids} is no range of owner ids")),
+        },
+        None => {
+            return Err(format!(
+                "--guest-ids: {guest_ids} is no range, such as 100..1024"
+            ));
+        }
+    };
     if let Some(name) = args.keys().next() {
         return Err(format!("unknown flag --{name}\n{USAGE}"));
     }
 
-    let text = std::fs::read_to_string(&accounts_file)
-        .map_err(|e| format!("reading {accounts_file}: {e}"))?;
-    let accounts =
-        accounts::parse(&text, book.max_owners).map_err(|e| format!("{accounts_file}: {e}"))?;
+    let mut accounts = read_accounts(Path::new(&accounts_file), book.max_owners)?;
+    if web.is_some() && guests_file.exists() {
+        accounts.extend(read_accounts(&guests_file, book.max_owners)?);
+    }
+    let guests = Guests {
+        file: Some(guests_file),
+        ids: guest_ids,
+        max_open_orders: 50,
+        messages_per_second: 20,
+    };
+    let web = web.map(|addr| (addr, guests));
     let config = EngineConfig {
         sync,
         snapshot_every: (snapshot_every > 0).then_some(snapshot_every),
@@ -139,10 +178,17 @@ fn run() -> Result<(), String> {
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::start(engine, config).map_err(|e| e.to_string())?;
-        serve(exchange, pipeline, listen, server, accounts.len())
+        serve(exchange, pipeline, listen, server, accounts.len(), web)
     } else {
-        serve(exchange, engine, listen, server, accounts.len())
+        serve(exchange, engine, listen, server, accounts.len(), web)
     }
+}
+
+/// The accounts in `path`, with ids below `max_owners`.
+fn read_accounts(path: &Path, max_owners: u32) -> Result<Vec<Account>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    accounts::parse(&text, max_owners).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Serves until the process is killed: nothing stops it otherwise.
@@ -152,6 +198,7 @@ fn serve<C: Core>(
     listen: SocketAddr,
     config: ServerConfig,
     accounts: usize,
+    web: Option<(SocketAddr, Guests)>,
 ) -> Result<(), String> {
     let mut server =
         Server::bind(exchange, core, listen, config).map_err(|e| format!("{listen}: {e}"))?;
@@ -159,6 +206,12 @@ fn serve<C: Core>(
         "gateway: {accounts} accounts, listening on {}",
         server.local_addr().map_err(|e| e.to_string())?
     );
+    if let Some((addr, guests)) = web {
+        server
+            .serve_web(addr, Some(guests))
+            .map_err(|e| format!("{addr}: {e}"))?;
+        eprintln!("gateway: the web page is on http://{addr}");
+    }
     let stop = AtomicBool::new(false);
     server.run(&stop).map_err(|e| e.to_string())
 }

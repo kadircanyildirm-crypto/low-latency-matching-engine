@@ -3,4 +3,13 @@
 # The Kani proof harnesses live in `proofs` modules under `#[cfg(kani)]`. Ordinary builds
 # never compile them, so a mutant there could never be caught by a test; cargo-mutants
 # skips `#[cfg(test)]` code by itself, but not `#[cfg(kani)]`.
-exclude_re = ["\\bproofs::"]
+#
+# Syncing on the real file system: a sync that does nothing is invisible until the power
+# fails, which no test on a running machine can do. The simulated disk models syncs, and
+# the crash tests catch every journal or snapshot path that skips one; only the two calls
+# that hand the sync to the OS are left out.
+exclude_re = [
+    "\\bproofs::",
+    "<impl StorageFile for FsFile>::sync ",
+    "<impl Storage for FsStorage>::sync_dir ",
+]

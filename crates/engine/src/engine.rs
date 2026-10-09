@@ -236,9 +236,7 @@ impl<S: Storage> Engine<S> {
         for &old in &seqs[..keep_from] {
             snapshots::remove(storage, &self.dir, old)?;
         }
-        if keep_from > 0 {
-            storage.sync_dir(&self.dir)?;
-        }
+        storage.sync_dir(&self.dir)?;
         // Until there are as many snapshots as are kept, the whole journal stays, so a
         // damaged newest snapshot can always fall back to an older one or to the start.
         if seqs.len() - keep_from == self.config.keep_snapshots {

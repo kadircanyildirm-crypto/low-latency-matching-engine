@@ -220,11 +220,6 @@ pub fn decode_command(bytes: &[u8; COMMAND_SIZE]) -> Result<Command, DecodeError
 //   stops       count u32, then each: id u64, owner u32, side u8, trigger i64,
 //               limit Option<i64>, qty u64
 
-/// Encoded size of one resting order.
-const ORDER_SIZE: usize = 8 + 4 + 1 + 8 + 8 + 8 + 1 + 9 + 8;
-/// Encoded size of one pending stop.
-const STOP_SIZE: usize = 8 + 4 + 1 + 8 + 9 + 8;
-
 /// Appends the encoding of `snapshot` to `out`.
 ///
 /// # Panics
@@ -299,11 +294,10 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<BookSnapshot, DecodeError> {
     let trade_count = r.u64()?;
     let reference_price = r.option_i64()?;
     let phase = phase_of(r.u8()?)?;
-    // Counts are checked against the bytes left before anything is allocated, so a damaged
-    // count cannot ask for gigabytes.
-    let count = r.count(ORDER_SIZE)?;
-    let mut orders = Vec::with_capacity(count);
-    for _ in 0..count {
+    // The vectors grow as entries decode, so a damaged count cannot allocate more than the
+    // input holds: decoding runs out of bytes first.
+    let mut orders = Vec::new();
+    for _ in 0..r.u32()? {
         orders.push(SnapshotOrder {
             id: r.u64()?,
             owner: r.u32()?,
@@ -316,9 +310,8 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<BookSnapshot, DecodeError> {
             visible: r.u64()?,
         });
     }
-    let count = r.count(STOP_SIZE)?;
-    let mut stops = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut stops = Vec::new();
+    for _ in 0..r.u32()? {
         stops.push(StopOrder {
             id: r.u64()?,
             owner: r.u32()?,
@@ -477,13 +470,5 @@ impl Reader<'_> {
         let present = self.bool("option flag")?;
         let value = self.i64()?;
         Ok(present.then_some(value))
-    }
-    /// A count of entries of `size` bytes each, if that many bytes are left.
-    fn count(&mut self, size: usize) -> Result<usize, DecodeError> {
-        let count = self.u32()? as usize;
-        if count > self.0.len() / size {
-            return Err(DecodeError::Truncated);
-        }
-        Ok(count)
     }
 }

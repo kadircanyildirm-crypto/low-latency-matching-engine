@@ -64,9 +64,7 @@ pub(crate) fn remove_partial<S: Storage>(storage: &mut S, dir: &Path) -> Result<
     for name in &partial {
         storage.remove(&dir.join(name))?;
     }
-    if !partial.is_empty() {
-        storage.sync_dir(dir)?;
-    }
+    storage.sync_dir(dir)?;
     Ok(())
 }
 

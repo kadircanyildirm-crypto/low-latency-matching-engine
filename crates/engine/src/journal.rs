@@ -206,6 +206,9 @@ const BATCH_RECORDS: usize = 256;
 /// Records read per read call during recovery.
 const READ_RECORDS: usize = 16_384;
 
+/// Bytes of zeros written per write call when a segment is created.
+const ZERO_FILL: usize = 1 << 20;
+
 impl<S: Storage> Journal<S> {
     /// Opens the journal in `dir`, creating it if there is none, and replays every command
     /// after `after` through `apply`, in order. Recovery cuts a torn tail as described in
@@ -426,14 +429,12 @@ impl<S: Storage> Journal<S> {
                 slot += filled as u32;
             }
         }
-        if !stale.is_empty() {
-            let zero = [0; RECORD_SIZE];
-            for &slot in &stale {
-                self.file.write_at(segment.offset(slot), &zero)?;
-            }
-            self.file.sync()?;
-            report.cleared_records += stale.len() as u64;
+        // Replay syncs the file right after the cut.
+        for &slot in &stale {
+            self.file
+                .write_at(segment.offset(slot), &[0; RECORD_SIZE])?;
         }
+        report.cleared_records += stale.len() as u64;
         if !later.is_empty() {
             for header in &later {
                 self.storage
@@ -445,15 +446,25 @@ impl<S: Storage> Journal<S> {
         Ok(())
     }
 
-    /// Creates the file for the segment starting at `first_seq`, which `self.file` already
-    /// is, and makes its header and size durable before any record is written into it.
+    /// Fills the file for the segment starting at `first_seq`, which `self.file` already
+    /// is, with zeros to its full size, and makes that and its header durable before any
+    /// record is written into it. Writing the zeros, rather than only setting the length,
+    /// makes the file system allocate every block now: appends then overwrite allocated
+    /// blocks in place, and a data sync has no block allocation to record.
     fn initialise_segment(&mut self, first_seq: Seq) -> Result<(), Error> {
         let header = Header {
             first_seq,
             fingerprint: self.fingerprint,
             capacity: self.capacity,
         };
-        self.file.set_len(header.file_len())?;
+        let zeros = vec![0; ZERO_FILL];
+        let len = header.file_len();
+        let mut offset = HEADER_SIZE;
+        while offset < len {
+            let n = (len - offset).min(ZERO_FILL as u64) as usize;
+            self.file.write_at(offset, &zeros[..n])?;
+            offset += n as u64;
+        }
         self.file.write_at(0, &header.encode())?;
         self.file.sync()?;
         self.storage.sync_dir(&self.dir)?;
@@ -508,7 +519,7 @@ impl<S: Storage> Journal<S> {
 
     /// Makes every appended record durable.
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        if self.durable < self.last_seq {
+        if self.durable != self.last_seq {
             self.file.sync()?;
             self.durable = self.last_seq;
         }
@@ -555,11 +566,12 @@ fn holds_records<F: StorageFile>(file: &mut F) -> Result<bool, Error> {
     let len = file.size()?;
     let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
     let mut offset = HEADER_SIZE;
-    while offset < len {
-        let n = ((len - offset) as usize).min(chunk.len()) / RECORD_SIZE * RECORD_SIZE;
-        if n == 0 {
-            break;
+    loop {
+        let records = (len.saturating_sub(offset) as usize).min(chunk.len()) / RECORD_SIZE;
+        if records == 0 {
+            return Ok(false);
         }
+        let n = records * RECORD_SIZE;
         file.read_at(offset, &mut chunk[..n])?;
         if chunk[..n]
             .chunks_exact(RECORD_SIZE)
@@ -569,7 +581,6 @@ fn holds_records<F: StorageFile>(file: &mut F) -> Result<bool, Error> {
         }
         offset += n as u64;
     }
-    Ok(false)
 }
 
 /// Whether `segment` has a slot for `seq`.
@@ -586,6 +597,7 @@ fn read_slots<F: StorageFile>(
     first: u32,
     chunk: &mut [u8],
 ) -> io::Result<usize> {
+    debug_assert!(first < segment.capacity, "reading past the segment");
     let count = (chunk.len() / RECORD_SIZE).min((segment.capacity - first) as usize);
     let bytes = &mut chunk[..count * RECORD_SIZE];
     let offset = segment.offset(first);
@@ -630,15 +642,35 @@ mod tests {
         assert_eq!(decode_record(&[0; RECORD_SIZE]), Slot::Empty);
     }
 
-    /// A record whose checksum holds but whose command is not a canonical encoding.
+    /// Records whose checksum holds but whose kind, length, padding or command is not what
+    /// the encoder writes.
     #[test]
-    fn records_need_a_canonical_command() {
-        let mut bytes = [0; RECORD_SIZE];
-        encode_record(1, 0, &Command::CancelAll { owner: 1 }, &mut bytes);
-        bytes[24 + 8] = 1; // the id field, unused by a mass cancel
-        let crc = crc32fast::hash(&bytes[4..]);
-        bytes[..4].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(decode_record(&bytes), Slot::Invalid);
+    fn records_need_every_field_valid() {
+        let mut valid = [0; RECORD_SIZE];
+        encode_record(1, 0, &Command::CancelAll { owner: 1 }, &mut valid);
+        // Kind, payload length, padding, and the id field a mass cancel leaves unused.
+        for (at, value) in [(4, 2), (5, 39), (6, 1), (7, 1), (24 + 8, 1)] {
+            let mut bytes = valid;
+            bytes[at] = value;
+            let crc = crc32fast::hash(&bytes[4..]);
+            bytes[..4].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(decode_record(&bytes), Slot::Invalid, "byte {at}");
+        }
+    }
+
+    /// A header whose checksum holds but whose reserved bytes are not zero.
+    #[test]
+    fn headers_need_zero_reserved_bytes() {
+        let header = Header {
+            first_seq: 1,
+            fingerprint: 2,
+            capacity: 3,
+        };
+        let mut bytes = header.encode();
+        bytes[40] = 1;
+        let crc = crc32fast::hash(&bytes[..60]);
+        bytes[60..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Header::decode(&bytes), None);
     }
 
     #[test]

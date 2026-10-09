@@ -12,7 +12,9 @@
 //! orders never rest, a fill-or-kill order fills completely exactly when the book could fill
 //! it, post-only orders never trade, icebergs trade only what they show and show their next
 //! tranche at the back of the queue, and exactly the stops a command's trades reach trigger,
-//! in the order the rules release them.
+//! in the order the rules release them. In a call phase orders rest without trading; leaving
+//! it uncrosses the book at one price that no candidate beats under the auction rules, in
+//! price-time priority on both sides.
 //!
 //! The checker works out, from the rules alone, the state each part of a command must leave:
 //! the command's own effect, then each stop it releases, one after the other. The engine's
@@ -22,15 +24,15 @@ mod common;
 
 use std::collections::{BTreeMap, VecDeque};
 
-use common::strategies::scenario;
+use common::strategies::{auction, scenario};
 use common::{Snapshot, snapshot};
 use orderbook::CancelReason::{
     FillOrKill, ImmediateOrCancel, MassCancel, NoLiquidity, PriceBand, PriceProtection, Requested,
-    SelfTrade,
+    SelfTrade, TradingPhase,
 };
 use orderbook::{
-    BookConfig, CancelReason, Command, Event, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder,
-    RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
+    BookConfig, CancelReason, Command, Event, OrderBook, OrderId, OwnerId, Phase, Price, Qty,
+    QueuedOrder, RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
 };
 use proptest::prelude::*;
 
@@ -39,21 +41,33 @@ proptest! {
 
     #[test]
     fn every_command_meets_the_specification((cfg, commands) in scenario(300)) {
-        let mut book = OrderBook::new(cfg);
-        let mut events = Vec::new();
-        for (step, &command) in commands.iter().enumerate() {
-            let before = State::capture(&book);
-            events.clear();
-            book.process(command, &mut events);
-            if let Err(violation) = check(&cfg, &before, command, &events, &book) {
-                prop_assert!(
-                    false,
-                    "step {}: {:?}\n  events: {:?}\n  violation: {}",
-                    step, command, events, violation
-                );
-            }
+        if let Err(violation) = check_all(&cfg, &commands) {
+            prop_assert!(false, "{}", violation);
         }
     }
+
+    /// Small calls whose sums tie often, so that every auction rule gets to decide.
+    #[test]
+    fn every_uncross_meets_the_auction_rules((cfg, commands) in auction()) {
+        if let Err(violation) = check_all(&cfg, &commands) {
+            prop_assert!(false, "{}", violation);
+        }
+    }
+}
+
+/// Runs `commands` on a new book, checking each against the specification.
+fn check_all(cfg: &BookConfig, commands: &[Command]) -> Check {
+    let mut book = OrderBook::new(*cfg);
+    let mut events = Vec::new();
+    for (step, &command) in commands.iter().enumerate() {
+        let before = State::capture(&book);
+        events.clear();
+        book.process(command, &mut events);
+        check(cfg, &before, command, &events, &book).map_err(|violation| {
+            format!("step {step}: {command:?}\n  events: {events:?}\n  violation: {violation}")
+        })?;
+    }
+    Ok(())
 }
 
 type Check = Result<(), String>;
@@ -77,6 +91,7 @@ struct State {
     stops: [Vec<StopOrder>; 2],
     trade_count: u64,
     reference: Option<Price>,
+    phase: Phase,
 }
 
 impl State {
@@ -89,6 +104,7 @@ impl State {
             ],
             trade_count: book.trade_count(),
             reference: book.reference_price(),
+            phase: book.phase(),
         }
     }
 
@@ -160,6 +176,19 @@ impl State {
         State {
             snapshot: from_books(books),
             stops,
+            ..self.clone()
+        }
+    }
+
+    /// The state with `order` resting at the back of the queue at `price` on `side`.
+    fn with_order(&self, side: Side, price: Price, order: QueuedOrder) -> State {
+        let mut books = to_books(&self.snapshot);
+        books[Self::side_index(side)]
+            .entry(price)
+            .or_default()
+            .push(order);
+        State {
+            snapshot: from_books(books),
             ..self.clone()
         }
     }
@@ -385,6 +414,20 @@ fn command_effect(cfg: &BookConfig, before: &State, command: Command, events: &[
             display,
         } => {
             ensure(first == Event::Accepted { id }, "must start with Accepted")?;
+            let post_only = tif == TimeInForce::PostOnly;
+            if before.phase == Phase::Auction {
+                let order = QueuedOrder {
+                    id,
+                    owner,
+                    leaves: qty,
+                    filled: 0,
+                    post_only,
+                    display,
+                    visible: display.map_or(qty, |display| display.min(qty)),
+                };
+                let (state, n) = rest_in_call(before, side, price, order, &events[1..])?;
+                return Ok((state, n + 1));
+            }
             let taker = Taker {
                 id,
                 owner,
@@ -393,7 +436,7 @@ fn command_effect(cfg: &BookConfig, before: &State, command: Command, events: &[
                 cap: None,
                 stop: None,
                 tif: Some(tif),
-                post_only: tif == TimeInForce::PostOnly,
+                post_only,
                 display,
                 qty,
                 filled_before: 0,
@@ -484,6 +527,16 @@ fn command_effect(cfg: &BookConfig, before: &State, command: Command, events: &[
             }
             // Lost priority: the same as a new GTC order for `leaves` arriving at a book
             // without the old order, keeping its post-only restriction and display.
+            if before.phase == Phase::Auction {
+                let order = QueuedOrder {
+                    leaves,
+                    visible: order.display.map_or(leaves, |display| display.min(leaves)),
+                    ..order
+                };
+                let (state, n) =
+                    rest_in_call(&before.without(id), side, price, order, &events[1..])?;
+                return Ok((state, n + 1));
+            }
             let taker = Taker {
                 id,
                 owner,
@@ -538,7 +591,249 @@ fn command_effect(cfg: &BookConfig, before: &State, command: Command, events: &[
                 .fold(before.clone(), |state, &(id, _)| state.without(id));
             Ok((state, expected.len()))
         }
+        Command::SetPhase { phase } => {
+            let (mut state, used) = if before.phase == Phase::Auction && phase != Phase::Auction {
+                check_uncross(before, events)?
+            } else {
+                (before.clone(), 0)
+            };
+            ensure(
+                events.get(used) == Some(&Event::PhaseChanged { phase }),
+                "a phase change is reported, after the uncross if it left a call phase",
+            )?;
+            state.phase = phase;
+            Ok((state, used + 1))
+        }
     }
+}
+
+/// An order entered in a call phase: it rests at the back of its level without trading.
+fn rest_in_call(
+    before: &State,
+    side: Side,
+    price: Price,
+    order: QueuedOrder,
+    events: &[Event],
+) -> Effect {
+    let rested = Event::Rested {
+        id: order.id,
+        side,
+        price,
+        qty: order.leaves,
+        visible: order.visible,
+    };
+    ensure(
+        events.first() == Some(&rested),
+        "in a call phase an order rests whole, without trading",
+    )?;
+    Ok((before.with_order(side, price, order), 1))
+}
+
+/// Checks the trades that end a call phase, and works out the state they leave.
+///
+/// The candidate prices are those of the orders on the book and the reference price; at
+/// each, the executable quantity is the smaller of the bids at or above it and the asks at
+/// or below it, hidden quantity included. The auction price must execute the most, then
+/// leave the least surplus; if the surplus lies on one side at every price still tied, it
+/// must be the highest (buy side) or the lowest (sell side); otherwise the closest to the
+/// reference price, and the lowest of those equally close. The trades must pair the bids
+/// and the asks in priority order, as much as both show, until one side has nothing left
+/// at or through that price.
+fn check_uncross(before: &State, events: &[Event]) -> Effect {
+    let side_total = |side: Side, reaches: &dyn Fn(Price) -> bool| -> u128 {
+        before
+            .priority(side)
+            .iter()
+            .filter(|(price, _)| reaches(*price))
+            .map(|(_, order)| u128::from(order.leaves))
+            .sum()
+    };
+    let demand = |p: Price| side_total(Side::Buy, &|price| price >= p);
+    let supply = |p: Price| side_total(Side::Sell, &|price| price <= p);
+    let volume = |p: Price| demand(p).min(supply(p));
+    let surplus = |p: Price| demand(p).abs_diff(supply(p));
+    let mut candidates: Vec<Price> = before
+        .snapshot
+        .iter()
+        .flatten()
+        .map(|(price, _)| *price)
+        .chain(before.reference)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let most = candidates.iter().map(|&p| volume(p)).max().unwrap_or(0);
+
+    // Replay the trades against copies of both sides.
+    let copy = |side: Side| -> Levels {
+        before.snapshot[State::side_index(side)]
+            .iter()
+            .map(|(price, queue)| (*price, queue.iter().copied().collect()))
+            .collect()
+    };
+    let mut sides = [copy(Side::Buy), copy(Side::Sell)];
+    let mut next_trade_id = before.trade_count + 1;
+    let (mut auction_price, mut executed) = (None, 0u128);
+    let mut i = 0;
+    while let Some(&Event::Trade {
+        trade_id,
+        taker,
+        maker,
+        taker_side,
+        price,
+        qty,
+        taker_leaves,
+        maker_leaves,
+    }) = events.get(i)
+    {
+        i += 1;
+        ensure(
+            *auction_price.get_or_insert(price) == price,
+            "an uncross trades at one price",
+        )?;
+        ensure(trade_id == next_trade_id, "trade ids must be consecutive")?;
+        next_trade_id += 1;
+        ensure(
+            taker_side == Side::Buy,
+            "an uncross reports the buy order as the taker",
+        )?;
+        for side in &mut sides {
+            side.retain(|(_, queue)| !queue.is_empty());
+        }
+        let [bids, asks] = &mut sides;
+        let (bid, buy) = bids.first_mut().ok_or("uncross trade without a bid left")?;
+        let (ask, sell) = asks
+            .first_mut()
+            .ok_or("uncross trade without an ask left")?;
+        ensure(
+            *bid >= price && *ask <= price,
+            "an uncross trades only orders at or through the auction price",
+        )?;
+        let (b, s) = (buy.front_mut().unwrap(), sell.front_mut().unwrap());
+        ensure(
+            (taker, maker) == (b.id, s.id),
+            format!(
+                "price-time priority: the uncross paired #{taker} and #{maker}, next in line were #{} and #{}",
+                b.id, s.id
+            ),
+        )?;
+        ensure(
+            qty > 0 && qty == b.visible.min(s.visible),
+            "an uncross trade is as large as both orders show",
+        )?;
+        executed += u128::from(qty);
+        for order in [&mut *b, &mut *s] {
+            order.leaves -= qty;
+            order.visible -= qty;
+            order.filled += qty;
+        }
+        ensure(
+            (taker_leaves, maker_leaves) == (b.leaves, s.leaves),
+            "leaves are wrong",
+        )?;
+        for (side, queue) in [(Side::Buy, buy), (Side::Sell, sell)] {
+            let front = *queue.front().unwrap();
+            if front.leaves == 0 {
+                queue.pop_front();
+            } else if front.visible == 0 {
+                let display = front
+                    .display
+                    .ok_or("a plain order showed less than it had")?;
+                let visible = display.min(front.leaves);
+                ensure(
+                    events.get(i)
+                        == Some(&Event::Replenished {
+                            id: front.id,
+                            side,
+                            price,
+                            visible,
+                        }),
+                    "an iceberg's used-up tranche must be replenished at once, the buy order's first",
+                )?;
+                i += 1;
+                let mut iceberg = queue.pop_front().unwrap();
+                iceberg.visible = visible;
+                queue.push_back(iceberg);
+            }
+        }
+    }
+
+    ensure(
+        executed == most,
+        format!("the uncross executed {executed} lots, but the most any price allows is {most}"),
+    )?;
+    if let Some(price) = auction_price {
+        ensure(
+            candidates.contains(&price),
+            "the auction price is no candidate",
+        )?;
+        // Volume is a step function that changes only at order prices, so these are all
+        // the values it takes: no price at all executes more.
+        let beats = candidates
+            .iter()
+            .flat_map(|&p| [p.saturating_sub(1), p, p.saturating_add(1)])
+            .find(|&p| volume(p) > most);
+        ensure(beats.is_none(), format!("{beats:?} would execute more"))?;
+        let tied: Vec<Price> = candidates
+            .iter()
+            .copied()
+            .filter(|&p| volume(p) == most)
+            .collect();
+        let least = tied.iter().map(|&p| surplus(p)).min().unwrap();
+        ensure(
+            surplus(price) == least,
+            "another price executing as much leaves less surplus",
+        )?;
+        let tied: Vec<Price> = tied.into_iter().filter(|&p| surplus(p) == least).collect();
+        if tied.iter().all(|&p| demand(p) > supply(p)) {
+            ensure(
+                tied.iter().all(|&p| p <= price),
+                "with a buy surplus everywhere, the highest price wins",
+            )?;
+        } else if tied.iter().all(|&p| supply(p) > demand(p)) {
+            ensure(
+                tied.iter().all(|&p| p >= price),
+                "with a sell surplus everywhere, the lowest price wins",
+            )?;
+        } else if let Some(reference) = before.reference {
+            let distance = price.abs_diff(reference);
+            ensure(
+                tied.iter().all(|&p| {
+                    let d = p.abs_diff(reference);
+                    d > distance || (d == distance && p >= price)
+                }),
+                "otherwise the price closest to the reference wins, and the lower of two",
+            )?;
+        } else {
+            ensure(
+                tied.iter().all(|&p| p >= price),
+                "without a reference, the lowest price wins",
+            )?;
+        }
+    }
+
+    let [bids, asks] = sides;
+    let side_book = |levels: Levels| -> BTreeMap<Price, Vec<QueuedOrder>> {
+        levels
+            .into_iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(price, queue)| (price, queue.into_iter().collect()))
+            .collect()
+    };
+    let state = State {
+        snapshot: from_books([side_book(bids), side_book(asks)]),
+        trade_count: next_trade_id - 1,
+        reference: auction_price.or(before.reference),
+        ..before.clone()
+    };
+    ensure(
+        !crosses(
+            &state,
+            Side::Buy,
+            state.best(Side::Buy).unwrap_or(Price::MIN),
+        ),
+        "the uncross left the book crossed",
+    )?;
+    Ok((state, i))
 }
 
 fn market_taker(
@@ -566,7 +861,9 @@ fn market_taker(
 }
 
 /// A released stop: it becomes a market order, or a GTC limit order that must first pass
-/// the price controls as they stand now, and is cancelled if it does not.
+/// the price controls as they stand now, and is cancelled if it does not. Outside continuous
+/// trading, a stop-limit rests in a call phase without trading, and anything else is
+/// cancelled.
 fn release(cfg: &BookConfig, state: &State, stop: StopOrder, events: &[Event]) -> Effect {
     let StopOrder {
         id,
@@ -575,6 +872,33 @@ fn release(cfg: &BookConfig, state: &State, stop: StopOrder, events: &[Event]) -
         qty,
         ..
     } = stop;
+    match (state.phase, stop.limit) {
+        (Phase::Continuous, _) => {}
+        (Phase::Auction, Some(limit)) => {
+            let order = QueuedOrder {
+                id,
+                owner,
+                leaves: qty,
+                filled: 0,
+                post_only: false,
+                display: None,
+                visible: qty,
+            };
+            return rest_in_call(state, side, limit, order, events);
+        }
+        _ => {
+            ensure(
+                events.first()
+                    == Some(&Event::Cancelled {
+                        id,
+                        qty,
+                        reason: TradingPhase,
+                    }),
+                "a stop triggered where its order cannot work must be cancelled",
+            )?;
+            return Ok((state.clone(), 1));
+        }
+    }
     let Some(limit) = stop.limit else {
         return check_execution(
             cfg,
@@ -875,6 +1199,7 @@ fn check_execution(cfg: &BookConfig, before: &State, taker: Taker, events: &[Eve
         .and_then(|(_, queue)| queue.front().copied());
     let exhausted = current == levels.len();
     let mut rested = None;
+    let mut phase = before.phase;
     match events.get(i) {
         Some(&Event::Rested {
             id,
@@ -940,6 +1265,18 @@ fn check_execution(cfg: &BookConfig, before: &State, taker: Taker, events: &[Eve
                         !exhausted && next_reachable.is_none(),
                         "a market order stopped although the next order is within its cap",
                     )?;
+                    // There was liquidity beyond the band: a volatility interruption.
+                    if reason == PriceBand && cfg.auction_on_band {
+                        ensure(
+                            events.get(i)
+                                == Some(&Event::PhaseChanged {
+                                    phase: Phase::Auction,
+                                }),
+                            "a market order the band stops must start a call",
+                        )?;
+                        i += 1;
+                        phase = Phase::Auction;
+                    }
                 }
                 ImmediateOrCancel => {
                     ensure(
@@ -954,7 +1291,9 @@ fn check_execution(cfg: &BookConfig, before: &State, taker: Taker, events: &[Eve
                 FillOrKill => {
                     return Err("a fill-or-kill order that could fill was killed".into());
                 }
-                Requested | MassCancel => return Err("a Cancel reason on a new order".into()),
+                Requested | MassCancel | TradingPhase => {
+                    return Err("a Cancel reason on a new order".into());
+                }
             }
         }
         _ => ensure(left == 0, "unfilled quantity vanished")?,
@@ -987,21 +1326,33 @@ fn check_execution(cfg: &BookConfig, before: &State, taker: Taker, events: &[Eve
         stops: before.stops.clone(),
         trade_count: next_trade_id - 1,
         reference: last_price.or(before.reference),
+        phase,
     };
     Ok((state, i))
 }
 
 /// The rejection the rules require for `command` against the book before it, or `None` if
 /// the command must be accepted. When several rules apply, the first one listed for the
-/// command wins: stateless checks (owner, quantity, price band) before stateful ones (ids,
-/// ownership, protection, capacity). An owner outside the table owns nothing, so its
-/// cancels and modifies fail as `UnknownOrder` and its mass cancels find nothing.
+/// command wins: stateless checks (owner, quantity, price band) before stateful ones (the
+/// phase, ids, ownership, protection, capacity). An owner outside the table owns nothing,
+/// so its cancels and modifies fail as `UnknownOrder` and its mass cancels find nothing.
+/// Cancels, mass cancels and phase changes are accepted in every phase.
 ///
 /// Checking acceptance as well as rejection matters: a command that should have been
 /// refused but was not can leave a book that looks perfectly healthy, such as a limit order
 /// priced through the protection band that simply trades.
 fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Option<RejectReason> {
     use RejectReason::*;
+    // A halt and the close refuse new orders and modifies; a call phase refuses orders
+    // that would have to trade at once. Nothing trades on arrival in a call phase, so price
+    // protection and the band do not apply there, and nothing frees a slot.
+    let refused_by_phase = |trades_at_once: bool| match before.phase {
+        Phase::Continuous => None,
+        Phase::Auction => trades_at_once.then_some(AuctionCall),
+        Phase::Halted => Some(TradingHalted),
+        Phase::Closed => Some(MarketClosed),
+    };
+    let continuous = before.phase == Phase::Continuous;
     let owner_invalid = |owner: OwnerId| owner >= cfg.max_owners;
     let covers = |display: Qty, qty: Qty| {
         u128::from(display) * u128::from(cfg.max_iceberg_tranches) >= u128::from(qty)
@@ -1033,15 +1384,17 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidDisplay)
             } else if out_of_band(price) {
                 Some(PriceOutOfRange)
+            } else if let Some(reason) = refused_by_phase(!may_rest) {
+                Some(reason)
             } else if taken(id) {
                 Some(DuplicateOrderId)
-            } else if beyond_protection(cfg, before, side, price) {
+            } else if continuous && beyond_protection(cfg, before, side, price) {
                 Some(PriceOutsideProtection)
-            } else if beyond_band(cfg, before, side, price) {
+            } else if continuous && beyond_band(cfg, before, side, price) {
                 Some(PriceOutsideBand)
             } else if tif == TimeInForce::PostOnly && crosses(before, side, price) {
                 Some(PostOnlyWouldCross)
-            } else if may_rest && full && !crosses(before, side, price) {
+            } else if may_rest && full && !(continuous && crosses(before, side, price)) {
                 // A crossing order frees a slot by its first match, and orders that never
                 // rest need none, so neither is refused.
                 Some(BookFull)
@@ -1054,6 +1407,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidOwner)
             } else if qty_invalid(qty) {
                 Some(InvalidQuantity)
+            } else if let Some(reason) = refused_by_phase(true) {
+                Some(reason)
             } else if taken(id) {
                 Some(DuplicateOrderId)
             } else {
@@ -1074,6 +1429,8 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 Some(InvalidQuantity)
             } else if out_of_band(trigger) || limit.is_some_and(out_of_band) {
                 Some(PriceOutOfRange)
+            } else if let Some(reason) = refused_by_phase(false) {
+                Some(reason)
             } else if taken(id) {
                 Some(DuplicateOrderId)
             } else if reached(before, side, trigger) {
@@ -1099,6 +1456,9 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             if out_of_band(price) {
                 return Some(PriceOutOfRange);
             }
+            if let Some(reason) = refused_by_phase(false) {
+                return Some(reason);
+            }
             if owned_stop(id, owner).is_some() {
                 return Some(PendingStop);
             }
@@ -1110,9 +1470,9 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
             let leaves = qty.saturating_sub(order.filled);
             let in_place = price == old_price && leaves <= order.leaves;
             let replaces = leaves > 0 && !in_place;
-            if replaces && beyond_protection(cfg, before, side, price) {
+            if replaces && continuous && beyond_protection(cfg, before, side, price) {
                 Some(PriceOutsideProtection)
-            } else if replaces && beyond_band(cfg, before, side, price) {
+            } else if replaces && continuous && beyond_band(cfg, before, side, price) {
                 Some(PriceOutsideBand)
             } else if replaces && order.post_only && crosses(before, side, price) {
                 Some(PostOnlyWouldCross)
@@ -1122,6 +1482,6 @@ fn required_rejection(cfg: &BookConfig, before: &State, command: Command) -> Opt
                 None
             }
         }
-        Command::CancelAll { .. } => None,
+        Command::CancelAll { .. } | Command::SetPhase { .. } => None,
     }
 }

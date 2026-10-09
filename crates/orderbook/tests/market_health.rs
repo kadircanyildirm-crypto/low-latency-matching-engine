@@ -32,6 +32,7 @@ fn one_sided_time_under_each_price_control() {
             mass_cancel: 0,
             stop: 0,
             modify: 5,
+            session: 0,
         },
         ..WorkloadConfig::default()
     };

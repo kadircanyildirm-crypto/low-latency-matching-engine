@@ -10,7 +10,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
-    BookConfig, CancelReason, Command, Event, EventSink, OrderId, OwnerId, Price, Qty,
+    BookConfig, CancelReason, Command, Event, EventSink, OrderId, OwnerId, Phase, Price, Qty,
     RejectReason, SelfTradePolicy, Side, TimeInForce,
 };
 
@@ -56,6 +56,10 @@ pub struct Mix {
     pub stop: u8,
     /// Modifies of resting orders.
     pub modify: u8,
+    /// Phase changes, as the exchange's schedule would send them: mostly into and out of
+    /// call phases, sometimes a halt or the close. The participants do not adapt to the
+    /// phase, so orders a phase refuses are rejected.
+    pub session: u8,
 }
 
 /// Time in force of generated limit orders, in percent; the rest are GTC. All zero by
@@ -119,6 +123,7 @@ impl Default for WorkloadConfig {
                 mass_cancel: 0,
                 stop: 0,
                 modify: 5,
+                session: 0,
             },
             tif: TifMix::default(),
             iceberg: 0,
@@ -140,6 +145,7 @@ impl WorkloadConfig {
             price_protection: Some((self.passive_depth * 4) as u32),
             price_band: None,
             reference_price: None,
+            auction_on_band: false,
             self_trade: SelfTradePolicy::CancelResting,
         }
     }
@@ -173,6 +179,8 @@ pub struct Workload {
     pending: Option<Command>,
     /// Last trade price seen, which new stops must lie beyond.
     last_trade: Option<Price>,
+    /// The book's phase, as last reported, from which the schedule picks the next one.
+    phase: Phase,
 }
 
 impl Workload {
@@ -192,6 +200,7 @@ impl Workload {
             m.mass_cancel,
             m.stop,
             m.modify,
+            m.session,
         ]
         .iter()
         .map(|&p| u32::from(p))
@@ -219,6 +228,7 @@ impl Workload {
             position,
             pending: None,
             last_trade: None,
+            phase: Phase::Continuous,
             cfg,
         }
     }
@@ -226,6 +236,11 @@ impl Workload {
     /// Number of orders the participants believe are resting.
     pub fn live_orders(&self) -> usize {
         self.live.len()
+    }
+
+    /// The book's phase, as the engine last reported it.
+    pub fn phase(&self) -> Phase {
+        self.phase
     }
 
     /// The next command to send.
@@ -261,7 +276,30 @@ impl Workload {
         if roll < m.stop {
             return self.new_stop();
         }
+        roll -= m.stop;
+        if roll < m.session {
+            return Command::SetPhase {
+                phase: self.next_phase(),
+            };
+        }
         self.modify()
+    }
+
+    /// The schedule: continuous trading mostly gives way to a call, sometimes to a halt or
+    /// the close; a call mostly ends in continuous trading; halts and the close mostly end in
+    /// a call.
+    fn next_phase(&mut self) -> Phase {
+        let roll = self.rng.below(10);
+        match self.phase {
+            Phase::Continuous if roll < 6 => Phase::Auction,
+            Phase::Continuous if roll < 9 => Phase::Halted,
+            Phase::Continuous => Phase::Closed,
+            Phase::Auction if roll < 7 => Phase::Continuous,
+            Phase::Auction if roll < 9 => Phase::Halted,
+            Phase::Auction => Phase::Closed,
+            Phase::Halted | Phase::Closed if roll < 6 => Phase::Auction,
+            Phase::Halted | Phase::Closed => Phase::Continuous,
+        }
     }
 
     /// Updates the participants' view of their resting orders from one engine event.
@@ -285,18 +323,20 @@ impl Workload {
                 });
             }
             Event::Trade {
+                taker,
                 maker,
+                taker_leaves,
                 maker_leaves,
                 price,
                 ..
             } => {
                 self.last_trade = Some(price);
-                if maker_leaves == 0 {
-                    self.forget(maker);
-                } else if let Some(&i) = self.position.get(&maker) {
-                    self.live[i as usize].leaves = maker_leaves;
-                }
+                // The taker is a resting order too when the trade is an uncross's;
+                // otherwise it is not tracked yet, and this changes nothing.
+                self.traded(taker, taker_leaves);
+                self.traded(maker, maker_leaves);
             }
+            Event::PhaseChanged { phase } => self.phase = phase,
             Event::Cancelled { id, .. } | Event::Triggered { id } => self.forget(id),
             // A pending stop can be cancelled like a resting order, so it is tracked like one.
             Event::StopPlaced {
@@ -342,6 +382,15 @@ impl Workload {
     /// remember who placed an order that has just rested.
     fn owner_of_new(&self, id: OrderId) -> OwnerId {
         (SplitMix64::new(id ^ self.cfg.seed).next_u64() % u64::from(self.cfg.owners)) as OwnerId
+    }
+
+    /// A tracked order traded and has `leaves` open.
+    fn traded(&mut self, id: OrderId, leaves: Qty) {
+        if leaves == 0 {
+            self.forget(id);
+        } else if let Some(&i) = self.position.get(&id) {
+            self.live[i as usize].leaves = leaves;
+        }
     }
 
     fn forget(&mut self, id: OrderId) {
@@ -576,6 +625,14 @@ pub struct EventCounts {
     pub modified: u64,
     /// `MassCancelled` events.
     pub mass_cancels: u64,
+    /// `Rejected` events because of the phase: a call phase, a halt or the close.
+    pub rejected_phase: u64,
+    /// `Cancelled` events of stops triggered where the phase did not let them work.
+    pub phase_cancels: u64,
+    /// `PhaseChanged` events.
+    pub phase_changes: u64,
+    /// `PhaseChanged` events into a call phase.
+    pub calls: u64,
 }
 
 impl EventSink for EventCounts {
@@ -585,8 +642,12 @@ impl EventSink for EventCounts {
             Event::Accepted { .. } => self.accepted += 1,
             Event::Rejected { reason, .. } => {
                 self.rejected += 1;
-                if reason == RejectReason::BookFull {
-                    self.rejected_book_full += 1;
+                match reason {
+                    RejectReason::BookFull => self.rejected_book_full += 1,
+                    RejectReason::AuctionCall
+                    | RejectReason::TradingHalted
+                    | RejectReason::MarketClosed => self.rejected_phase += 1,
+                    _ => {}
                 }
             }
             Event::Trade { qty, .. } => {
@@ -603,6 +664,7 @@ impl EventSink for EventCounts {
                     CancelReason::MassCancel => self.mass_cancelled_orders += 1,
                     CancelReason::ImmediateOrCancel => self.ioc_cancels += 1,
                     CancelReason::FillOrKill => self.fok_kills += 1,
+                    CancelReason::TradingPhase => self.phase_cancels += 1,
                     CancelReason::Requested | CancelReason::NoLiquidity => {}
                 }
             }
@@ -611,6 +673,12 @@ impl EventSink for EventCounts {
             Event::Replenished { .. } => self.replenishes += 1,
             Event::StopPlaced { .. } => self.stops_placed += 1,
             Event::Triggered { .. } => self.stops_triggered += 1,
+            Event::PhaseChanged { phase } => {
+                self.phase_changes += 1;
+                if phase == Phase::Auction {
+                    self.calls += 1;
+                }
+            }
         }
     }
 }

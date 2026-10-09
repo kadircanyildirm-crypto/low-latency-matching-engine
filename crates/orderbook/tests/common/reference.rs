@@ -3,12 +3,13 @@
 //! It shares no code or data structures with the real engine: `BTreeMap` of price ->
 //! `VecDeque` of orders, prices instead of level indices, linear searches, allocation
 //! everywhere. It is short enough to check by reading, and the property tests require the
-//! engine to produce exactly the same events and the same book.
+//! engine to produce exactly the same events and the same book. The auction price is found
+//! by scoring every candidate price and filtering the list rule by rule.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use orderbook::{
-    BookConfig, CancelReason, Command, Event, OrderId, OwnerId, Price, Qty, QueuedOrder,
+    BookConfig, CancelReason, Command, Event, OrderId, OwnerId, Phase, Price, Qty, QueuedOrder,
     RejectReason, SelfTradePolicy, Side, StopOrder, TimeInForce,
 };
 
@@ -50,6 +51,7 @@ pub struct ReferenceBook {
     pending: Vec<StopOrder>,
     /// Lowest and highest price traded at during the current command.
     traded: Option<(Price, Price)>,
+    phase: Phase,
 }
 
 impl ReferenceBook {
@@ -63,7 +65,12 @@ impl ReferenceBook {
             reference: cfg.reference_price,
             pending: Vec::new(),
             traded: None,
+            phase: Phase::Continuous,
         }
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase
     }
 
     /// One side's pending stops in trigger order: buy stops lowest trigger first, sell stops
@@ -136,6 +143,21 @@ impl ReferenceBook {
                 qty,
                 ..
             } = stop;
+            // Outside continuous trading only a call phase lets a stop-limit rest; nothing
+            // else can work.
+            if self.phase != Phase::Continuous {
+                match (self.phase, stop.limit) {
+                    (Phase::Auction, Some(limit)) => {
+                        self.rest(id, owner, side, limit, qty, qty, (false, None), out)
+                    }
+                    _ => out.push(Event::Cancelled {
+                        id,
+                        qty,
+                        reason: CancelReason::TradingPhase,
+                    }),
+                }
+                continue;
+            }
             match stop.limit {
                 None => self.execute_market(id, owner, side, qty, out),
                 Some(limit) => {
@@ -177,23 +199,32 @@ impl ReferenceBook {
                     }
                 }
                 self.check_band(price)?;
+                self.check_phase(!may_rest)?;
                 if self.taken(id) {
                     return Err(RejectReason::DuplicateOrderId);
                 }
-                if self.outside_protection(side, price) {
+                let calling = self.phase == Phase::Auction;
+                if !calling && self.outside_protection(side, price) {
                     return Err(RejectReason::PriceOutsideProtection);
                 }
-                if self.outside_band(side, price) {
+                if !calling && self.outside_band(side, price) {
                     return Err(RejectReason::PriceOutsideBand);
                 }
                 let crosses = self.crosses(side, price);
                 if tif == TimeInForce::PostOnly && crosses {
                     return Err(RejectReason::PostOnlyWouldCross);
                 }
-                if may_rest && self.held() >= self.cfg.max_orders as usize && !crosses {
+                // Only matching can free a slot, and a call phase does not match.
+                let frees_a_slot = crosses && !calling;
+                if may_rest && self.held() >= self.cfg.max_orders as usize && !frees_a_slot {
                     return Err(RejectReason::BookFull);
                 }
                 out.push(Event::Accepted { id });
+                if calling {
+                    let shape = (tif == TimeInForce::PostOnly, display);
+                    self.rest(id, owner, side, price, qty, qty, shape, out);
+                    return Ok(());
+                }
                 match tif {
                     TimeInForce::Gtc | TimeInForce::PostOnly => {
                         let post_only = tif == TimeInForce::PostOnly;
@@ -244,6 +275,7 @@ impl ReferenceBook {
             } => {
                 self.check_owner(owner)?;
                 self.check_qty(qty)?;
+                self.check_phase(true)?;
                 if self.taken(id) {
                     return Err(RejectReason::DuplicateOrderId);
                 }
@@ -264,6 +296,7 @@ impl ReferenceBook {
                 if let Some(limit) = limit {
                     self.check_band(limit)?;
                 }
+                self.check_phase(false)?;
                 if self.taken(id) {
                     return Err(RejectReason::DuplicateOrderId);
                 }
@@ -324,6 +357,7 @@ impl ReferenceBook {
             } => {
                 self.check_qty(qty)?;
                 self.check_band(price)?;
+                self.check_phase(false)?;
                 if self.pending.iter().any(|s| s.id == id && s.owner == owner) {
                     return Err(RejectReason::PendingStop);
                 }
@@ -350,10 +384,11 @@ impl ReferenceBook {
                         leaves: qty - filled,
                     });
                 } else {
-                    if self.outside_protection(side, price) {
+                    let calling = self.phase == Phase::Auction;
+                    if !calling && self.outside_protection(side, price) {
                         return Err(RejectReason::PriceOutsideProtection);
                     }
-                    if self.outside_band(side, price) {
+                    if !calling && self.outside_band(side, price) {
                         return Err(RejectReason::PriceOutsideBand);
                     }
                     if order.post_only && self.crosses(side, price) {
@@ -374,7 +409,11 @@ impl ReferenceBook {
                     });
                     let leaves = qty - filled;
                     let shape = (order.post_only, order.display);
-                    self.execute_limit(id, owner, side, price, leaves, qty, shape, out);
+                    if calling {
+                        self.rest(id, owner, side, price, leaves, qty, shape, out);
+                    } else {
+                        self.execute_limit(id, owner, side, price, leaves, qty, shape, out);
+                    }
                 }
             }
             Command::CancelAll { owner } => {
@@ -415,8 +454,138 @@ impl ReferenceBook {
                 }
                 out.push(Event::MassCancelled { owner, count });
             }
+            Command::SetPhase { phase } => {
+                if self.phase == Phase::Auction && phase != Phase::Auction {
+                    self.uncross(out);
+                }
+                self.phase = phase;
+                out.push(Event::PhaseChanged { phase });
+            }
         }
         Ok(())
+    }
+
+    /// A halt or the close refuses everything but cancels; a call phase refuses orders
+    /// that would have to trade at once.
+    fn check_phase(&self, trades_at_once: bool) -> Result<(), RejectReason> {
+        if self.phase == Phase::Halted {
+            return Err(RejectReason::TradingHalted);
+        }
+        if self.phase == Phase::Closed {
+            return Err(RejectReason::MarketClosed);
+        }
+        if self.phase == Phase::Auction && trades_at_once {
+            return Err(RejectReason::AuctionCall);
+        }
+        Ok(())
+    }
+
+    /// Ends a call phase: scores every candidate price (each price an order rests at, and
+    /// the reference), keeps the best by the rules one after the other, then trades both
+    /// sides in priority order at that one price.
+    fn uncross(&mut self, out: &mut Vec<Event>) {
+        let mut candidates: Vec<Price> = self
+            .bids
+            .keys()
+            .chain(self.asks.keys())
+            .copied()
+            .chain(self.reference)
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        let sum = |ladder: &Ladder, wanted: &dyn Fn(Price) -> bool| -> u128 {
+            ladder
+                .iter()
+                .filter(|(price, _)| wanted(**price))
+                .flat_map(|(_, queue)| queue.iter())
+                .map(|order| u128::from(order.leaves))
+                .sum()
+        };
+        // (price, bids at or above it, asks at or below it)
+        let scored: Vec<(Price, u128, u128)> = candidates
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    sum(&self.bids, &|q| q >= p),
+                    sum(&self.asks, &|q| q <= p),
+                )
+            })
+            .collect();
+        let volume = |&(_, bid, ask): &(Price, u128, u128)| bid.min(ask);
+        let surplus = |&(_, bid, ask): &(Price, u128, u128)| bid.abs_diff(ask);
+        let most = scored.iter().map(volume).max().unwrap_or(0);
+        if most == 0 {
+            return;
+        }
+        let best: Vec<_> = scored.iter().filter(|c| volume(c) == most).collect();
+        let least = best.iter().map(|c| surplus(c)).min().unwrap();
+        let best: Vec<_> = best.into_iter().filter(|c| surplus(c) == least).collect();
+        let prices = best.iter().map(|c| c.0);
+        let price = if best.iter().all(|&&(_, bid, ask)| bid > ask) {
+            prices.max().unwrap()
+        } else if best.iter().all(|&&(_, bid, ask)| ask > bid) {
+            prices.min().unwrap()
+        } else if let Some(reference) = self.reference {
+            prices.min_by_key(|&p| (p.abs_diff(reference), p)).unwrap()
+        } else {
+            prices.min().unwrap()
+        };
+
+        while self.best(Side::Buy).is_some_and(|bid| bid >= price)
+            && self.best(Side::Sell).is_some_and(|ask| ask <= price)
+        {
+            let (bid, ask) = (
+                self.best(Side::Buy).unwrap(),
+                self.best(Side::Sell).unwrap(),
+            );
+            let buy = self.bids.get_mut(&bid).unwrap().front_mut().unwrap();
+            let sell = self.asks.get_mut(&ask).unwrap().front_mut().unwrap();
+            let fill = buy.visible.min(sell.visible);
+            for order in [&mut *buy, &mut *sell] {
+                order.leaves -= fill;
+                order.visible -= fill;
+            }
+            self.trades += 1;
+            out.push(Event::Trade {
+                trade_id: self.trades,
+                taker: buy.id,
+                maker: sell.id,
+                taker_side: Side::Buy,
+                price,
+                qty: fill,
+                taker_leaves: buy.leaves,
+                maker_leaves: sell.leaves,
+            });
+            self.after_uncross_fill(Side::Buy, bid, price, out);
+            self.after_uncross_fill(Side::Sell, ask, price, out);
+        }
+        self.reference = Some(price);
+        self.traded = Some((price, price));
+    }
+
+    /// The order at the front of the queue at `level` just traded in an uncross: it leaves
+    /// if it is filled; an iceberg out of its tranche shows the next one at the back.
+    fn after_uncross_fill(&mut self, side: Side, level: Price, price: Price, out: &mut Vec<Event>) {
+        let queue = self.ladder(side).get_mut(&level).unwrap();
+        let front = *queue.front().unwrap();
+        if front.leaves == 0 {
+            queue.pop_front();
+            self.orders.remove(&front.id);
+        } else if front.visible == 0 {
+            let mut iceberg = queue.pop_front().unwrap();
+            iceberg.visible = iceberg.display.unwrap().min(iceberg.leaves);
+            out.push(Event::Replenished {
+                id: iceberg.id,
+                side,
+                price,
+                visible: iceberg.visible,
+            });
+            queue.push_back(iceberg);
+        }
+        if self.ladder(side)[&level].is_empty() {
+            self.ladder(side).remove(&level);
+        }
     }
 
     /// `max_iceberg_tranches` tranches of `display` cover `qty`.
@@ -550,6 +719,13 @@ impl ReferenceBook {
                 qty: unfilled,
                 reason,
             });
+            // A volatility interruption: trading moves to a call.
+            if reason == CancelReason::PriceBand && self.cfg.auction_on_band {
+                self.phase = Phase::Auction;
+                out.push(Event::PhaseChanged {
+                    phase: Phase::Auction,
+                });
+            }
         }
     }
 
@@ -577,6 +753,31 @@ impl ReferenceBook {
             });
             return;
         }
+        self.rest(
+            id,
+            owner,
+            side,
+            price,
+            left,
+            total,
+            (post_only, display),
+            out,
+        );
+    }
+
+    /// Puts `left` of an order at the back of the queue at `price`.
+    #[allow(clippy::too_many_arguments)]
+    fn rest(
+        &mut self,
+        id: OrderId,
+        owner: OwnerId,
+        side: Side,
+        price: Price,
+        left: Qty,
+        total: Qty,
+        (post_only, display): (bool, Option<Qty>),
+        out: &mut Vec<Event>,
+    ) {
         let visible = display.map_or(left, |display| display.min(left));
         self.ladder(side)
             .entry(price)

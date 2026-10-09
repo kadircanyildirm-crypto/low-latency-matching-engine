@@ -81,6 +81,7 @@ fn protected_config() -> (WorkloadConfig, BookConfig) {
             mass_cancel: 1,
             stop: 4,
             modify: 5,
+            session: 0,
         },
         tif: TifMix {
             ioc: 30,
@@ -129,6 +130,7 @@ fn banded_config() -> (WorkloadConfig, BookConfig) {
             mass_cancel: 0,
             stop: 0,
             modify: 5,
+            session: 0,
         },
         ..config()
     };
@@ -220,8 +222,8 @@ fn output_matches_the_golden_fingerprints() {
 }
 
 const GOLDEN_DEFAULT: u64 = 0xa83b_9f96_80cf_a652;
-const GOLDEN_DEFAULT_DIGEST: u64 = 0x6af9_1bee_2c68_365b;
+const GOLDEN_DEFAULT_DIGEST: u64 = 0x2994_b8d1_188e_075b;
 const GOLDEN_PROTECTED: u64 = 0x1c6e_12e1_87ef_3f44;
-const GOLDEN_PROTECTED_DIGEST: u64 = 0xf898_d029_54fd_1fc8;
+const GOLDEN_PROTECTED_DIGEST: u64 = 0xf167_5321_c238_1e08;
 const GOLDEN_BANDED: u64 = 0xdbe4_19eb_3a15_01ed;
-const GOLDEN_BANDED_DIGEST: u64 = 0x2a22_6461_fdd2_37b2;
+const GOLDEN_BANDED_DIGEST: u64 = 0x7c1f_5993_3e23_a1f2;

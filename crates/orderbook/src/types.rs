@@ -126,10 +126,21 @@ pub enum Command {
         /// Participant whose orders to cancel.
         owner: OwnerId,
     },
+    /// Moves the book to another trading phase. It comes from the exchange's own schedule
+    /// (the sequencer decides when), never from a participant, and it is never rejected.
+    ///
+    /// Leaving [`Phase::Auction`] uncrosses the book first: everything that can execute
+    /// does, at a single price. Setting the phase the book is already in changes nothing,
+    /// but is still reported.
+    SetPhase {
+        /// The phase to move to.
+        phase: Phase,
+    },
 }
 
 impl Command {
-    /// The order this command creates or refers to; `None` for a mass cancel.
+    /// The order this command creates or refers to; `None` for a mass cancel or a phase
+    /// change.
     #[inline]
     pub const fn id(&self) -> Option<OrderId> {
         match *self {
@@ -138,20 +149,22 @@ impl Command {
             | Command::Stop { id, .. }
             | Command::Cancel { id, .. }
             | Command::Modify { id, .. } => Some(id),
-            Command::CancelAll { .. } => None,
+            Command::CancelAll { .. } | Command::SetPhase { .. } => None,
         }
     }
 
-    /// The participant who sent the command.
+    /// The participant who sent the command; `None` for a phase change, which comes from
+    /// the exchange itself.
     #[inline]
-    pub const fn owner(&self) -> OwnerId {
+    pub const fn owner(&self) -> Option<OwnerId> {
         match *self {
             Command::Limit { owner, .. }
             | Command::Market { owner, .. }
             | Command::Stop { owner, .. }
             | Command::Cancel { owner, .. }
             | Command::Modify { owner, .. }
-            | Command::CancelAll { owner } => owner,
+            | Command::CancelAll { owner } => Some(owner),
+            Command::SetPhase { .. } => None,
         }
     }
 }
@@ -171,6 +184,29 @@ pub enum TimeInForce {
     PostOnly,
 }
 
+/// The book's trading phase: what it accepts, and whether orders trade on arrival.
+///
+/// The phase changes only by [`Command::SetPhase`], or, with `auction_on_band` configured,
+/// when the price band stops a market order: a volatility interruption.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Continuous trading: orders trade on arrival as far as they can, and the remainder
+    /// rests or is cancelled as its time in force says.
+    #[default]
+    Continuous,
+    /// The call phase of an auction: an opening or closing call, or a reopening after a
+    /// halt. Limit orders, stops, modifies and cancels are accepted, but nothing trades, so
+    /// the book may be crossed. Market, immediate-or-cancel and fill-or-kill orders, which
+    /// exist to trade at once, are refused. Leaving the phase uncrosses the book at a
+    /// single price.
+    Auction,
+    /// Trading halted: the book keeps its orders and pending stops, but accepts only cancels
+    /// and mass cancels.
+    Halted,
+    /// The market is closed: as in a halt, only cancels and mass cancels are accepted.
+    Closed,
+}
+
 /// Output of the matching engine.
 ///
 /// Per command the engine emits:
@@ -188,9 +224,18 @@ pub enum TimeInForce {
 ///   priority), then for each of its pending stops (buy stops lowest trigger first, then
 ///   sell stops highest trigger first), then `MassCancelled`. It is never rejected.
 ///
+/// - `SetPhase`: when it leaves [`Phase::Auction`], first the `Trade`s of the uncross,
+///   each followed by a `Replenished` for every iceberg whose tranche it used up (the buy
+///   order's first); then `PhaseChanged`. It is never rejected.
+///
+/// A market order that the price band stops, in a book configured with `auction_on_band`,
+/// is followed by `PhaseChanged { phase: Auction }`.
+///
 /// After any command whose trades reached a pending stop's trigger, the stop is released:
 /// `Triggered`, then the events of the market or limit order it becomes, after `Accepted`.
-/// A released stop's trades can trigger more stops in turn.
+/// A released stop's trades can trigger more stops in turn. Outside continuous trading a
+/// released stop cannot trade: a stop-limit rests if the book is in a call phase, and
+/// anything else is cancelled (`TradingPhase`).
 ///
 /// "Leaves" quantity is the open quantity still working on the book; zero means the order
 /// is done.
@@ -209,7 +254,8 @@ pub enum Event {
         reason: RejectReason,
     },
     /// The incoming order (`taker`) traded with a resting order (`maker`) at the maker's
-    /// price.
+    /// price. In an uncross both orders were resting and the price is the auction price;
+    /// the buy order is reported as the taker.
     Trade {
         /// Unique, gap-free execution id.
         trade_id: TradeId,
@@ -299,6 +345,12 @@ pub enum Event {
         /// How many orders were cancelled; zero if the owner had none.
         count: u32,
     },
+    /// The book is now in `phase`. When the book left a call phase, this follows the
+    /// trades of the uncross.
+    PhaseChanged {
+        /// The phase now in force.
+        phase: Phase,
+    },
 }
 
 /// Why a command was refused.
@@ -334,6 +386,13 @@ pub enum RejectReason {
     StopWouldTrigger,
     /// A modify of a stop that has not triggered yet; cancel it and send a new one instead.
     PendingStop,
+    /// A market, immediate-or-cancel or fill-or-kill order during an auction's call phase.
+    /// Such orders exist to trade at once, and nothing trades until the uncross.
+    AuctionCall,
+    /// Trading is halted: only cancels and mass cancels are accepted.
+    TradingHalted,
+    /// The market is closed: only cancels and mass cancels are accepted.
+    MarketClosed,
 }
 
 /// Why open quantity left the book without trading.
@@ -355,6 +414,9 @@ pub enum CancelReason {
     FillOrKill,
     /// A market order reached the edge of the price band around the reference price.
     PriceBand,
+    /// A stop triggered outside continuous trading, where the order it becomes cannot work:
+    /// a stop-market in any other phase, or a stop-limit while trading is halted or closed.
+    TradingPhase,
 }
 
 /// How the book prevents an owner from trading with themselves.

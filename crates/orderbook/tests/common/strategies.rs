@@ -4,9 +4,14 @@
 //! unknown ids), few owners (self-trades, and sometimes one outside the owner table), prices near bitset word boundaries and band
 //! edges or just outside the band, and quantities at zero, at `max_order_qty`, just above
 //! it, and at `u64::MAX`.
+//!
+//! Two scenarios in three change trading phases: about one command in sixteen moves the
+//! book to a random phase, so calls fill up with crossing orders, uncross, and halts and
+//! closes refuse orders. Only those scenarios may switch on the volatility interruption,
+//! since nothing else would ever end the call it starts.
 
 use orderbook::{
-    BookConfig, Command, OrderId, OwnerId, Price, Qty, SelfTradePolicy, Side, TimeInForce,
+    BookConfig, Command, OrderId, OwnerId, Phase, Price, Qty, SelfTradePolicy, Side, TimeInForce,
 };
 use proptest::prelude::*;
 use proptest::strategy::BoxedStrategy;
@@ -47,7 +52,7 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
         band,
         (1u32..=24, max_owners, tranches),
         any::<bool>(),
-        (protection, price_band, reference),
+        (protection, price_band, reference, any::<bool>()),
         policy,
     )
         .prop_map(
@@ -55,7 +60,7 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
                 (min_price, max_price),
                 (max_orders, max_owners, max_iceberg_tranches),
                 huge_qty,
-                (price_protection, price_band, reference),
+                (price_protection, price_band, reference, auction_on_band),
                 self_trade,
             )| {
                 let reference_price = match reference {
@@ -80,6 +85,7 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
                     price_protection,
                     price_band,
                     reference_price,
+                    auction_on_band,
                     self_trade,
                 }
             },
@@ -88,11 +94,19 @@ pub fn config() -> impl Strategy<Value = BookConfig> {
 
 /// A config together with a command sequence for it.
 pub fn scenario(max_len: usize) -> impl Strategy<Value = (BookConfig, Vec<Command>)> {
-    config().prop_flat_map(move |cfg| (Just(cfg), prop::collection::vec(command(cfg), 1..max_len)))
+    let sessions = prop_oneof![1 => Just(false), 2 => Just(true)];
+    (config(), sessions).prop_flat_map(move |(cfg, sessions)| {
+        let cfg = BookConfig {
+            auction_on_band: cfg.auction_on_band && sessions,
+            ..cfg
+        };
+        let commands = prop::collection::vec(command(cfg, sessions), 1..max_len);
+        (Just(cfg), commands)
+    })
 }
 
-pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
-    prop_oneof![
+pub fn command(cfg: BookConfig, sessions: bool) -> BoxedStrategy<Command> {
+    let orders = prop_oneof![
         6 => (id(), owner(), side(), price(cfg), qty(cfg), tif(), display())
             .prop_map(|(id, owner, side, price, qty, tif, display)| Command::Limit {
                 id, owner, side, price, qty, tif, display,
@@ -108,8 +122,104 @@ pub fn command(cfg: BookConfig) -> BoxedStrategy<Command> {
             .prop_map(|(id, owner, side, trigger, limit, qty)| Command::Stop {
                 id, owner, side, trigger, limit, qty,
             }),
+    ];
+    if !sessions {
+        return orders.boxed();
+    }
+    prop_oneof![
+        15 => orders,
+        1 => phase().prop_map(|phase| Command::SetPhase { phase }),
     ]
     .boxed()
+}
+
+/// One call phase and its uncross: a few orders of one to three lots, some of them icebergs,
+/// over eleven ticks, and a few stops, entered in a call phase and uncrossed by moving to
+/// any other phase. The sums of so few small orders tie often, so every tie-break of the
+/// auction rules gets to decide, with a reference price inside, outside or missing.
+pub fn auction() -> impl Strategy<Value = (BookConfig, Vec<Command>)> {
+    let reference = prop_oneof![
+        1 => Just(None),
+        4 => (90i64..=110).prop_map(Some),
+    ];
+    let policy = prop_oneof![
+        Just(SelfTradePolicy::CancelResting),
+        Just(SelfTradePolicy::CancelIncoming),
+    ];
+    let order = (id(), owner(), side(), 95i64..=105, 1u64..=3, any::<bool>()).prop_map(
+        |(id, owner, side, price, qty, iceberg)| Command::Limit {
+            id,
+            owner,
+            side,
+            price,
+            qty,
+            tif: TimeInForce::Gtc,
+            display: (iceberg && qty > 1).then_some(1),
+        },
+    );
+    let stop = (
+        id(),
+        owner(),
+        side(),
+        90i64..=110,
+        prop::option::of(90i64..=110),
+    )
+        .prop_map(|(id, owner, side, trigger, limit)| Command::Stop {
+            id,
+            owner,
+            side,
+            trigger,
+            limit,
+            qty: 1,
+        });
+    let entry = prop_oneof![6 => order, 1 => stop];
+    let end = prop_oneof![
+        4 => Just(Phase::Continuous),
+        1 => Just(Phase::Halted),
+        1 => Just(Phase::Closed),
+    ];
+    (
+        reference,
+        policy,
+        prop::collection::vec(entry, 1..14),
+        end,
+        prop::collection::vec(entry_after(), 0..4),
+    )
+        .prop_map(|(reference_price, self_trade, entries, end, after)| {
+            let cfg = BookConfig {
+                reference_price,
+                self_trade,
+                ..BookConfig::new(90, 110, 16)
+            };
+            let mut commands = vec![Command::SetPhase {
+                phase: Phase::Auction,
+            }];
+            commands.extend(entries);
+            commands.push(Command::SetPhase { phase: end });
+            commands.extend(after);
+            (cfg, commands)
+        })
+}
+
+/// A few market orders after the uncross, which can trade what it left behind.
+fn entry_after() -> impl Strategy<Value = Command> {
+    (id(), owner(), side(), 1u64..=3).prop_map(|(id, owner, side, qty)| Command::Market {
+        id,
+        owner,
+        side,
+        qty,
+    })
+}
+
+/// Calls as often as continuous trading, so books cross and uncross; now and then a halt
+/// or the close.
+fn phase() -> impl Strategy<Value = Phase> {
+    prop_oneof![
+        3 => Just(Phase::Continuous),
+        3 => Just(Phase::Auction),
+        1 => Just(Phase::Halted),
+        1 => Just(Phase::Closed),
+    ]
 }
 
 fn id() -> impl Strategy<Value = OrderId> {
@@ -167,6 +277,9 @@ fn qty(cfg: BookConfig) -> BoxedStrategy<Qty> {
     prop_oneof![
         1 => Just(0),
         24 => 1..=small,
+        // Small lots add up to equal sums often, so auction prices tie on volume and
+        // surplus and the later tie-breaks decide.
+        6 => 1..=2u64.min(max),
         3 => max.saturating_sub(3).max(1)..=max,
         1 => Just(max.saturating_add(1)),
         1 => Just(u64::MAX),

@@ -180,17 +180,17 @@ market, cancel and price-move commands only, our extra controls off) through thi
 [exchange-core](https://github.com/exchange-core/exchange-core) (Java, its matching core),
 [liquibook](https://github.com/enewhuis/liquibook) (C++) and
 [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) (Rust), and checks that all
-four produce exactly the same trades and final book. Preliminary results, from a busy
-laptop and the same E-core for every engine:
+four produce exactly the same trades and final book. On an otherwise idle laptop, every
+engine pinned to the same P-core, median of three rounds:
 
 | Scenario | ours | exchange-core | liquibook | OrderBook-rs |
 |---|---:|---:|---:|---:|
-| baseline | 16.7M cmd/s | 8.7M (0.52x) | 2.05M (0.12x) | 0.54M (0.03x) |
-| deep (1M orders) | 4.15M cmd/s | 3.1M (0.74x) | 0.20M (0.05x) | 0.03M (0.01x) |
+| baseline | 27.6M cmd/s, p50 55 ns | 16.3M (0.59x) | 3.48M (0.13x) | 0.94M (0.03x) |
+| deep (1M orders) | 7.47M cmd/s, p50 143 ns | 5.09M (0.68x) | 0.27M (0.04x) | 0.04M (0.01x) |
 
-exchange-core comes closest on the million-order book (0.89x in a P-core spot check), where
-both engines are bound by cache misses. The method, all four scenarios, latency
-percentiles and caveats are in the document; `compare/run.sh` reruns everything.
+exchange-core comes closest on the million-order book, where both engines are bound by
+cache misses. The method, all four scenarios, latency percentiles and caveats are in the
+document; `compare/run.sh` reruns everything.
 
 ## Running
 

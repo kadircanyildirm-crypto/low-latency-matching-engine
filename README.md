@@ -17,7 +17,7 @@ single-threaded deterministic matching, event sourcing, and a pipeline of pinned
 | Property | How |
 |---|---|
 | Deterministic | Single-threaded, no clocks, no randomness. CI checks pinned fingerprints of the output on Linux, Windows and macOS (ARM). |
-| No heap allocation on the hot path | All memory is reserved at construction. A counting global allocator verifies it, including the worst case for the hash index. |
+| No heap allocation on the hot path | All memory is reserved at construction. A counting global allocator verifies it, including the worst case for the id index. |
 | No overflow by construction | `max_orders × max_order_qty` must fit in a `u64`, so no quantity sum can wrap. |
 | No `unsafe` | `#![forbid(unsafe_code)]` in the library. |
 
@@ -126,45 +126,49 @@ scenario, a participant-like generator records a command stream, which is then r
 into fresh books: 3 runs × 2M measured commands after warm-up.
 
 Numbers from a development laptop (Intel Core i5-12450H, Windows 11, untuned, no core
-isolation). The benchmark pins to the last logical core, which on this hybrid processor
-is an efficiency core (E-core). The ~25 ns timer overhead is included. Throughput comes from a separate pass
-without per-command timers.
+isolation), pinned to a performance core (`LAT_CORE=2`). The ~14 ns timer overhead is
+included. Throughput comes from a separate pass without per-command timers.
 
 | Scenario | Book after warm-up | p50 | p90 | p99 | p99.9 | p99.99 | Throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
-| baseline | 7.7k orders, 243 levels | 81 ns | 123 ns | 192 ns | 351 ns | 2.5 µs | 17.6–18.5M cmd/s |
-| sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 80 ns | 130 ns | 194 ns | 272 ns | 2.4 µs | 16.9–17.2M cmd/s |
-| deep | 1M orders, 10k levels | 261 ns | 526 ns | 1.1 µs | 3.8 µs | 15 µs | 3.6–3.9M cmd/s |
-| protected: 2-tick protection, 4 owners, IOC / FOK / post-only | 1.7k orders, 141 levels | 82 ns | 126 ns | 207 ns | 303 ns | 2.2 µs | 18.2–18.3M cmd/s |
+| baseline | 7.7k orders, 243 levels | 58 ns | 83 ns | 130 ns | 199 ns | 1.1 µs | 21.8–24.6M cmd/s |
+| sweep: 40% aggressive flow, multi-level fills | 1.6k orders, 165 levels | 58 ns | 90 ns | 136 ns | 187 ns | 0.6 µs | 23.1–23.8M cmd/s |
+| deep | 1M orders, 10.2k levels | 165 ns | 296 ns | 798 ns | 1.1 µs | 10.9 µs | 6.3–6.7M cmd/s |
+| protected: 2-tick protection, 4 owners, every order type | 6.5k orders, 182 levels | 63 ns | 104 ns | 254 ns | 661 ns | 1.6 µs | 19.2–20.1M cmd/s |
+| sessions: calls, halts and the close | 3.5k orders, 243 levels | 51 ns | 68 ns | 128 ns | 1.9 µs | 4.1 µs | 28.4–29.2M cmd/s |
 
-The protected scenario runs the paths the others never reach. About 5% of its commands are
-rejected, about a quarter of its market orders stop at the protection band, and
-self-trade prevention removes about 220k resting orders per run.
+The protected scenario runs the paths the others never reach: IOC, FOK, post-only,
+icebergs and stops. About 7% of its commands are rejected, about a quarter of its market
+orders stop at the protection band, and self-trade prevention removes about 270k resting
+orders per run. The sessions scenario changes phase two commands in a hundred, under a
+10-tick band that starts a call whenever it stops a market order: about 15,000 calls per
+run. A phase change takes 36 ns at p50 and 3.2 µs at p99, uncross included, and
+those uncrosses set the scenario's p99.9.
 
-A fifth scenario, sessions, changes phase two commands in a hundred, under a 10-tick band
-that starts a call whenever it stops a market order: about 15,000 calls in each run of 2M
-commands. Measured
-in a later session, in which baseline measured 90 ns at p50 and 205 ns at p99: 77 ns at
-p50, 213 ns at p99, 3.2 µs at p99.9 and 16.4–16.8M cmd/s. Phase changes themselves take
-0.6 µs on average and 5.5 µs at p99, uncross included.
+On the last logical core, an efficiency core (E-core), the same session measured 89 ns at
+p50 and 191 ns at p99 for baseline (15.7–16.0M cmd/s) and 222 ns and 868 ns for deep
+(3.3–4.7M cmd/s).
 
 By command, in the baseline scenario:
 
 | Command | p50 | p99 | p99.9 |
 |---|---:|---:|---:|
-| limit | 73 ns | 176 ns | 281 ns |
-| market | 101 ns | 235 ns | 356 ns |
-| cancel | 95 ns | 169 ns | 563 ns |
-| modify | 133 ns | 251 ns | 695 ns |
+| limit | 58 ns | 124 ns | 185 ns |
+| market | 65 ns | 169 ns | 239 ns |
+| cancel | 57 ns | 87 ns | 191 ns |
+| modify | 94 ns | 158 ns | 276 ns |
 
 - **The deep book is slower because it does not fit in cache.** A million 48-byte order
-  nodes take about 48 MB, on top of the id index, against a 12 MB L3. Cancels and
-  modifies touch arbitrary orders and pay for the misses.
-- **The tail is the machine, not the engine.** p99.99 moves between 2.4 and 7 µs from run
-  to run in the baseline scenario, and the maximum reaches milliseconds: preemption by
-  the OS. Even medians move by several percent between sessions on this laptop (the deep
-  scenario measured 343 ns in an earlier session), so only same-session comparisons are
-  meaningful. Measurements on an isolated Linux core are part of Phase 5.
+  nodes take about 48 MB, and the id index another 32 MB, against a 12 MB L3. Cancels and
+  modifies touch arbitrary orders and pay for the misses. A custom id index that finds
+  an order in one cache line instead of two
+  ([DESIGN.md §13](docs/DESIGN.md#13-performance-work)) cut the deep scenario's p50 by
+  about a fifth.
+- **The tail is the machine, not the engine.** p99.99 moves by a factor of two or three
+  from run to run, and the maximum reaches milliseconds: preemption by the OS. Even
+  medians move by several percent between sessions on this laptop, so only
+  same-session comparisons are meaningful. Measurements on an isolated Linux core are
+  part of Phase 5.
 - **What this does not measure:** network, serialization, journaling or queueing. This
   is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
   coordinated-omission correction) arrives with the gateway and pipeline phases.
@@ -193,6 +197,7 @@ percentiles and caveats are in the document; `compare/run.sh` reruns everything.
 ```sh
 cargo test                                # all tests
 cargo bench --bench latency               # latency per scenario; writes target/latency/*.hgrm
+LAT_CORE=2 cargo bench --bench latency    # the same, pinned to logical core 2 instead of the last
 cargo bench --bench throughput            # Criterion before/after comparison (includes generator cost)
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
 compare/run.sh fetch && compare/run.sh export && compare/run.sh all   # comparison with other engines

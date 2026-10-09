@@ -261,13 +261,16 @@ pub struct Journal<S: Storage> {
     next: Option<Prepared<S::File>>,
     /// Bytes of zeros the next segment is owed, from records appended since the last piece.
     owed: u64,
+    /// Why preparing the next segment failed, until someone asks.
+    prepare_failure: Option<Error>,
+    /// Whether preparing is off until the next roll, after a failure.
+    paused: bool,
 }
 
 /// A segment file being filled with zeros under the name `journal-<first seq>.next`.
 struct Prepared<F> {
     file: F,
-    first_seq: Seq,
-    capacity: u32,
+    header: Header,
     /// Bytes after the header already zero.
     filled: u64,
 }
@@ -305,33 +308,40 @@ impl<S: Storage> Journal<S> {
         mut apply: impl FnMut(Seq, Command) -> Result<(), Error>,
     ) -> Result<(Journal<S>, JournalReport), Error> {
         assert!(expect.capacity > 0, "segments need room for a record");
-        let mut names: Vec<Seq> = storage
-            .list(dir)?
-            .iter()
-            .filter_map(|name| segment_seq(name))
-            .collect();
-        names.sort_unstable();
         let mut report = JournalReport::default();
+        let names = segment_names(&mut storage, dir)?;
+        let clean = read_clean(&mut storage, dir)?;
 
-        // Read every header that replay depends on: the segment that holds `after + 1` and
-        // the ones after it. Older segments are only kept for older snapshots, and damage to
-        // them must not stop recovery from a newer one. Nothing is changed yet.
+        // Read the headers. Those of segments wholly before `after + 1` only serve older
+        // snapshots: damage to them, or a read error, must not stop recovery from a newer
+        // one, so their extent is then taken from the names. Nothing is changed yet.
         let mut segments = Vec::with_capacity(names.len());
         let mut torn_newest = None;
         for (index, &seq) in names.iter().enumerate() {
             let path = dir.join(segment_name(seq));
             let next = names.get(index + 1).copied();
-            if next.is_some_and(|next| next <= after + 1) {
-                segments.push(Header {
-                    first_seq: seq,
-                    fingerprint: expect.fingerprint,
-                    capacity: u32::try_from(next.unwrap() - seq).unwrap_or(u32::MAX),
-                    rules: 0,
+            let opened = storage
+                .open(&path)
+                .map_err(Error::from)
+                .and_then(|mut file| Ok((read_header(&mut file)?, file)));
+            if let Some(next) = next.filter(|&next| next <= after + 1) {
+                segments.push(match opened {
+                    Ok((Ok(header), _))
+                        if header.first_seq == seq && header.fingerprint == expect.fingerprint =>
+                    {
+                        header
+                    }
+                    _ => Header {
+                        first_seq: seq,
+                        fingerprint: expect.fingerprint,
+                        capacity: u32::try_from(next - seq).unwrap_or(u32::MAX),
+                        rules: expect.rules,
+                    },
                 });
                 continue;
             }
-            let mut file = storage.open(&path)?;
-            match read_header(&mut file)? {
+            let (header, mut file) = opened?;
+            match header {
                 Ok(header) if header.first_seq != seq => {
                     return Err(Error::Corrupt {
                         file: path,
@@ -341,17 +351,11 @@ impl<S: Storage> Journal<S> {
                 Ok(header) if header.fingerprint != expect.fingerprint => {
                     return Err(Error::ConfigMismatch { file: path });
                 }
-                Ok(header) if header.rules != expect.rules => {
-                    return Err(Error::RulesMismatch {
-                        file: path,
-                        found: header.rules,
-                    });
-                }
                 Ok(header) => segments.push(header),
-                // A segment's header is synced before any record is written into it, so a
-                // torn header with no records behind it is a crash during creation. With
-                // records behind it, the header was synced and has since been damaged.
-                Err(HeaderError::Torn) if next.is_none() && !holds_records(&mut file)? => {
+                // A segment gets its final name only once its header is synced, so a torn
+                // header is damage. With no valid record behind it, nothing is lost by
+                // removing the file.
+                Err(HeaderError::Torn) if next.is_none() && !holds_records(&mut file, 0)? => {
                     torn_newest = Some(path);
                 }
                 Err(HeaderError::Torn) => {
@@ -372,8 +376,13 @@ impl<S: Storage> Journal<S> {
             }
         }
 
-        // Segments are contiguous: each starts where the one before ends.
-        for pair in segments.windows(2) {
+        // The segments replay needs are contiguous: each starts where the one before ends.
+        // A gap among older ones only costs an older snapshot its journal.
+        let first_needed = names
+            .iter()
+            .position(|&seq| seq > after + 1)
+            .map_or(segments.len().saturating_sub(1), |i| i.saturating_sub(1));
+        for pair in segments[first_needed.min(segments.len())..].windows(2) {
             if pair[0].first_seq + u64::from(pair[0].capacity) != pair[1].first_seq {
                 return Err(Error::Corrupt {
                     file: dir.join(segment_name(pair[1].first_seq)),
@@ -389,7 +398,7 @@ impl<S: Storage> Journal<S> {
         if segments.first().is_some_and(|s| s.first_seq > after + 1) {
             return Err(Error::MissingJournal { from: after + 1 });
         }
-        let covering = segments.iter().position(|s| s.covers(after + 1));
+        let mut covering = segments.iter().position(|s| s.covers(after + 1));
         if covering.is_none()
             && segments
                 .last()
@@ -401,8 +410,27 @@ impl<S: Storage> Journal<S> {
             });
         }
 
+        // A segment written under other matching rules can only be kept if nothing in it
+        // needs replaying: the upgrade path, where the old version took a snapshot before it
+        // stopped. The journal is then cut at the snapshot and continues under these rules.
+        let mut upgrade = None;
+        if let Some(i) = covering.filter(|&i| segments[i].rules != expect.rules) {
+            let path = dir.join(segment_name(segments[i].first_seq));
+            for later in &segments[i..] {
+                let path = dir.join(segment_name(later.first_seq));
+                if holds_records(&mut storage.open(&path)?, after)? {
+                    return Err(Error::RulesMismatch {
+                        file: path,
+                        found: later.rules,
+                    });
+                }
+            }
+            upgrade = Some((i, path));
+        }
+
         // Everything checks out: from here on, recovery repairs. A segment that was still
-        // being prepared never held a record.
+        // being prepared never held a record, and the clean-shutdown marker is about to be
+        // out of date.
         if let Some(path) = &torn_newest {
             storage.remove(path)?;
             report.removed_segments += 1;
@@ -412,18 +440,53 @@ impl<S: Storage> Journal<S> {
                 storage.remove(&dir.join(name))?;
             }
         }
+        if clean.is_some() {
+            storage.remove(&dir.join(CLEAN))?;
+        }
+        if let Some((i, path)) = upgrade {
+            for later in segments.drain(i + 1..) {
+                storage.remove(&dir.join(segment_name(later.first_seq)))?;
+                report.removed_segments += 1;
+            }
+            let segment = &mut segments[i];
+            if segment.first_seq == after + 1 {
+                storage.remove(&path)?;
+                segments.pop();
+                report.removed_segments += 1;
+            } else {
+                // End the old segment at the snapshot.
+                segment.capacity = (after + 1 - segment.first_seq) as u32;
+                let mut file = storage.open(&path)?;
+                file.write_at(0, &segment.encode())?;
+                file.sync()?;
+            }
+            covering = None;
+        }
+
         let (file, slot) = match covering {
             Some(i) => {
                 let first_seq = segments[i].first_seq;
                 let file = storage.open(&dir.join(segment_name(first_seq)))?;
                 (file, (after + 1 - first_seq) as u32)
             }
-            // Replaced by the new segment below.
-            None => (storage.create(&dir.join(prepared_name(after + 1)))?, 0),
+            None => {
+                let header = Header {
+                    first_seq: after + 1,
+                    fingerprint: expect.fingerprint,
+                    capacity: expect.capacity,
+                    rules: expect.rules,
+                };
+                let prepared = prepare(&mut storage, dir, header)?;
+                let file = finish(&mut storage, dir, prepared)?;
+                segments.push(header);
+                (file, 0)
+            }
         };
         let mut journal = Journal {
             next: None,
             owed: 0,
+            prepare_failure: None,
+            paused: false,
             file,
             storage,
             dir: dir.to_owned(),
@@ -436,9 +499,8 @@ impl<S: Storage> Journal<S> {
             durable: after,
             buf: Vec::with_capacity(BATCH_RECORDS * RECORD_SIZE),
         };
-        match covering {
-            Some(start) => journal.replay(start, &mut apply, &mut report)?,
-            None => journal.start_segment(after + 1)?,
+        if let Some(start) = covering {
+            journal.replay(start, clean, &mut apply, &mut report)?;
         }
         // The directory may hold entries that only the OS cache knows of: a segment a killed
         // process created, or the removals above and those of leftover temporary snapshots.
@@ -450,17 +512,21 @@ impl<S: Storage> Journal<S> {
     }
 
     /// Replays from the current position to the end of the log, then cuts the log there and
-    /// makes what it kept durable.
+    /// makes what it kept durable. `clean` is the sequence number a clean shutdown recorded
+    /// as durable, if there was one.
     fn replay(
         &mut self,
         start: usize,
+        clean: Option<Seq>,
         apply: &mut impl FnMut(Seq, Command) -> Result<(), Error>,
         report: &mut JournalReport,
     ) -> Result<(), Error> {
         let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
         let mut index = start;
-        // The highest sequence number some record says was synced.
-        let mut vouched = self.last_seq;
+        // The highest sequence number known to have been synced: the starting point, which
+        // the journal was synced to before the snapshot, a clean shutdown, and what the
+        // records themselves say.
+        let mut vouched = self.last_seq.max(clean.unwrap_or(0));
         loop {
             let segment = self.segments[index];
             let filled = read_slots(&mut self.file, &segment, self.slot, &mut chunk)?;
@@ -496,17 +562,37 @@ impl<S: Storage> Journal<S> {
             if self.slot < segment.capacity {
                 continue;
             }
-            // This segment is full; go on in the next, if there is one.
-            match self.segments.get(index + 1) {
+            // This segment is full; go on in the next, if there is one. A next segment of
+            // other rules may only be empty: what it holds cannot be replayed under these.
+            match self.segments.get(index + 1).copied() {
                 Some(next) => {
+                    let path = self.dir.join(segment_name(next.first_seq));
+                    let mut file = self.storage.open(&path)?;
+                    if next.rules != self.rules {
+                        if holds_records(&mut file, self.last_seq)? {
+                            return Err(Error::RulesMismatch {
+                                file: path,
+                                found: next.rules,
+                            });
+                        }
+                        break;
+                    }
                     index += 1;
-                    self.file = self
-                        .storage
-                        .open(&self.dir.join(segment_name(next.first_seq)))?;
+                    self.file = file;
                     self.slot = 0;
                 }
                 None => break,
             }
+        }
+        if clean.is_some_and(|clean| clean > self.last_seq) {
+            return Err(Error::Corrupt {
+                file: self.dir.join(CLEAN),
+                detail: format!(
+                    "a clean shutdown had {} durable, but the journal ends at {}",
+                    clean.unwrap(),
+                    self.last_seq
+                ),
+            });
         }
         self.cut(index, report)?;
         self.rewrite_unvouched(vouched, report)?;
@@ -578,109 +664,56 @@ impl<S: Storage> Journal<S> {
     /// Writes the records after `vouched` again, so that the sync after it really puts them
     /// on disk. After a failed sync, Linux marks the pages clean although they never reached
     /// the disk; a process that reopens the journal without a reboot reads them from the
-    /// cache, and a plain sync would do nothing for them.
+    /// cache, and a plain sync would do nothing for them. Each segment other than the
+    /// current one is synced once; replay syncs the current one.
     fn rewrite_unvouched(&mut self, vouched: Seq, report: &mut JournalReport) -> Result<(), Error> {
         let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
-        let mut seq = vouched + 1;
-        while seq <= self.last_seq {
-            let segment = *self
-                .segments
-                .iter()
-                .rfind(|s| s.covers(seq))
-                .expect("a replayed record's segment");
-            let slot = (seq - segment.first_seq) as u32;
-            let count = (self.last_seq - seq + 1)
-                .min(READ_RECORDS as u64)
-                .min(u64::from(segment.capacity - slot)) as usize;
-            let bytes = &mut chunk[..count * RECORD_SIZE];
-            let offset = segment.offset(slot);
-            if segment == *self.current() {
-                self.file.read_at(offset, bytes)?;
-                self.file.write_at(offset, bytes)?;
-            } else {
-                // A full segment before the current one, synced when the next was created,
-                // but perhaps only into a failed write-back.
-                let mut file = self
-                    .storage
-                    .open(&self.dir.join(segment_name(segment.first_seq)))?;
+        let current = *self.current();
+        for segment in self.segments.clone() {
+            let end = segment.first_seq + u64::from(segment.capacity) - 1;
+            let (from, to) = ((vouched + 1).max(segment.first_seq), self.last_seq.min(end));
+            if from > to {
+                continue;
+            }
+            let mut other = None;
+            if segment != current {
+                other = Some(
+                    self.storage
+                        .open(&self.dir.join(segment_name(segment.first_seq)))?,
+                );
+            }
+            let mut seq = from;
+            while seq <= to {
+                let count = (to - seq + 1).min(READ_RECORDS as u64) as usize;
+                let bytes = &mut chunk[..count * RECORD_SIZE];
+                let offset = segment.offset((seq - segment.first_seq) as u32);
+                let file = other.as_mut().unwrap_or(&mut self.file);
                 file.read_at(offset, bytes)?;
                 file.write_at(offset, bytes)?;
+                seq += count as u64;
+                report.rewritten_records += count as u64;
+            }
+            if let Some(mut file) = other {
                 file.sync()?;
             }
-            seq += count as u64;
-            report.rewritten_records += count as u64;
         }
         Ok(())
-    }
-
-    /// Reads the commands `from..=to` and passes them to `apply`, without changing anything.
-    /// Returns `false` if the journal does not hold all of them intact, under the current
-    /// configuration and rules.
-    pub(crate) fn read(
-        &mut self,
-        from: Seq,
-        to: Seq,
-        mut apply: impl FnMut(Seq, Command),
-    ) -> Result<bool, Error> {
-        let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
-        let mut next = from;
-        while next <= to {
-            let Some(listed) = self.segments.iter().rfind(|s| s.covers(next)).copied() else {
-                return Ok(false);
-            };
-            let mut file = self
-                .storage
-                .open(&self.dir.join(segment_name(listed.first_seq)))?;
-            let header = match read_header(&mut file)? {
-                Ok(header)
-                    if header.first_seq == listed.first_seq
-                        && header.fingerprint == self.fingerprint
-                        && header.rules == self.rules =>
-                {
-                    header
-                }
-                _ => return Ok(false),
-            };
-            let mut slot = (next - header.first_seq) as u32;
-            while next <= to && slot < header.capacity {
-                let filled = read_slots(&mut file, &header, slot, &mut chunk)?;
-                for bytes in chunk[..filled * RECORD_SIZE].chunks_exact(RECORD_SIZE) {
-                    if next > to {
-                        break;
-                    }
-                    match decode_record(bytes) {
-                        Slot::Record { seq, command, .. } if seq == next => apply(seq, command),
-                        _ => return Ok(false),
-                    }
-                    next += 1;
-                }
-                slot += filled as u32;
-            }
-        }
-        Ok(true)
-    }
-
-    /// Creates the file for the segment after the current one, under its temporary name.
-    fn prepare(&mut self, first_seq: Seq) -> Result<Prepared<S::File>, Error> {
-        Ok(Prepared {
-            file: self
-                .storage
-                .create(&self.dir.join(prepared_name(first_seq)))?,
-            first_seq,
-            capacity: self.capacity,
-            filled: 0,
-        })
     }
 
     /// Writes zeros into the next segment for the records appended since the last piece,
     /// twice as fast as records arrive, so it is ready long before it is needed.
     fn prefill(&mut self, records: usize) -> Result<(), Error> {
         if self.next.is_none() {
-            let first_seq = self.current().first_seq + u64::from(self.current().capacity);
-            self.next = Some(self.prepare(first_seq)?);
+            let header = Header {
+                first_seq: self.current().first_seq + u64::from(self.current().capacity),
+                fingerprint: self.fingerprint,
+                capacity: self.capacity,
+                rules: self.rules,
+            };
+            self.next = Some(prepare(&mut self.storage, &self.dir, header)?);
         }
         let next = self.next.as_mut().expect("a prepared segment");
-        let body = u64::from(next.capacity) * RECORD_SIZE as u64;
+        let body = u64::from(next.header.capacity) * RECORD_SIZE as u64;
         self.owed += 2 * (records * RECORD_SIZE) as u64;
         while next.filled < body && (self.owed >= PIECE as u64 || self.owed >= body - next.filled) {
             let n = (body - next.filled).min(PIECE as u64);
@@ -692,49 +725,52 @@ impl<S: Storage> Journal<S> {
         Ok(())
     }
 
-    /// Makes the segment starting at `first_seq` the current one: finishes filling it with
-    /// zeros, writes its header, makes both durable, gives it its final name and makes that
-    /// durable, all before any record is written into it. Writing the zeros, rather than
-    /// only setting the length, makes the file system allocate every block: appends then
-    /// overwrite allocated blocks in place, and a data sync has no block allocation to
-    /// record. It also replaces whatever an earlier file of the same name left there.
-    fn start_segment(&mut self, first_seq: Seq) -> Result<(), Error> {
-        let mut next = match self.next.take() {
-            Some(next) if next.first_seq == first_seq => next,
-            _ => self.prepare(first_seq)?,
-        };
-        let header = Header {
-            first_seq,
-            fingerprint: self.fingerprint,
-            capacity: next.capacity,
-            rules: self.rules,
-        };
-        let body = u64::from(next.capacity) * RECORD_SIZE as u64;
-        while next.filled < body {
-            let n = (body - next.filled).min(PIECE as u64);
-            next.file
-                .write_at(HEADER_SIZE + next.filled, &ZEROS[..n as usize])?;
-            next.filled += n;
-        }
-        next.file.write_at(0, &header.encode())?;
-        next.file.sync()?;
-        self.storage.rename(
-            &self.dir.join(prepared_name(first_seq)),
-            &self.dir.join(segment_name(first_seq)),
-        )?;
-        self.storage.sync_dir(&self.dir)?;
-        self.file = next.file;
-        self.segments.push(header);
-        self.slot = 0;
-        self.owed = 0;
-        Ok(())
-    }
-
     /// Starts the next segment, after making the current one durable: a segment exists
     /// only once every record before it is on disk.
     fn roll(&mut self) -> Result<(), Error> {
         self.sync()?;
-        self.start_segment(self.last_seq + 1)
+        let first_seq = self.last_seq + 1;
+        let prepared = match self.next.take() {
+            Some(prepared) if prepared.header.first_seq == first_seq => prepared,
+            _ => {
+                let header = Header {
+                    first_seq,
+                    fingerprint: self.fingerprint,
+                    capacity: self.capacity,
+                    rules: self.rules,
+                };
+                prepare(&mut self.storage, &self.dir, header)?
+            }
+        };
+        let header = prepared.header;
+        self.file = finish(&mut self.storage, &self.dir, prepared)?;
+        self.segments.push(header);
+        self.slot = 0;
+        self.owed = 0;
+        self.paused = false;
+        Ok(())
+    }
+
+    /// Syncs the journal and records that everything in it is durable, so the next
+    /// recovery need not write anything again.
+    pub(crate) fn close(&mut self) -> Result<(), Error> {
+        self.sync()?;
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&CLEAN_MAGIC);
+        bytes[8..16].copy_from_slice(&self.last_seq.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..16]);
+        bytes[16..20].copy_from_slice(&crc.to_le_bytes());
+        let mut file = self.storage.create(&self.dir.join(CLEAN))?;
+        file.write_at(0, &bytes)?;
+        file.sync()?;
+        self.storage.sync_dir(&self.dir)?;
+        Ok(())
+    }
+
+    /// Why preparing the next segment failed, if it did since the last call. Appending goes
+    /// on; the segment is prepared again when it is needed.
+    pub(crate) fn take_prepare_failure(&mut self) -> Option<Error> {
+        self.prepare_failure.take()
     }
 
     fn current(&self) -> &Header {
@@ -766,7 +802,15 @@ impl<S: Storage> Journal<S> {
             self.slot += n as u32;
             self.last_seq += n as u64;
             rest = &rest[n..];
-            self.prefill(n)?;
+            // The records are written; a failure to prepare the next segment, such as a
+            // full disk, is not theirs. Preparing stops until the roll, which tries again.
+            if !self.paused {
+                if let Err(error) = self.prefill(n) {
+                    self.next = None;
+                    self.paused = true;
+                    self.prepare_failure = Some(error);
+                }
+            }
         }
         Ok(self.last_seq)
     }
@@ -815,8 +859,9 @@ impl<S: Storage> Journal<S> {
     }
 }
 
-/// Whether a segment file, whose header cannot be trusted, holds any valid record.
-fn holds_records<F: StorageFile>(file: &mut F) -> Result<bool, Error> {
+/// Whether a segment file, whose header may not be trusted, holds a valid record of a
+/// sequence number after `after`.
+fn holds_records<F: StorageFile>(file: &mut F, after: Seq) -> Result<bool, Error> {
     let len = file.size()?;
     let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
     let mut offset = HEADER_SIZE;
@@ -829,12 +874,141 @@ fn holds_records<F: StorageFile>(file: &mut F) -> Result<bool, Error> {
         file.read_at(offset, &mut chunk[..n])?;
         if chunk[..n]
             .chunks_exact(RECORD_SIZE)
-            .any(|bytes| matches!(decode_record(bytes), Slot::Record { .. }))
+            .any(|bytes| matches!(decode_record(bytes), Slot::Record { seq, .. } if seq > after))
         {
             return Ok(true);
         }
         offset += n as u64;
     }
+}
+
+/// The first sequence numbers of the segments in `dir`, in order.
+fn segment_names<S: Storage>(storage: &mut S, dir: &Path) -> Result<Vec<Seq>, Error> {
+    let mut names: Vec<Seq> = storage
+        .list(dir)?
+        .iter()
+        .filter_map(|name| segment_seq(name))
+        .collect();
+    names.sort_unstable();
+    Ok(names)
+}
+
+/// The file a clean shutdown leaves: the sequence number up to which everything was synced.
+const CLEAN: &str = "journal.clean";
+const CLEAN_MAGIC: [u8; 8] = *b"LMECLEAN";
+
+/// The sequence number a clean shutdown recorded as durable, if the marker is there and
+/// intact.
+fn read_clean<S: Storage>(storage: &mut S, dir: &Path) -> Result<Option<Seq>, Error> {
+    if !storage.list(dir)?.iter().any(|name| name == CLEAN) {
+        return Ok(None);
+    }
+    let mut bytes = [0; 24];
+    let read = storage.open(&dir.join(CLEAN))?.read_at(0, &mut bytes);
+    let crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    Ok(
+        (read.is_ok() && bytes[..8] == CLEAN_MAGIC && crc == crc32fast::hash(&bytes[..16]))
+            .then(|| u64::from_le_bytes(bytes[8..16].try_into().unwrap())),
+    )
+}
+
+/// Creates the file for the segment `header` describes, under its temporary name.
+fn prepare<S: Storage>(
+    storage: &mut S,
+    dir: &Path,
+    header: Header,
+) -> Result<Prepared<S::File>, Error> {
+    Ok(Prepared {
+        file: storage.create(&dir.join(prepared_name(header.first_seq)))?,
+        header,
+        filled: 0,
+    })
+}
+
+/// Makes a prepared segment ready for records: finishes filling it with zeros, writes its
+/// header, makes both durable, gives it its final name and makes that durable. Writing the
+/// zeros, rather than only setting the length, makes the file system allocate every block:
+/// appends then overwrite allocated blocks in place, and a data sync has no block allocation
+/// to record. It also replaces whatever an earlier file of the same name left there.
+fn finish<S: Storage>(
+    storage: &mut S,
+    dir: &Path,
+    mut prepared: Prepared<S::File>,
+) -> Result<S::File, Error> {
+    let header = prepared.header;
+    let body = u64::from(header.capacity) * RECORD_SIZE as u64;
+    while prepared.filled < body {
+        let n = (body - prepared.filled).min(PIECE as u64);
+        prepared
+            .file
+            .write_at(HEADER_SIZE + prepared.filled, &ZEROS[..n as usize])?;
+        prepared.filled += n;
+    }
+    prepared.file.write_at(0, &header.encode())?;
+    prepared.file.sync()?;
+    storage.rename(
+        &dir.join(prepared_name(header.first_seq)),
+        &dir.join(segment_name(header.first_seq)),
+    )?;
+    storage.sync_dir(dir)?;
+    Ok(prepared.file)
+}
+
+/// Reads the commands `from..=to` from the journal in `dir` and passes them to `apply`,
+/// without changing anything. Returns why not, if the journal does not hold all of them
+/// intact under the expected configuration and rules.
+pub(crate) fn read_range<S: Storage>(
+    storage: &mut S,
+    dir: &Path,
+    expect: Expect,
+    from: Seq,
+    to: Seq,
+    mut apply: impl FnMut(Seq, Command),
+) -> Result<Result<(), String>, Error> {
+    let names = segment_names(storage, dir)?;
+    let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
+    let mut next = from;
+    while next <= to {
+        let Some(&first_seq) = names.iter().rfind(|&&seq| seq <= next) else {
+            return Ok(Err(format!("no segment holds {next}")));
+        };
+        let mut file = match storage.open(&dir.join(segment_name(first_seq))) {
+            Ok(file) => file,
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        let header = match read_header(&mut file) {
+            Ok(Ok(header))
+                if header.first_seq == first_seq
+                    && header.fingerprint == expect.fingerprint
+                    && header.rules == expect.rules
+                    && header.covers(next) =>
+            {
+                header
+            }
+            Ok(Ok(_)) => return Ok(Err(format!("the segment for {next} does not fit"))),
+            Ok(Err(_)) => return Ok(Err(format!("the segment for {next} is damaged"))),
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        let mut slot = (next - header.first_seq) as u32;
+        while next <= to && slot < header.capacity {
+            let filled = match read_slots(&mut file, &header, slot, &mut chunk) {
+                Ok(filled) => filled,
+                Err(error) => return Ok(Err(error.to_string())),
+            };
+            for bytes in chunk[..filled * RECORD_SIZE].chunks_exact(RECORD_SIZE) {
+                if next > to {
+                    break;
+                }
+                match decode_record(bytes) {
+                    Slot::Record { seq, command, .. } if seq == next => apply(seq, command),
+                    _ => return Ok(Err(format!("the record for {next} is missing"))),
+                }
+                next += 1;
+            }
+            slot += filled as u32;
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// Reads slots from `first` on into `chunk`, as many as fit and the segment holds, and

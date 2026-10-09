@@ -87,6 +87,16 @@ pub enum Error {
         /// The newer snapshot's sequence number.
         seq: Seq,
     },
+    /// The consumer has handled events of commands the journal no longer holds: a power
+    /// failure took them back after their events were delivered, which only
+    /// [`SyncPolicy::Os`] allows. The consumer must undo what it did
+    /// after `journal`.
+    ConsumerAhead {
+        /// The last sequence number the consumer has handled.
+        consumer: Seq,
+        /// The last sequence number in the journal.
+        journal: Seq,
+    },
 }
 
 impl fmt::Display for Error {
@@ -124,6 +134,10 @@ impl fmt::Display for Error {
             Error::Divergence { seq } => write!(
                 f,
                 "replaying the journal does not reach the state of the snapshot at {seq}"
+            ),
+            Error::ConsumerAhead { consumer, journal } => write!(
+                f,
+                "the consumer has handled up to {consumer}, but the journal ends at {journal}"
             ),
         }
     }

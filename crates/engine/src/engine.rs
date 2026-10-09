@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use orderbook::{BookConfig, BookSnapshot, Command, Event, EventSink, OrderBook, Phase};
 
-use crate::journal::{Expect, Journal, JournalReport};
+use crate::journal::{self, Expect, Journal, JournalReport};
 use crate::snapshots;
 use crate::storage::{FsStorage, Storage};
 use crate::{Error, Seq};
@@ -76,6 +76,8 @@ pub struct RecoveryReport {
     /// The snapshot whose state replaying the journal from the one before it (or from the
     /// start) reproduced, if [`EngineConfig::verify_replay`] found the means to check.
     pub verified: Option<Seq>,
+    /// Why the snapshot recovery started from could not be verified, if it could not.
+    pub unverified: Option<String>,
     /// What replaying the journal found and did.
     pub journal: JournalReport,
 }
@@ -84,11 +86,24 @@ pub struct RecoveryReport {
 ///
 /// A command's events arrive while it is applied, after it was journaled. If the process
 /// stops in between, they are lost with it; recovery replays the command and delivers them
-/// again with the same sequence number. A consumer that remembers the last sequence number
-/// it has fully handled can therefore skip what it has seen, and loses nothing.
+/// again with the same sequence number.
+///
+/// A consumer that remembers the last sequence number it has fully handled says so through
+/// [`resume_after`](Output::resume_after). Recovery then starts from a snapshot no later
+/// than that, delivers the events of exactly the commands after it, and refuses with
+/// [`Error::ConsumerAhead`] if the consumer has seen events of commands the journal no
+/// longer holds, which a power failure under [`SyncPolicy::Os`] can cause. The journal and
+/// snapshots must reach back to where the slowest consumer stands.
 pub trait Output {
     /// Called once per event, in order.
     fn on_event(&mut self, seq: Seq, event: Event);
+
+    /// The sequence number of the last command whose events this consumer has fully
+    /// handled, or `None` if it does not keep track: then recovery starts from the newest
+    /// snapshot and delivers the events of the commands after it.
+    fn resume_after(&self) -> Option<Seq> {
+        None
+    }
 }
 
 impl Output for Vec<(Seq, Event)> {
@@ -189,13 +204,24 @@ impl<S: Storage> Engine<S> {
             dir: dir.to_owned(),
         })?;
         snapshots::remove_partial(&mut storage, dir)?;
+        let expect = Expect {
+            fingerprint: fingerprint(&config.book),
+            rules: orderbook::RULES_VERSION,
+            capacity: config.segment_capacity,
+        };
+        let resume = out.resume_after();
 
-        // The newest snapshot that loads. Damaged ones are only set aside once everything
-        // else has worked; anything but damage, a read error included, stops recovery.
+        // The newest snapshot that loads, and is no later than what the consumer has
+        // handled. Damaged ones are only set aside once everything else has worked; anything
+        // but damage, a read error included, stops recovery.
         let mut report = RecoveryReport::default();
         let snapshot_seqs = snapshots::list(&mut storage, dir)?;
         let mut start = None;
-        for &seq in snapshot_seqs.iter().rev() {
+        for &seq in snapshot_seqs
+            .iter()
+            .rev()
+            .filter(|&&seq| resume.is_none_or(|resume| seq <= resume))
+        {
             match snapshots::read(&mut storage, dir, seq, &config.book) {
                 Ok(book) => {
                     start = Some((seq, book));
@@ -207,57 +233,69 @@ impl<S: Storage> Engine<S> {
         }
         let (after, mut book) = start.unwrap_or_else(|| (0, OrderBook::new(config.book)));
         report.snapshot = (after > 0).then_some(after);
-        let digest_at_snapshot = book.digest();
 
-        let (mut journal, journal_report) = Journal::open(
-            storage,
-            dir,
-            Expect {
-                fingerprint: fingerprint(&config.book),
-                rules: orderbook::RULES_VERSION,
-                capacity: config.segment_capacity,
-            },
-            after,
-            |seq, command| {
-                book.process(
-                    command,
-                    &mut Tagged {
-                        seq,
-                        out: &mut *out,
-                    },
-                );
+        // Check that the journal replays to the snapshot, before anything is repaired or
+        // delivered.
+        if config.verify_replay && after > 0 {
+            let older = snapshot_seqs.iter().rev().copied().find(|&seq| seq < after);
+            let base = match older {
+                Some(seq) => match snapshots::read(&mut storage, dir, seq, &config.book) {
+                    Ok(book) => Ok((seq, book)),
+                    Err(Error::Corrupt { detail, .. }) => {
+                        report.damaged_snapshots.push((seq, detail.clone()));
+                        Err(format!("the snapshot at {seq} is damaged: {detail}"))
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => Ok((0, OrderBook::new(config.book))),
+            };
+            match base {
+                Ok((from, mut replica)) => {
+                    let replayed =
+                        journal::read_range(&mut storage, dir, expect, from + 1, after, |_, c| {
+                            replica.process(c, &mut Discard);
+                        })?;
+                    match replayed {
+                        Ok(()) if replica.digest() == book.digest() => {
+                            report.verified = Some(after);
+                        }
+                        Ok(()) => return Err(Error::Divergence { seq: after }),
+                        Err(reason) => report.unverified = Some(reason),
+                    }
+                }
+                Err(reason) => report.unverified = Some(reason),
+            }
+        }
+
+        let (journal, journal_report) =
+            Journal::open(storage, dir, expect, after, |seq, command| {
+                if resume.is_none_or(|resume| seq > resume) {
+                    book.process(
+                        command,
+                        &mut Tagged {
+                            seq,
+                            out: &mut *out,
+                        },
+                    );
+                } else {
+                    book.process(command, &mut Discard);
+                }
                 Ok(())
-            },
-        )?;
+            })?;
         report.journal = journal_report;
+        let mut journal = journal;
+        if let Some(resume) = resume.filter(|&resume| resume > journal.last_seq()) {
+            return Err(Error::ConsumerAhead {
+                consumer: resume,
+                journal: journal.last_seq(),
+            });
+        }
 
         // Not synced: if a rename is lost, the next recovery finds the damage again.
         let storage = journal.storage();
         for (seq, _) in &report.damaged_snapshots {
             let path = snapshots::path(dir, *seq);
             storage.rename(&path, &path.with_extension("damaged"))?;
-        }
-
-        if config.verify_replay && after > 0 {
-            // The snapshot before the one recovery started from, or the empty book.
-            let older = snapshot_seqs.iter().rev().copied().find(|&seq| seq < after);
-            let base = match older {
-                Some(seq) => snapshots::read(journal.storage(), dir, seq, &config.book)
-                    .ok()
-                    .map(|book| (seq, book)),
-                None => Some((0, OrderBook::new(config.book))),
-            };
-            if let Some((from, mut replica)) = base {
-                let complete = journal.read(from + 1, after, |_, command| {
-                    replica.process(command, &mut Discard);
-                })?;
-                if complete {
-                    if replica.digest() != digest_at_snapshot {
-                        return Err(Error::Divergence { seq: after });
-                    }
-                    report.verified = Some(after);
-                }
-            }
         }
 
         Ok((
@@ -296,7 +334,7 @@ impl<S: Storage> Engine<S> {
     ///
     /// A due automatic snapshot is taken first. If it fails, the batch goes ahead anyway,
     /// the next attempt waits another `snapshot_every` commands, and
-    /// [`take_snapshot_failure`](Self::take_snapshot_failure) says why.
+    /// [`take_failure`](Self::take_failure) says why.
     pub fn submit_batch<O: Output>(
         &mut self,
         commands: &[Command],
@@ -343,10 +381,15 @@ impl<S: Storage> Engine<S> {
         self.journal.sync().inspect_err(|_| self.poisoned = true)
     }
 
-    /// Syncs the journal and closes the engine. Dropping an engine closes it too, but
-    /// without the sync under [`SyncPolicy::Os`], and without a chance to report an error.
+    /// Syncs the journal, records that everything in it is durable, and closes the engine.
+    /// The record spares the next recovery from writing the journal's tail again. Dropping
+    /// an engine closes it too, but without the sync under [`SyncPolicy::Os`], without the
+    /// record, and without a chance to report an error.
     pub fn close(mut self) -> Result<(), Error> {
-        self.sync()
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.journal.close()
     }
 
     /// Writes a snapshot of the book now, after syncing the journal, reads it back to check
@@ -391,6 +434,8 @@ impl<S: Storage> Engine<S> {
         for &old in &seqs[..keep_from] {
             snapshots::remove(storage, &self.dir, old)?;
         }
+        // Damaged snapshots are kept for inspection only while they are among the newest.
+        snapshots::remove_damaged_before(storage, &self.dir, seqs[keep_from])?;
         storage.sync_dir(&self.dir)?;
         // Until there are as many snapshots as are kept, the whole journal stays, so a
         // damaged newest snapshot can fall back to an older one or to the start.
@@ -400,9 +445,13 @@ impl<S: Storage> Engine<S> {
         Ok(())
     }
 
-    /// Why the last automatic snapshot failed, if one did since the last call.
-    pub fn take_snapshot_failure(&mut self) -> Option<Error> {
-        self.snapshot_failure.take()
+    /// The last failure that did not stop the engine, if there was one since the last call:
+    /// an automatic snapshot that could not be taken, or a next journal segment that could
+    /// not be prepared (it is prepared again when it is needed).
+    pub fn take_failure(&mut self) -> Option<Error> {
+        self.snapshot_failure
+            .take()
+            .or_else(|| self.journal.take_prepare_failure())
     }
 
     /// The book.

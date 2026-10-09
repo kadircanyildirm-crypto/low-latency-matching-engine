@@ -161,6 +161,23 @@ pub(crate) fn read<S: Storage>(
     Ok(book)
 }
 
+/// Deletes the snapshots set aside as damaged that are older than `seq`.
+pub(crate) fn remove_damaged_before<S: Storage>(
+    storage: &mut S,
+    dir: &Path,
+    seq: Seq,
+) -> Result<(), Error> {
+    for name in storage.list(dir)? {
+        let old = name
+            .strip_suffix(".damaged")
+            .and_then(|stem| snapshot_seq(&format!("{stem}.snap")));
+        if old.is_some_and(|old| old < seq) {
+            storage.remove(&dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
 /// Deletes the snapshot taken after command `seq`.
 pub(crate) fn remove<S: Storage>(storage: &mut S, dir: &Path, seq: Seq) -> Result<(), Error> {
     storage.remove(&dir.join(snapshot_name(seq)))?;

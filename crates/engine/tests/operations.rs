@@ -114,10 +114,15 @@ fn opening_verifies_replay_against_the_newest_snapshot() {
     let mut to = storage.clone();
     let mut file = to.create(&path).unwrap();
     file.write_at(0, &bytes).unwrap();
+    // Refused before anything is repaired or delivered.
+    let files = storage.files();
+    let mut delivered: Vec<(Seq, Event)> = Vec::new();
     assert!(matches!(
-        open(&storage, config),
+        Engine::open_with(storage.clone(), Path::new(DIR), config, &mut delivered),
         Err(Error::Divergence { seq: 90 })
     ));
+    assert!(delivered.is_empty());
+    assert_eq!(storage.files(), files);
 }
 
 /// A snapshot that cannot be written does not stop trading: the batch goes ahead, the
@@ -137,8 +142,8 @@ fn a_failing_snapshot_does_not_stop_trading() {
     for &command in &commands[..25] {
         engine.submit(command, &mut events).unwrap();
     }
-    assert!(engine.take_snapshot_failure().is_some());
-    assert!(engine.take_snapshot_failure().is_none());
+    assert!(engine.take_failure().is_some());
+    assert!(engine.take_failure().is_none());
     assert_eq!(engine.last_snapshot(), 0);
     storage.set_failing_names(None);
     for &command in &commands[25..] {
@@ -347,9 +352,10 @@ fn snapshots_every_zero_commands_panics() {
     );
 }
 
-/// A panic while the book applies a command leaves the engine poisoned.
+/// A panic while a command is applied, in the book or in the output, leaves the engine
+/// poisoned.
 #[test]
-fn a_panic_in_the_book_poisons_the_engine() {
+fn a_panic_while_applying_a_command_poisons_the_engine() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     struct Explode;
     impl engine::Output for Explode {
@@ -374,4 +380,217 @@ fn a_panic_in_the_book_poisons_the_engine() {
     let (engine, _) = open(&storage, small(book)).unwrap();
     assert_eq!(engine.last_seq(), 1);
     let _: Command = commands[0];
+}
+
+/// Rewrites the rules version in the header of the segment starting at `first`, keeping
+/// the checksum valid, as if an earlier version of the rules had written it.
+fn set_rules(storage: &SimStorage, first: u64, rules: u32) {
+    let path = Path::new(DIR).join(format!("journal-{first:020}.log"));
+    let mut fs = storage.clone();
+    let mut file = fs.open(&path).unwrap();
+    let mut header = [0; 64];
+    file.read_at(0, &mut header).unwrap();
+    header[36..40].copy_from_slice(&rules.to_le_bytes());
+    let crc = crc32fast::hash(&header[..60]);
+    header[60..].copy_from_slice(&crc.to_le_bytes());
+    file.write_at(0, &header).unwrap();
+}
+
+/// The upgrade path: the old version takes a snapshot as it stops, and the new one, under
+/// other rules, starts from it, cuts the old journal there and goes on in a new segment.
+#[test]
+fn a_new_rules_version_starts_from_the_old_versions_snapshot() {
+    let (book, commands) = common::flow(63, 40);
+    let digests = common::digests(book, &commands);
+    for at in [25, 30] {
+        let storage = SimStorage::new();
+        let (mut engine, _) = open(&storage, small(book)).unwrap();
+        let mut events: Vec<(Seq, Event)> = Vec::new();
+        engine.submit_batch(&commands[..at], &mut events).unwrap();
+        engine.snapshot().unwrap();
+        engine.close().unwrap();
+        for first in [1, 11, 21] {
+            set_rules(&storage, first, orderbook::RULES_VERSION + 1);
+        }
+        let (mut engine, report) =
+            open(&storage, small(book)).unwrap_or_else(|e| panic!("{at}: {e}"));
+        assert_eq!(engine.last_seq(), at as u64);
+        assert_eq!(engine.book().digest(), digests[at]);
+        assert!(
+            report.unverified.is_some(),
+            "{at}: other rules cannot be replayed"
+        );
+        engine.submit_batch(&commands[at..], &mut events).unwrap();
+        drop(engine);
+        let (engine, _) = open(&storage, small(book)).unwrap();
+        assert_eq!(engine.book().digest(), digests[40], "{at}");
+    }
+}
+
+/// Commands written under other rules after the snapshot cannot be replayed.
+#[test]
+fn commands_under_other_rules_after_the_snapshot_are_refused() {
+    let (book, commands) = common::flow(64, 30);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    engine.submit_batch(&commands[..15], &mut events).unwrap();
+    engine.snapshot().unwrap();
+    engine.submit_batch(&commands[15..], &mut events).unwrap();
+    drop(engine);
+    set_rules(&storage, 11, orderbook::RULES_VERSION + 1);
+    assert!(matches!(
+        open(&storage, small(book)),
+        Err(Error::RulesMismatch { .. })
+    ));
+}
+
+/// A consumer that tracks its position gets exactly the events after it, even when it is
+/// behind the newest snapshot; one that has seen commands a power failure took back is told.
+#[test]
+fn consumers_resume_where_they_stood() {
+    struct Consumer {
+        handled: Seq,
+        events: Vec<(Seq, Event)>,
+    }
+    impl engine::Output for Consumer {
+        fn on_event(&mut self, seq: Seq, event: Event) {
+            self.events.push((seq, event));
+        }
+        fn resume_after(&self) -> Option<Seq> {
+            Some(self.handled)
+        }
+    }
+    let (book, commands) = common::flow(65, 100);
+    let config = EngineConfig {
+        snapshot_every: Some(20),
+        keep_snapshots: 3,
+        ..small(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut all: Vec<(Seq, Event)> = Vec::new();
+    for &command in &commands {
+        engine.submit(command, &mut all).unwrap();
+    }
+    drop(engine);
+    // Snapshots at 40, 60 and 80 are kept; the consumer stands at 70.
+    let mut consumer = Consumer {
+        handled: 70,
+        events: Vec::new(),
+    };
+    let (engine, report) =
+        Engine::open_with(storage.clone(), Path::new(DIR), config, &mut consumer).unwrap();
+    assert_eq!(report.snapshot, Some(60));
+    assert_eq!(engine.last_seq(), 100);
+    let expected: Vec<_> = all.iter().filter(|(seq, _)| *seq > 70).cloned().collect();
+    assert_eq!(consumer.events, expected);
+    drop(engine);
+
+    // Under the OS policy, a power failure takes back what was not synced; a consumer that
+    // had handled it is told, rather than skipping the new commands of the same numbers.
+    let os = EngineConfig {
+        sync: SyncPolicy::Os,
+        ..small(book)
+    };
+    let mut told = 0;
+    for seed in 0..20 {
+        let storage = SimStorage::new();
+        let (mut engine, _) = open(&storage, os).unwrap();
+        let mut seen: Vec<(Seq, Event)> = Vec::new();
+        engine.submit_batch(&commands[..20], &mut seen).unwrap();
+        engine.sync().unwrap();
+        engine.submit_batch(&commands[20..25], &mut seen).unwrap();
+        drop(engine);
+        let crashed = storage.crash(&mut SplitMix64::new(seed), CrashModel::InOrder);
+        let mut consumer = Consumer {
+            handled: 25,
+            events: Vec::new(),
+        };
+        match Engine::open_with(crashed, Path::new(DIR), os, &mut consumer) {
+            Ok((engine, _)) => assert_eq!(engine.last_seq(), 25, "everything survived"),
+            Err(Error::ConsumerAhead { consumer, journal }) => {
+                assert_eq!(consumer, 25);
+                assert!((20..25).contains(&journal));
+                told += 1;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    assert!(told > 0);
+}
+
+/// A prepared segment that cannot be written does not stop trading: the records are
+/// journaled, the failure is reported, and the segment is prepared again at the roll.
+#[test]
+fn a_failing_preparation_does_not_stop_trading() {
+    let (book, commands) = common::flow(66, 25);
+    let digests = common::digests(book, &commands);
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, small(book)).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    storage.set_failing_names(Some(".next"));
+    engine.submit_batch(&commands[..5], &mut events).unwrap();
+    assert!(engine.take_failure().is_some());
+    engine.submit_batch(&commands[5..9], &mut events).unwrap();
+    storage.set_failing_names(None);
+    engine.submit_batch(&commands[9..], &mut events).unwrap();
+    assert_eq!(engine.book().digest(), digests[25]);
+    drop(engine);
+    let (engine, _) = open(&storage, small(book)).unwrap();
+    assert_eq!(engine.book().digest(), digests[25]);
+}
+
+/// After a clean shutdown, nothing has to be written again; and if the journal then ends
+/// before what the shutdown recorded as durable, that is damage, not a crash.
+#[test]
+fn a_clean_shutdown_is_recorded() {
+    let (book, commands) = common::flow(67, 30);
+    let os = EngineConfig {
+        sync: SyncPolicy::Os,
+        ..small(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, os).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    engine.submit_batch(&commands[..25], &mut events).unwrap();
+    engine.close().unwrap();
+    let (engine, report) = open(&storage, os).unwrap();
+    assert_eq!(engine.last_seq(), 25);
+    assert_eq!(report.journal.rewritten_records, 0);
+    engine.close().unwrap();
+    // The last record, which no later record vouches for, is damaged.
+    storage.flip_bit(
+        &Path::new(DIR).join("journal-00000000000000000021.log"),
+        (64 + 4 * 64) * 8 + 100,
+    );
+    assert!(matches!(open(&storage, os), Err(Error::Corrupt { .. })));
+}
+
+/// A segment missing among the ones only older snapshots need costs only the verification.
+#[test]
+fn a_missing_older_segment_only_skips_verification() {
+    let (book, commands) = common::flow(68, 100);
+    let digests = common::digests(book, &commands);
+    let config = EngineConfig {
+        snapshot_every: Some(30),
+        ..small(book)
+    };
+    let storage = SimStorage::new();
+    let (mut engine, _) = open(&storage, config).unwrap();
+    let mut events: Vec<(Seq, Event)> = Vec::new();
+    for &command in &commands {
+        engine.submit(command, &mut events).unwrap();
+    }
+    drop(engine);
+    // Snapshots at 60 and 90; segments 61 to 100 are kept. Recovery from 90 needs only 91.
+    storage
+        .clone()
+        .remove(&Path::new(DIR).join("journal-00000000000000000071.log"))
+        .unwrap();
+    let (engine, report) = open(&storage, config).unwrap();
+    assert_eq!(report.snapshot, Some(90));
+    assert_eq!(report.verified, None);
+    assert!(report.unverified.is_some());
+    assert_eq!(engine.book().digest(), digests[100]);
 }

@@ -189,17 +189,20 @@ fn records_left_by_a_failed_sync_are_written_again() {
     let (book, commands) = common::flow(55, 30);
     let digests = common::digests(book, &commands);
     for seed in 0..20 {
+        // Three records, or one.
+        let failed = if seed % 2 == 0 { 3 } else { 1 };
         let storage = SimStorage::new();
         let (mut engine, _) = open(&storage, small(book)).unwrap();
         let mut events = Vec::new();
         engine.submit_batch(&commands[..5], &mut events).unwrap();
         storage.set_failing_syncs(true);
-        assert!(engine.submit_batch(&commands[5..8], &mut events).is_err());
+        let batch = &commands[5..5 + failed];
+        assert!(engine.submit_batch(batch, &mut events).is_err());
         drop(engine);
         storage.set_failing_syncs(false);
         // The same boot: the records written before the failed sync are in the cache.
         let (engine, report) = open(&storage, small(book)).unwrap();
-        assert_eq!(engine.last_seq(), 8);
+        assert_eq!(engine.last_seq(), 5 + failed as u64);
         let claimed = engine.durable_seq() as usize;
         drop(engine);
         let crashed = storage.crash(&mut SplitMix64::new(seed), CrashModel::AnyOrder);
@@ -207,7 +210,7 @@ fn records_left_by_a_failed_sync_are_written_again() {
         let kept = engine.last_seq() as usize;
         assert!(kept >= claimed, "seed {seed}: {kept} of {claimed}");
         assert_eq!(engine.book().digest(), digests[kept]);
-        assert_eq!(report.journal.rewritten_records, 3);
+        assert_eq!(report.journal.rewritten_records, failed as u64);
     }
 }
 

@@ -649,38 +649,29 @@ impl<S: Storage> Journal<S> {
     /// Writes the records after `vouched` again, so that the sync after it really puts them
     /// on disk. After a failed sync, Linux marks the pages clean although they never reached
     /// the disk; a process that reopens the journal without a reboot reads them from the
-    /// cache, and a plain sync would do nothing for them. Each segment other than the
-    /// current one is synced once; replay syncs the current one.
+    /// cache, and a plain sync would do nothing for them. Each segment is synced once.
     fn rewrite_unvouched(&mut self, vouched: Seq, report: &mut JournalReport) -> Result<(), Error> {
         let mut chunk = vec![0; READ_RECORDS * RECORD_SIZE];
-        let current = *self.current();
         for segment in self.segments.clone() {
             let end = segment.first_seq + u64::from(segment.capacity) - 1;
             let (from, to) = ((vouched + 1).max(segment.first_seq), self.last_seq.min(end));
             if from > to {
                 continue;
             }
-            let mut other = None;
-            if segment != current {
-                other = Some(
-                    self.storage
-                        .open(&self.dir.join(segment_name(segment.first_seq)))?,
-                );
-            }
+            let mut file = self
+                .storage
+                .open(&self.dir.join(segment_name(segment.first_seq)))?;
             let mut seq = from;
             while seq <= to {
                 let count = (to - seq + 1).min(READ_RECORDS as u64) as usize;
                 let bytes = &mut chunk[..count * RECORD_SIZE];
                 let offset = segment.offset((seq - segment.first_seq) as u32);
-                let file = other.as_mut().unwrap_or(&mut self.file);
                 file.read_at(offset, bytes)?;
                 file.write_at(offset, bytes)?;
                 seq += count as u64;
                 report.rewritten_records += count as u64;
             }
-            if let Some(mut file) = other {
-                file.sync()?;
-            }
+            file.sync()?;
         }
         Ok(())
     }

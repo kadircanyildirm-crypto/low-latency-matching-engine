@@ -201,6 +201,31 @@ fn logins_are_checked() {
     ));
 }
 
+/// A login tells the last sequence number the exchange has taken, counting commands still
+/// waiting in the batch: every report the session gets after it carries a larger one.
+#[test]
+fn a_login_tells_the_last_sequence_number_taken() {
+    let mut exchange = exchange(&[account(1), account(2)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    for client_ref in 1..=3 {
+        exchange.receive(0, limit(client_ref, Side::Buy, 10, 1), 1, &mut mail);
+    }
+    exchange.flush(&mut mail).unwrap();
+    for client_ref in 4..=5 {
+        exchange.receive(0, limit(client_ref, Side::Buy, 10, 1), 1, &mut mail);
+    }
+    exchange.connect(1, 1);
+    exchange.receive(1, login(2), 1, &mut mail);
+    assert_eq!(
+        mail.take(1),
+        [Outbound::LoginAccepted {
+            account: 2,
+            last_seq: 5
+        }]
+    );
+}
+
 #[test]
 fn orders_get_sequential_ids_and_reports_reach_their_owners() {
     let mut exchange = exchange(&[account(1), account(2)]);

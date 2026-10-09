@@ -8,8 +8,8 @@ documented are worth more than five half-finished ones.
 |-------|-------|--------|
 | 1 | Matching core + test infrastructure + benchmarks | ✅ Done |
 | 2 | Event sourcing: journal + replay | ✅ Done |
-| 3 | Binary protocol + TCP gateway | ⏳ Next |
-| 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | — |
+| 3 | Binary protocol + TCP gateway | ✅ Done |
+| 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ⏳ Next |
 | 5 | Public web demo: paper trading against bots, live order book | — |
 | 6 | End-to-end measurement and optimisation on Linux | — |
 | 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
@@ -120,24 +120,44 @@ met.
 
 ---
 
-## Phase 3 — Binary protocol + TCP gateway
+## Phase 3 — Binary protocol + TCP gateway ✅
 
 **Goal:** accept orders from the outside world.
 
-- Fixed-length, little-endian messages: `NewOrder`, `Cancel`, `Modify`,
-  `ExecutionReport`, `Reject`, `Heartbeat`.
-- Framing, sessions (login / heartbeat / logout), mapping client order ids to exchange
-  order ids, and accounts, each mapped to one of the book's dense owner ids.
-- Exchange-assigned sequential order ids, which let the book replace its hash-map id index
-  with a directly indexed table.
-- Cancel-on-disconnect: the gateway sends the book's `CancelAll` when a session drops.
-- Per-session pre-trade risk: order count limits and throttling, so one participant cannot
-  fill the book.
-- Fuzzing the protocol decoder with `cargo-fuzz`.
-- A simple load-generating client.
+**Delivered** (`crates/protocol`, `crates/gateway`,
+[DESIGN.md §15](DESIGN.md#15-the-gateway))
+- A wire protocol of fixed-length, little-endian messages: login, logout, heartbeat, new
+  order (limit, market, stop, with time in force and iceberg display), cancel, modify and
+  mass cancel in; login accepted or rejected, logout with a reason, heartbeat, a gateway
+  reject and one report per event of the book out. Decoding is strict: unknown types,
+  wrong lengths, out-of-range codes and non-zero padding are errors, and a connection that
+  sends one is logged out.
+- Sessions: a login with an account and its token first, one session per account,
+  heartbeats to quiet clients, logout of silent ones.
+- Accounts from a plain text file, each id also the book's owner id for its orders.
+- Exchange-assigned order ids: an order's id is the sequence number of the command that
+  places it, unique, increasing, and recovered with the journal. The client's own
+  reference is echoed in every report about the order.
+- Cancel-on-disconnect: a connection that closes, is logged out, or falls too far behind
+  reading its reports has its account's orders cancelled. Stopping the gateway leaves
+  them, as a crash would, and a restart attributes them to their accounts again.
+- Per-account pre-trade risk: a limit on open orders and pending stops, counting those
+  not yet applied, and a token bucket per session, enforced before anything is journaled.
+- A single-threaded `mio` event loop with group commit: the commands of one round of reads
+  share a journal sync, and reports go out only after it.
+- Fuzzing: the decoders on arbitrary byte streams, and the gateway's sessions on byte
+  streams and well-formed messages from several connections that come and go.
+- A load generator whose clients trade against each other and measure the time from
+  sending each order to its acknowledgement.
 
-**Acceptance criteria:** no crashes under fuzzing; end-to-end order flow driven by the load
-generator.
+The directly indexed id table this phase once listed was not built. Order ids are now
+sequence numbers, which grow without bound while a good-till-cancelled order may rest
+indefinitely, so a table indexed by id needs to handle collisions: that is what the book's
+index already does, and it puts consecutive ids into shared cache lines.
+
+**Acceptance criteria:** no crashes under fuzzing (both targets on every push, and for
+twenty minutes each a week); end-to-end order flow driven by the load generator
+(`crates/gateway/tests/server.rs`, on Linux, Windows and macOS). Both met.
 
 ---
 

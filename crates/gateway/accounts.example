@@ -1,0 +1,8 @@
+# Accounts for a local gateway and its load generator, one per line:
+# id, token, open-order limit, order-entry messages per second.
+# An id is also the book's owner id for the account's orders, so it must be below the
+# book's max_owners (1,024 unless --max-owners says otherwise). Tokens here are examples.
+1 1001 1000 1000000
+2 1002 1000 1000000
+3 1003 1000 1000000
+4 1004 1000 1000000

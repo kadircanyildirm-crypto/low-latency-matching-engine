@@ -1,10 +1,11 @@
 # Design of the matching engine
 
-This document explains what the order book in `crates/orderbook`, and the journal and
-recovery in `crates/engine` around it, do, how, and why. It also says what they
-deliberately do not do yet. Every claim here is backed by a test: the
-[verification](#11-verification) section says which one for the book, and
-[§14](#how-it-is-verified) for the engine.
+This document explains what the order book in `crates/orderbook`, the journal and recovery
+in `crates/engine` around it, and the gateway in `crates/protocol` and `crates/gateway` in
+front of them, do, how, and why. It also says what they deliberately do not do yet. Every
+claim here is backed by a test: the [verification](#11-verification) section says which
+one for the book, [§14](#how-it-is-verified) for the engine and
+[§15](#how-it-is-verified-1) for the gateway.
 
 ## 1. Goals
 
@@ -534,8 +535,8 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 
 | Limitation | Plan |
 |---|---|
-| No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
-| The id index's hash is not keyed: a participant choosing ids adversarially could crowd many into one home line, and lookups would then scan several lines | Phase 3: the gateway assigns order ids, so participants never choose them; with sequential ids, a directly indexed table could replace the hash altogether |
+| The book has no per-participant limits: one owner can fill it and block others with `BookFull` | Enforced in front of it: the gateway limits each account's open orders and each session's message rate (§15) |
+| The id index's hash is not keyed: a caller choosing ids adversarially could crowd many into one home line, and lookups would then scan several lines | Through the gateway, ids are sequence numbers and participants never choose them (§15). A directly indexed table was considered: ids grow without bound while an order may rest indefinitely, so it would need the collision handling the index already has |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 6: benchmark alternatives and add a windowed or hybrid ladder |
 | Without `auction_on_band`, a price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6). With it, a band tight against the market's moves keeps the book in calls most of the time (§7) | The band's width is a configuration choice; widening the band during a call, as some exchanges do, is not implemented |
@@ -549,7 +550,11 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 8: a standby holds a second copy to compare against |
 | Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, a segment roll stalls one call for 8 to 23 ms on this laptop, and under `SyncPolicy::Always` a sync costs about a millisecond (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 6: measure Linux, `io_uring` and drives with power-loss protection |
 | Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 4 or 6: take snapshots from a copy, such as the standby's book |
-| Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 3/4, with the gateway's receive time: a second record format version |
+| Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 4, with the gateway's receive time: a second record format version |
+| The gateway and the book share one thread: while a batch is journaled and synced, no socket is read | Phase 4: the gateway, the journal and the matcher become stages on cores of their own |
+| Plain TCP; tokens travel and are stored in the clear, and are compared in variable time | Phase 5 puts the public demo behind TLS; Phase 7 brings real account management |
+| A client that reconnects cannot ask what it missed: no order status, no replay of reports from a sequence number, and orders recovered after a restart have lost their client references | Phase 4: the publisher keeps the event stream, and clients resume from a sequence number |
+| No market data: clients only hear about their own orders, and phase changes | Phase 4: the market data publisher |
 | A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 8's standby to compare against |
 | Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal` | Phase 4: the publisher tracks its consumers and holds retention back |
 
@@ -864,3 +869,158 @@ and that preparing segments ahead had moved the stall at a roll rather than remo
 Each is fixed, with a test that fails without the fix; `interrupted.rs` and
 `operations.rs` exist because the earlier tests could not see these: they only failed
 between batches, never inside an operation.
+
+## 15. The gateway
+
+`crates/protocol` defines the wire protocol and `crates/gateway` serves it: clients log in
+over TCP, enter orders, and receive reports of what happens to them. The goal of Phase 3:
+accept orders from the outside world without letting any of it reach the book unchecked.
+
+### The protocol
+
+Every message has a fixed length: a 4-byte header (total length `u16`, type `u8`, a zero
+byte) and a body of little-endian integers. The tables are in the `protocol` crate's
+documentation; the client sends `Login`, `Logout`, `Heartbeat`, `NewOrder`, `Cancel`,
+`Modify` and `MassCancel`, and the exchange sends `LoginAccepted`, `LoginRejected`,
+`Logout`, `Heartbeat`, `Reject` and `Report`. A `Report` describes one event of the book
+about one order, as its owner sees it: accepted, rejected with the book's reason, filled
+(with the trade id, price, quantity and what is left), rested, replenished, cancelled
+with a reason, modified, stop placed, triggered; or, about no order in particular, a mass
+cancel's count and a phase change. Every report carries the sequence number of the
+command that caused it.
+
+Decoding is as strict as the journal's: an unknown type, a length that is not the type's,
+a code out of range, a non-zero padding byte or unused field are all errors. A decoder
+that accepted variants would give two byte strings one meaning and turn a client's bug
+into a guess. Directions are separate: a client cannot send what only the exchange sends.
+Fixed lengths make framing a lookup, and a connection's undecoded input never exceeds one
+partial message.
+
+### Sessions
+
+A connection's first message must be a `Login` with the protocol version, an account and
+its token; anything else ends the session with `Logout(ProtocolError)`. A login is refused
+for an unknown version, account or token, or an account already logged in elsewhere, and
+the connection is closed: one session per account, so a client cannot race itself. A
+second login in a session is refused and the session goes on. `LoginAccepted` carries the
+sequence number of the last command the exchange has taken: every report after it carries
+a larger one.
+
+A logged-in session that has been sent nothing for a second gets a `Heartbeat`; a session
+that has sent nothing for five is logged out as idle. The exchange logic takes the time
+as an argument and reads no clock, so these rules are tested, and fuzzed, with time under
+the test's control.
+
+Accounts come from a text file, one per line: id, token, open-order limit and message
+rate. An account's id is also the book's owner id for its orders, which keeps the book's
+per-owner state in plain arrays (§6).
+
+### Order ids
+
+An order's id is the sequence number of the command that places it. Ids are unique and
+increasing without coordination, survive restarts with the journal, and tell the order's
+place in history. The client chooses only a reference, which every report about the
+order echoes. Ids are assigned when a message is accepted into the batch, before it is
+journaled, so the id of the next new order is the engine's last sequence number plus the
+number of commands waiting, plus one.
+
+A recovered book whose orders have ids above the journal's last sequence number was not
+built through a gateway, and a new order could get one of their ids: the gateway refuses
+to start on it.
+
+### Pre-trade risk
+
+Two limits apply before a message reaches the batch, and a refusal is a `Reject` that
+never reaches the journal:
+
+- **Open orders** per account: orders and pending stops on the book plus new ones waiting
+  in the batch. An order counts until its final event: rejected, filled, cancelled, or
+  modified down to nothing. Without it, one participant could fill the book and every
+  other participant would get `BookFull`.
+- **Message rate** per session: a token bucket that refills at the account's rate and
+  holds at most one second's worth, so short bursts pass and floods do not. It counts
+  order entry (new orders, cancels, modifies, mass cancels); heartbeats and logouts are
+  free.
+
+### Routing
+
+The engine's output goes through a router that turns each event into a report for the
+session of the account that owns the order, found through a map of live orders to their
+account and client reference. A trade becomes two fills, one per side. A `Rejected`
+event goes only to the session that sent the command, and only if that session is still
+logged in for the command's account: a cancel naming someone else's order must not tell
+that order's owner anything, and a disconnected session's slot may already belong to
+another account. Phase changes go to every session. When an order's final event passes,
+the router retires it from the map and from its account's count.
+
+Reports for an account go to whichever session is logged in for it when they are
+produced. A session being logged out is sent nothing more, not even the acceptance of an
+order it placed in its last batch; the account's next session hears what becomes of the
+order. The gateway fuzzer found this case: the target had assumed every order's first
+report is its acceptance.
+
+### The event loop and group commit
+
+One thread runs a `mio` event loop over non-blocking sockets. Each round:
+
+1. Wait up to 10 ms for readiness, or not at all if something is still to do.
+2. Accept new connections, up to the session limit; further ones are closed at once.
+   Nagle's algorithm is off: replies are small and latency matters.
+3. Read each ready connection, at most sixteen 64 KiB chunks per round, decode each
+   complete message and hand it over. A client that sends without pause would otherwise
+   keep the loop reading it, and fill one huge batch; what is left is read next round.
+4. Flush the batch: journal it (one sync under `SyncPolicy::Always`), apply it, and route
+   the events.
+5. Send heartbeats and log out idle sessions.
+6. Write each connection's replies, as far as its socket takes them. A connection with more
+   than 4 MiB of replies unwritten is dropped as a slow consumer.
+
+Reports go out only after the batch is journaled, so under `Always` a client never hears of
+an order the journal could lose. Everything the clients sent in one round shares one
+sync: the more clients send at once, the more commands each sync carries, which is what
+makes durability affordable (§14).
+
+### Disconnects, stops and failures
+
+A connection that closes, sends bytes that do not decode, is logged out, or falls behind
+as a slow consumer, has its account's orders cancelled: a `CancelAll` for the account goes
+into the batch. A client that is gone cannot manage its orders, and an exchange that kept
+them would trade on the client's behalf. A session being logged out keeps the connection
+for up to a second, to read its `Logout`.
+
+Stopping the gateway logs every session out with `Logout(Shutdown)` but cancels nothing:
+the orders stay on the book, as they would after a crash, and both are recovered the same
+way. On start, the gateway walks the recovered book's queues and stops and attributes
+each order to its account again. Their client references were not journaled and are lost:
+reports about them carry zero.
+
+If the engine fails (a write or sync error poisons it, §14), every session is logged out
+with `Shutdown` and the server stops: the engine cannot accept commands until reopened,
+and recovery decides what survived.
+
+### Cost
+
+`loadgen` runs clients that trade against each other through a running gateway, each
+keeping a window of new orders in flight, and measures each order's time from sending to
+its acknowledgement. On the Windows laptop of §13, four clients over loopback with 16
+orders in flight each, for three seconds:
+
+| Sync policy | Orders/s | p50 | p99 | p99.9 |
+|---|---:|---:|---:|---:|
+| `Always` | 16,400 | 3.1 ms | 7.8 ms | 13.5 ms |
+| `Os` | 267,000 | 165 µs | 780 µs | 17 ms |
+
+Under `Always`, each round waits for a sync of about a millisecond (§14) and carries the
+64 orders in flight; under `Os` the round trip is the loopback and the loop. These are
+closed-loop numbers on a busy laptop, with the clients on the same machine: Phase 6
+measures open-loop on Linux.
+
+### How it is verified
+
+| Test | What it shows |
+|---|---|
+| `crates/protocol/tests/messages.rs` | Every message round-trips in both directions; every prefix of one is incomplete; any changed byte fails to decode or decodes to what encodes to it; streams decode the same in any pieces; bad headers are named. |
+| `crates/gateway/tests/exchange.rs` | The session rules, order ids, routing of every kind of event, refusals only to their sender, the open-order limit counting the batch, the token bucket, heartbeats and idle logouts, cancel-on-disconnect, stops and self-trades, phase changes to everyone, recovery after a stop, refusing a foreign book, an engine failure; and a property test of random sessions, messages, disconnects and ticks: reports reach only the owner, and open-order counts match the book after every flush. |
+| `crates/gateway/tests/server.rs` | Real sockets and a real journal: trading, 500 orders in one write, bytes that do not decode before and after login, a client that does not read, the session limit, a stop and restart that keeps the orders, a bad token, and the load generator end to end: every order answered exactly once and the book empty when the clients leave. CI runs it on Linux, Windows and macOS. |
+| `fuzz/fuzz_targets/protocol.rs` | Arbitrary byte streams, read as the gateway reads a client and as a client reads the gateway: decoding never panics, every message decoded re-encodes to its bytes, and a stream cut anywhere decodes the same messages up to the cut. |
+| `fuzz/fuzz_targets/gateway.rs` | Up to four connections that come and go and send raw bytes or well-formed messages, with time passing and batches flushing: nothing panics, nothing reaches a closed session, all reports about an order go to one account, the one that owns it on the book, and open-order counts match the book and stay within the limit. |

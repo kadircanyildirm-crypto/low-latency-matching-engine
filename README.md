@@ -6,9 +6,9 @@
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
 
-**Status:** Phases 1 and 2 of 9 are complete: the matching core, and the journal and crash
-recovery around it. The next phases lead to a public web demo with paper trading, then to
-outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
+**Status:** Phases 1 to 3 of 9 are complete: the matching core, the journal and crash
+recovery around it, and a TCP gateway in front of them. The next phases lead to a public
+web demo with paper trading, then to outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
 decision is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Phase 1: the order book
@@ -268,6 +268,42 @@ durability is affordable only with group commit. Journaling, rolls included, mov
 core of its own in Phase 4. Formats, the recovery algorithm, the trade-offs and the reasoning are in
 [DESIGN.md §14](docs/DESIGN.md#14-the-journal-and-recovery).
 
+## Phase 3: the gateway
+
+`crates/protocol` defines a binary protocol and `crates/gateway` serves it over TCP: clients
+log in, enter orders, and receive a report of every event of the book that concerns them.
+
+```sh
+cargo run --release -p gateway --bin gateway -- --dir data --accounts crates/gateway/accounts.example
+cargo run --release -p gateway --bin loadgen -- --accounts crates/gateway/accounts.example --clients 4
+```
+
+| Property | How |
+|---|---|
+| A strict binary protocol | Fixed-length, little-endian messages with a 4-byte header. Anything that is not exactly what the encoder writes (unknown types, wrong lengths, codes out of range, non-zero padding) logs the connection out. |
+| Sessions | A login with an account and its token first, one session per account, heartbeats to quiet clients, logout of silent ones. |
+| Exchange-assigned ids | An order's id is the sequence number of the command that places it: unique, increasing, and recovered with the journal. The client's own reference comes back in every report. |
+| Pre-trade risk | A limit on each account's open orders and pending stops, counting those not yet applied, and a token bucket on each session's message rate, both checked before anything is journaled. |
+| Cancel-on-disconnect | A connection that closes, sends garbage, goes idle, or reads its reports too slowly has its account's orders cancelled. Stopping the gateway leaves them on the book, as a crash would, and a restart attributes them to their accounts again. |
+| Group commit | One thread, one `mio` event loop: the commands of a round of reads share one journal sync, and reports go out only after it, so under `SyncPolicy::Always` no client hears of an order the journal could lose. |
+
+**Verification.** Unit and property tests of the session logic with time under the test's
+control; end-to-end tests over real sockets and a real journal on Linux, Windows and
+macOS, the load generator's run among them; and two fuzz targets, one on the decoders and
+one on several sessions sending raw bytes and well-formed messages while connections come
+and go. The latter found a wrong assumption in its own first version within seconds on
+CI: an order's first report need not be its acceptance.
+
+**Cost** (`loadgen`, four clients with 16 orders in flight each, same Windows laptop,
+loopback):
+
+| Sync policy | Orders/s | p50 acknowledgement | p99 |
+|---|---:|---:|---:|
+| `Always` (a sync per round) | 16,400 | 3.1 ms | 7.8 ms |
+| `Os` | 267,000 | 165 µs | 780 µs |
+
+Details and reasoning are in [DESIGN.md §15](docs/DESIGN.md#15-the-gateway).
+
 ## Running
 
 ```sh
@@ -278,13 +314,15 @@ cargo bench --bench throughput            # Criterion before/after comparison (i
 cargo bench -p engine --bench journal    # journaling cost per sync policy, replay and snapshot speed
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
 cargo mutants -p engine --exclude crates/engine/src/sim.rs --exclude crates/engine/src/bin/engine-soak.rs
+cargo mutants -p gateway --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
 cargo +nightly fuzz run differential -s none -a -- -max_total_time=60 -len_control=0   # fuzzing
 (cd crates/orderbook && cargo kani)                                     # proofs (Linux, macOS)
 cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|engine-soak)\.rs' --summary-only   # coverage
 compare/run.sh fetch && compare/run.sh export && compare/run.sh all   # comparison with other engines
 ```
 
-The fuzz targets are `differential`, `snapshot_roundtrip`, `restore` and `recovery`. Each needs its
+The fuzz targets are `differential`, `snapshot_roundtrip`, `restore`, `recovery`,
+`protocol` and `gateway`. Each needs its
 tool first: `cargo install cargo-fuzz`, `cargo install --locked kani-verifier && cargo kani
 setup`, or `cargo install cargo-llvm-cov` with the nightly `llvm-tools-preview` component.
 Windows needs a different fuzzing setup, described in

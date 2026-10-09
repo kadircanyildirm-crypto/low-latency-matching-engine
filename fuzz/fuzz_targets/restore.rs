@@ -2,8 +2,8 @@
 //!
 //! A snapshot starts as that of a live book the fuzzer builds, and the fuzzer then edits
 //! it: inserts orders and stops made from scratch, changes any field, removes, duplicates
-//! and reorders entries, and sets the trade count and reference price. So inputs range
-//! from valid snapshots through near misses to garbage.
+//! and reorders entries, and sets the trade count, reference price and phase. So inputs
+//! range from valid snapshots through near misses to garbage.
 //!
 //! - `restore` never panics: an impossible snapshot is an error.
 //! - It accepts exactly the snapshots that keep the rules `SnapshotError` documents, and an
@@ -11,7 +11,7 @@
 //!   documentation, independently of the implementation.
 //! - An accepted snapshot yields a healthy book (`validate()`) holding exactly its orders
 //!   and stops, each price level's queue and each trigger's stops in snapshot order, with
-//!   its trade count and reference price. The book's own snapshot restores to the same
+//!   its trade count, reference price and phase. The book's own snapshot restores to the same
 //!   state, and its digest equals that snapshot's.
 //! - The restored book then runs commands the fuzzer chooses with `validate()` after each,
 //!   and, unless the band lies too close to the ends of `i64` for the reference book, it
@@ -24,13 +24,13 @@ use std::collections::{BTreeMap, HashSet};
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use orderbook::{
-    BookConfig, BookSnapshot, OrderBook, OrderId, Price, Side, SnapshotError, SnapshotOrder,
+    BookConfig, BookSnapshot, OrderBook, OrderId, Phase, Price, Side, SnapshotError, SnapshotOrder,
     StopOrder,
 };
 use orderbook_fuzz::reference::ReferenceBook;
 use orderbook_fuzz::{
-    CommandInput, ConfigInput, DisplayInput, IdInput, MAX_COMMANDS, OwnerInput, PriceInput, Prices,
-    QtyInput, assert_matches, reference_can_follow, side,
+    CommandInput, ConfigInput, DisplayInput, IdInput, MAX_COMMANDS, OwnerInput, PhaseInput,
+    PriceInput, Prices, QtyInput, assert_matches, reference_can_follow, side,
 };
 
 /// Commands that build the live book the snapshot starts from.
@@ -84,6 +84,7 @@ enum Edit {
     },
     TradeCount(TradeCountInput),
     ReferencePrice(Option<PriceInput>),
+    Phase(PhaseInput),
 }
 
 /// An id for an inserted or changed entry: one no live order uses, or one from the pool the
@@ -252,6 +253,7 @@ impl Edit {
             Edit::ReferencePrice(price) => {
                 snapshot.reference_price = price.map(|price| price.price(&config));
             }
+            Edit::Phase(phase) => snapshot.phase = phase.phase(),
         }
     }
 }
@@ -356,7 +358,7 @@ fn broken_rules(snapshot: &BookSnapshot) -> Vec<SnapshotError> {
     };
     let (best_bid, best_ask) = (prices(Side::Buy).max(), prices(Side::Sell).min());
     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-        if bid >= ask {
+        if bid >= ask && snapshot.phase != Phase::Auction {
             broken.push(SnapshotError::Crossed);
         }
     }
@@ -418,6 +420,7 @@ fuzz_target!(|input: Input| {
     assert_eq!(canonical.config, snapshot.config);
     assert_eq!(canonical.trade_count, snapshot.trade_count);
     assert_eq!(canonical.reference_price, snapshot.reference_price);
+    assert_eq!(canonical.phase, snapshot.phase);
     assert_eq!(groups(&canonical), groups(&snapshot));
     assert_eq!(book.digest(), canonical.digest());
     match OrderBook::restore(&canonical) {

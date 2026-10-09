@@ -1,7 +1,7 @@
 //! Differential fuzzing: on a configuration and a command stream the fuzzer chooses, the
 //! engine must emit exactly the reference book's events, hold exactly its orders in the
-//! same queue order, its pending stops in the same trigger order, the same trade count and
-//! reference price, and keep its internal invariants (`validate()`) after every command.
+//! same queue order, its pending stops in the same trigger order, the same trade count,
+//! reference price and phase, and keep its internal invariants (`validate()`) after every command.
 //!
 //! This is `tests/differential.rs` driven by coverage feedback instead of a fixed random
 //! distribution, and over any configuration: bands anywhere in the `i64` range short of

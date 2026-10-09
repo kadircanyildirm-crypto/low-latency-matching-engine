@@ -8,14 +8,16 @@
 //! the band and at bitset word and summary-word boundaries, and quantities at zero, at
 //! `max_order_qty`, just above it and at `u64::MAX`. Unlike the property tests, the fuzzer
 //! also chooses where the band lies, out to the ends of the `i64` range, and every other
-//! configuration value, up to `u32::MAX` ticks of protection and of band.
+//! configuration value, up to `u32::MAX` ticks of protection and of band. Phase changes are
+//! commands like any other, biased toward continuous trading and calls, so books cross in
+//! calls and uncross when they end.
 
 #![forbid(unsafe_code)]
 
 use arbitrary::Arbitrary;
 use orderbook::{
-    BookConfig, Command, OrderBook, OrderId, OwnerId, Price, Qty, QueuedOrder, SelfTradePolicy,
-    Side, TimeInForce,
+    BookConfig, Command, OrderBook, OrderId, OwnerId, Phase, Price, Qty, QueuedOrder,
+    SelfTradePolicy, Side, TimeInForce,
 };
 
 /// The deliberately naive reference book of the property tests. It is compiled from the
@@ -40,8 +42,8 @@ pub fn snapshot(book: &OrderBook) -> Snapshot {
 }
 
 /// Panics unless the engine holds exactly the reference book's orders, in the same queue
-/// order, its pending stops in the same trigger order, and the same trade count and
-/// reference price, or if the engine's internal invariants are broken. `step` and
+/// order, its pending stops in the same trigger order, and the same trade count, reference
+/// price and phase, or if the engine's internal invariants are broken. `step` and
 /// `command` only label the failure.
 pub fn assert_matches(
     engine: &OrderBook,
@@ -64,6 +66,7 @@ pub fn assert_matches(
     }
     assert_eq!(engine.trade_count(), reference.trade_count());
     assert_eq!(engine.reference_price(), reference.reference_price());
+    assert_eq!(engine.phase(), reference.phase());
     if let Err(violation) = engine.validate() {
         panic!("invariant broken at step {step} ({command:?}): {violation}");
     }
@@ -110,6 +113,7 @@ pub struct ConfigInput {
     price_band: Option<TicksInput>,
     reference_price: Option<LevelInput>,
     cancel_incoming: bool,
+    auction_on_band: bool,
 }
 
 /// Where the price band lies and how many levels it has.
@@ -234,7 +238,7 @@ impl ConfigInput {
             } else {
                 SelfTradePolicy::CancelResting
             },
-            auction_on_band: false,
+            auction_on_band: self.auction_on_band,
         }
     }
 }
@@ -308,6 +312,7 @@ pub enum CommandInput {
         limit: Option<PriceInput>,
         qty: QtyInput,
     },
+    SetPhase(PhaseInput),
 }
 
 impl CommandInput {
@@ -374,6 +379,9 @@ impl CommandInput {
                 trigger: trigger.price(config),
                 limit: limit.map(|limit| limit.price(config)),
                 qty: qty.qty(config),
+            },
+            CommandInput::SetPhase(phase) => Command::SetPhase {
+                phase: phase.phase(),
             },
         }
     }
@@ -471,6 +479,21 @@ impl QtyInput {
             28 => max.saturating_add(1),
             29 => Qty::MAX,
             _ => self.value,
+        }
+    }
+}
+
+/// A trading phase: mostly continuous trading or a call, sometimes a halt or the close.
+#[derive(Arbitrary, Clone, Copy, Debug)]
+pub struct PhaseInput(u8);
+
+impl PhaseInput {
+    pub fn phase(self) -> Phase {
+        match self.0 % 8 {
+            0..=2 => Phase::Continuous,
+            3..=5 => Phase::Auction,
+            6 => Phase::Halted,
+            _ => Phase::Closed,
         }
     }
 }

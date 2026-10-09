@@ -443,16 +443,18 @@ configuration, and it is biased like the property tests' strategies: few ids and
 owners, prices at band edges and bitset word boundaries, quantities at the limits. But
 the fuzzer also picks every configuration value: bands of up to 12,289 levels anywhere in
 the `i64` range, 1 to 64 orders, 1 to 5 owners or 1,024, any number of protection and
-band ticks up to `u32::MAX`, up to 255 iceberg tranches, and either self-trade policy. An
-input runs at most 512 commands. Tranches stay few because each one is a trade: with
+band ticks up to `u32::MAX`, up to 255 iceberg tranches, either self-trade policy, and
+whether a band stop starts a call. Phase changes are commands like the others, mostly to
+continuous trading or a call, so books cross in calls and uncross when they end. An input
+runs at most 512 commands. Tranches stay few because each one is a trade: with
 `u32::MAX` of them, one command could legally emit billions of events, which only
 exhausts the fuzzer's memory.
 
 | Target | What every run checks |
 |---|---|
-| `differential` | The engine matches the reference book event for event, and in its orders, stops, trade count and reference price, with `validate()` after every command. At the end, `digest()` equals the snapshot's digest. Bands keep 2³³ ticks away from the ends of `i64`, because the reference adds tick counts to prices in plain `i64` arithmetic. |
+| `differential` | The engine matches the reference book event for event, and in its orders, stops, trade count, reference price and phase, with `validate()` after every command. At the end, `digest()` equals the snapshot's digest. Bands keep 2³³ ticks away from the ends of `i64`, because the reference adds tick counts to prices in plain `i64` arithmetic. |
 | `snapshot_roundtrip` | A snapshot taken at a cut the fuzzer chooses restores to a healthy book with the same snapshot and digest, which then emits exactly the original's events, with `validate()` on both books after every command. Bands may reach `i64::MIN` and `i64::MAX`. |
-| `restore` | Up to 64 commands build a live book. Up to 16 edits then turn its snapshot into anything from valid to garbage: entries made from scratch, any field changed, entries removed, duplicated or moved, any trade count and reference price. `restore` must not panic. It must accept exactly the snapshots that keep the rules `SnapshotError` documents, which the target restates independently of the implementation, and a refusal must name a rule the snapshot breaks. An accepted snapshot must yield a healthy book holding exactly its orders and stops, each level's queue in snapshot order, whose own snapshot restores to the same state. The book then runs up to 512 commands in step with the reference book loaded from the same snapshot. |
+| `restore` | Up to 64 commands build a live book. Up to 16 edits then turn its snapshot into anything from valid to garbage: entries made from scratch, any field changed, entries removed, duplicated or moved, any trade count, reference price and phase. `restore` must not panic. It must accept exactly the snapshots that keep the rules `SnapshotError` documents, which the target restates independently of the implementation, and a refusal must name a rule the snapshot breaks. An accepted snapshot must yield a healthy book holding exactly its orders and stops, each level's queue in snapshot order, whose own snapshot restores to the same state. The book then runs up to 512 commands in step with the reference book loaded from the same snapshot. |
 
 The targets are built with debug assertions and overflow checks, so an arithmetic
 overflow anywhere fails a run: §9's claim is tested on inputs the property tests never

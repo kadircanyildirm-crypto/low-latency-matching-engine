@@ -16,6 +16,7 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 engine = { path = "../crates/engine" }
 libfuzzer-sys = "0.4.13"
 orderbook = { path = "../crates/orderbook" }
+protocol = { path = "../crates/protocol" }
 
 # A workspace of its own, so that building or testing the main workspace never compiles
 # libFuzzer, and the fuzz build's sanitizer flags never reach it.
@@ -46,6 +47,13 @@ bench = false
 [[bin]]
 name = "recovery"
 path = "fuzz_targets/recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
 test = false
 doc = false
 bench = false

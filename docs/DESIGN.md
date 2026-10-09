@@ -39,7 +39,7 @@ The [verification](#10-verification) section says which one.
           └──► #7 ⇄ #3 ⇄ #9  (FIFO) ────┘
 
  occupancy bitset: 1 bit per level + 1 summary bit per 64 words
- id index: FxHashMap<OrderId, slot>, reserved at 2x capacity
+ id index: hash table of cache lines, 5 (id, slot) pairs each, room for 2x capacity
  stop ladders: two more ladders of the same shape, keyed by trigger level; buy stops
                run like asks (lowest trigger first), sell stops like bids
  iceberg parts: (display, visible) per slot, beside the slab; a level's total counts
@@ -70,11 +70,18 @@ around the touch, or a ladder near the touch with a tree beyond it. Phase 5 benc
 the ladder against `BTreeMap` and a sorted `Vec`, and that comparison decides the design
 for wide markets.
 
-**Why an id index at 2× capacity.** Hash-map deletes leave tombstones. When the map runs
-out of growth room, it either rehashes in place (no allocation) or grows (allocation).
-With capacity reserved for `2 × max_orders`, live entries never exceed half the table, so
-it always takes the in-place path. A test hammers a permanently full book to show this
-empirically.
+**Why a custom id index.** Cancels and modifies look orders up by id. In a book far
+larger than the cache, a general-purpose map pays two misses in a row per lookup: first
+its control bytes, then the bucket. The index (`src/index.rs`) is a table of 64-byte
+lines, each holding five ids with their slots, sized once for `2 × max_orders` and never
+grown. An id lives in its home line unless that line is full, so a lookup normally reads
+one cache line. Four consecutive ids share a home line: ids are usually handed out in
+sequence, so a new order's duplicate check and insertion hit the line its predecessor
+just used. An id that overflows goes to the next line with room, and the lines it passes
+count it; a lookup moves on from a line only while that count is non-zero. Removal clears
+the entry and lowers the counts, so there are no tombstones and never a rehash, which in a
+general-purpose map stalls whichever command happens to trigger it. A test hammers a
+permanently full book to show it never allocates.
 
 **Why owner lists, and why mass cancels sort.** Cancel-on-disconnect has to pull every
 order of one participant at once. Scanning the book would cost time proportional to the
@@ -323,7 +330,7 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | Limitation | Plan |
 |---|---|
 | No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
-| The id index stays allocation-free only because std's hash map rehashes in place while it is at most half full. That is an implementation detail; the zero-allocation tests guard it | Phase 3: once the gateway assigns sequential ids, replace the hash map with a directly indexed table, which also removes a cache miss from every cancel |
+| The id index's hash is not keyed: a participant choosing ids adversarially could crowd many into one home line, and lookups would then scan several lines | Phase 3: the gateway assigns order ids, so participants never choose them; with sequential ids, a directly indexed table could replace the hash altogether |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
 | A price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6) | Next: trading halts and a reopening auction that sets a new reference |

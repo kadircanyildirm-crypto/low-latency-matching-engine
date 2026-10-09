@@ -46,6 +46,7 @@
 
 mod bitset;
 mod book;
+mod index;
 mod owners;
 mod pool;
 mod types;

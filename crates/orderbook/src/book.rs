@@ -6,9 +6,8 @@ mod stops;
 pub use snapshot::{BookSnapshot, SnapshotError, SnapshotOrder};
 pub use stops::{StopOrder, Stops};
 
-use rustc_hash::FxHashMap;
-
 use crate::bitset::LevelBitset;
+use crate::index::IdIndex;
 use crate::owners::Owners;
 use crate::pool::{NIL, OrderKind, OrderNode, OrderPool};
 use crate::types::{
@@ -158,12 +157,7 @@ impl Level {
     /// Removes the order at the head of the queue and frees its slot. The caller has
     /// already taken its quantity out of `total_qty`.
     #[inline]
-    fn pop_front(
-        &mut self,
-        pool: &mut OrderPool,
-        index: &mut FxHashMap<OrderId, u32>,
-        owners: &mut Owners,
-    ) {
+    fn pop_front(&mut self, pool: &mut OrderPool, index: &mut IdIndex, owners: &mut Owners) {
         let slot = self.head;
         let OrderNode {
             id, next, owner, ..
@@ -332,9 +326,8 @@ pub struct OrderBook {
     /// Pending sell stops by trigger level, highest trigger first.
     sell_stops: HalfBook,
     pool: OrderPool,
-    /// Order id -> pool slot. Reserved at twice `max_orders` so that clearing out deleted
-    /// entries is always an in-place rehash, never a reallocation.
-    index: FxHashMap<OrderId, u32>,
+    /// Order id -> pool slot, sized for `max_orders` up front.
+    index: IdIndex,
     /// Each owner's resting orders, for mass cancels.
     owners: Owners,
     /// Sort buffer for mass cancels, sized for every resting order up front.
@@ -376,8 +369,6 @@ impl OrderBook {
             "max_orders * max_order_qty must fit in a u64"
         );
         let levels = levels as usize;
-        let mut index = FxHashMap::default();
-        index.reserve((config.max_orders as usize).saturating_mul(2));
         let reference = config.reference_price.map(|price| {
             let offset = i128::from(price) - i128::from(config.min_price);
             assert!(
@@ -393,7 +384,7 @@ impl OrderBook {
             buy_stops: HalfBook::new(Side::Sell, levels),
             sell_stops: HalfBook::new(Side::Buy, levels),
             pool: OrderPool::with_capacity(config.max_orders),
-            index,
+            index: IdIndex::with_capacity(config.max_orders),
             owners: Owners::new(config.max_owners, config.max_orders),
             scratch: Vec::with_capacity(config.max_orders as usize),
             next_trade_id: 1,

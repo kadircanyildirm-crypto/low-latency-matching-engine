@@ -1,0 +1,11 @@
+[package]
+name = "run-ours"
+version = "0.1.0"
+description = "Our engine (crates/orderbook) replaying the comparison streams."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+harness = { path = "../harness" }
+orderbook = { path = "../../crates/orderbook" }

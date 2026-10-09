@@ -126,7 +126,8 @@ scenario, a participant-like generator records a command stream, which is then r
 into fresh books: 3 runs × 2M measured commands after warm-up.
 
 Numbers from a development laptop (Intel Core i5-12450H, Windows 11, untuned, no core
-isolation). The ~25 ns timer overhead is included. Throughput comes from a separate pass
+isolation). The benchmark pins to the last logical core, which on this hybrid processor
+is an efficiency core (E-core). The ~25 ns timer overhead is included. Throughput comes from a separate pass
 without per-command timers.
 
 | Scenario | Book after warm-up | p50 | p90 | p99 | p99.9 | p99.99 | Throughput |
@@ -168,6 +169,25 @@ By command, in the baseline scenario:
   is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
   coordinated-omission correction) arrives with the gateway and pipeline phases.
 
+### Compared with other engines
+
+[docs/COMPARISON.md](docs/COMPARISON.md) replays one recorded order flow (GTC limit,
+market, cancel and price-move commands only, our extra controls off) through this engine,
+[exchange-core](https://github.com/exchange-core/exchange-core) (Java, its matching core),
+[liquibook](https://github.com/enewhuis/liquibook) (C++) and
+[OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) (Rust), and checks that all
+four produce exactly the same trades and final book. Preliminary results, from a busy
+laptop and the same E-core for every engine:
+
+| Scenario | ours | exchange-core | liquibook | OrderBook-rs |
+|---|---:|---:|---:|---:|
+| baseline | 16.7M cmd/s | 8.7M (0.52x) | 2.05M (0.12x) | 0.54M (0.03x) |
+| deep (1M orders) | 4.15M cmd/s | 3.1M (0.74x) | 0.20M (0.05x) | 0.03M (0.01x) |
+
+exchange-core comes closest on the million-order book (0.89x in a P-core spot check), where
+both engines are bound by cache misses. The method, all four scenarios, latency
+percentiles and caveats are in the document; `compare/run.sh` reruns everything.
+
 ## Running
 
 ```sh
@@ -175,6 +195,7 @@ cargo test                                # all tests
 cargo bench --bench latency               # latency per scenario; writes target/latency/*.hgrm
 cargo bench --bench throughput            # Criterion before/after comparison (includes generator cost)
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
+compare/run.sh fetch && compare/run.sh export && compare/run.sh all   # comparison with other engines
 ```
 
 The `.hgrm` files can be plotted with the

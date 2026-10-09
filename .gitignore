@@ -2,3 +2,8 @@
 graphify-out/
 mutants.out*/
 .claude/worktrees/
+# Comparison harness: build output, recorded streams, raw results, downloaded competitors.
+/compare/target
+/compare/data
+/compare/results
+/compare/vendor

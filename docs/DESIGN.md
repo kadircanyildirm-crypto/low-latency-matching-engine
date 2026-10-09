@@ -81,7 +81,9 @@ just used. An id that overflows goes to the next line with room, and the lines i
 count it; a lookup moves on from a line only while that count is non-zero. Removal clears
 the entry and lowers the counts, so there are no tombstones and never a rehash, which in a
 general-purpose map stalls whichever command happens to trigger it. A test hammers a
-permanently full book to show it never allocates.
+permanently full book to show it never allocates. A lookup also stops when it gets back to
+its home line: bursts of colliding ids at different times can leave every line with a
+non-zero count at once, and without that stop an absent id would be searched for forever.
 
 **Why owner lists, and why mass cancels sort.** Cancel-on-disconnect has to pull every
 order of one participant at once. Scanning the book would cost time proportional to the

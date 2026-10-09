@@ -102,7 +102,7 @@ fn processing_commands_never_allocates() {
 }
 
 /// A tiny book that is permanently full: every new order first cancels an old one, so the
-/// id index sees maximum churn at maximum occupancy, the worst case for its tombstones.
+/// id index sees maximum churn at maximum occupancy.
 #[test]
 fn a_permanently_full_book_never_allocates() {
     let cfg = WorkloadConfig {
@@ -114,7 +114,7 @@ fn a_permanently_full_book_never_allocates() {
 }
 
 /// Mass cancels sort the owner's orders in a buffer reserved at construction, and churn the
-/// owner table, whose index has the same tombstone worst case as the order id index.
+/// owner lists.
 #[test]
 fn mass_cancels_never_allocate() {
     let cfg = WorkloadConfig {

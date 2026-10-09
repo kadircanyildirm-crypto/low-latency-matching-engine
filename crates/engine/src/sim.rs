@@ -130,6 +130,8 @@ enum NameChange {
 
 #[derive(Debug, Default)]
 struct Inode {
+    /// The file's name, which renames change.
+    name: PathBuf,
     /// The contents as the program sees them.
     current: Vec<u8>,
     /// The contents as of the last sync.
@@ -158,33 +160,45 @@ impl Change {
         }
     }
 
-    /// A random part of a write, as a torn write leaves it; a length change is atomic.
-    fn torn(&self, rng: &mut SplitMix64) -> Option<Change> {
-        match self {
-            Change::Write(offset, bytes) if bytes.len() > 1 => {
-                let start = rng.below(bytes.len() as u64) as usize;
-                let end = start + 1 + rng.below((bytes.len() - start) as u64) as usize;
-                Some(Change::Write(
-                    offset + start as u64,
-                    bytes[start..end].to_vec(),
-                ))
-            }
-            _ => None,
+    /// The parts of a write a torn write leaves, sector by sector: a prefix of its sectors
+    /// in order, or any of them. A length change is atomic.
+    fn torn(&self, rng: &mut SplitMix64, in_order: bool) -> Vec<Change> {
+        let Change::Write(offset, bytes) = self else {
+            return Vec::new();
+        };
+        // The write's pieces, cut at sector boundaries of the file.
+        let mut sectors = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let to_boundary = SECTOR - ((offset + at as u64) % SECTOR as u64) as usize;
+            let end = (at + to_boundary).min(bytes.len());
+            sectors.push(Change::Write(offset + at as u64, bytes[at..end].to_vec()));
+            at = end;
+        }
+        if in_order {
+            let kept = rng.below(sectors.len() as u64) as usize;
+            sectors.truncate(kept);
+            sectors
+        } else {
+            sectors.into_iter().filter(|_| rng.below(2) == 0).collect()
         }
     }
 }
+
+/// The unit a disk writes atomically: a write that is torn keeps or loses whole sectors.
+const SECTOR: usize = 512;
 
 /// A file of [`SimStorage`].
 #[derive(Debug)]
 pub struct SimFile {
     inode: Rc<RefCell<Inode>>,
     disk: Rc<RefCell<Disk>>,
-    path: PathBuf,
 }
 
 impl SimFile {
     fn change(&self) -> io::Result<()> {
-        self.disk.borrow_mut().change_to(&self.path)
+        let name = self.inode.borrow().name.clone();
+        self.disk.borrow_mut().change_to(&name)
     }
 }
 
@@ -228,6 +242,10 @@ impl SimStorage {
                     after.remove(name);
                 }
             }
+        }
+        // A rename that did not survive leaves the file under its old name.
+        for (name, inode) in &after {
+            inode.borrow_mut().name = name.clone();
         }
         SimStorage {
             disk: Rc::new(RefCell::new(Disk {
@@ -336,9 +354,9 @@ impl Inode {
                 for change in &inode.unsynced[..kept] {
                     change.apply(&mut contents);
                 }
-                if let Some(torn) = inode.unsynced.get(kept).and_then(|c| c.torn(rng)) {
-                    if rng.below(2) == 0 {
-                        torn.apply(&mut contents);
+                if let Some(change) = inode.unsynced.get(kept) {
+                    for part in change.torn(rng, true) {
+                        part.apply(&mut contents);
                     }
                 }
             }
@@ -346,17 +364,17 @@ impl Inode {
                 for change in &inode.unsynced {
                     match rng.below(3) {
                         0 => change.apply(&mut contents),
-                        1 => {
-                            if let Some(torn) = change.torn(rng) {
-                                torn.apply(&mut contents);
-                            }
-                        }
+                        1 => change
+                            .torn(rng, false)
+                            .iter()
+                            .for_each(|part| part.apply(&mut contents)),
                         _ => {}
                     }
                 }
             }
         }
         Inode {
+            name: inode.name.clone(),
             current: contents.clone(),
             durable: contents,
             unsynced: Vec::new(),
@@ -394,7 +412,10 @@ impl Storage for SimStorage {
     }
 
     fn create(&mut self, path: &Path) -> io::Result<SimFile> {
-        let inode = Rc::new(RefCell::new(Inode::default()));
+        let inode = Rc::new(RefCell::new(Inode {
+            name: path.to_owned(),
+            ..Inode::default()
+        }));
         let mut disk = self.disk.borrow_mut();
         disk.change_to(path)?;
         disk.names.insert(path.to_owned(), inode.clone());
@@ -403,7 +424,6 @@ impl Storage for SimStorage {
         Ok(SimFile {
             inode,
             disk: self.disk.clone(),
-            path: path.to_owned(),
         })
     }
 
@@ -413,7 +433,6 @@ impl Storage for SimStorage {
         Ok(SimFile {
             inode,
             disk: self.disk.clone(),
-            path: path.to_owned(),
         })
     }
 
@@ -422,6 +441,7 @@ impl Storage for SimStorage {
         disk.check_name(from)?;
         disk.change_to(to)?;
         let inode = disk.names.remove(from).ok_or_else(not_found)?;
+        inode.borrow_mut().name = to.to_owned();
         disk.names.insert(to.to_owned(), inode);
         disk.pending
             .push(NameChange::Rename(from.to_owned(), to.to_owned()));
@@ -537,21 +557,22 @@ mod tests {
         Some(bytes)
     }
 
-    /// Synced data and directory entries always survive; unsynced ones survive as the
-    /// model allows; a torn write leaves part of one write.
+    /// Synced data and directory entries always survive; unsynced writes survive as the
+    /// model allows; a torn write keeps whole sectors of one write, a prefix of them in
+    /// order, any of them otherwise.
     #[test]
     fn a_crash_keeps_what_was_synced() {
         let dir = Path::new("d");
-        let mut seen_torn = false;
-        let mut seen_reordered = false;
+        let (mut seen_torn, mut seen_reordered, mut seen_gap) = (false, false, false);
         for seed in 0..500 {
             let mut disk = SimStorage::new();
             let mut file = disk.create(&dir.join("f")).unwrap();
             file.write_at(0, b"synced").unwrap();
             file.sync().unwrap();
             disk.sync_dir(dir).unwrap();
-            file.write_at(6, b"-one").unwrap();
-            file.write_at(10, b"-two").unwrap();
+            // Two writes of three sectors each, the first starting mid-sector.
+            file.write_at(6, &[1; 1530]).unwrap();
+            file.write_at(1536, &[2; 1536]).unwrap();
             let model = if seed % 2 == 0 {
                 CrashModel::InOrder
             } else {
@@ -560,19 +581,33 @@ mod tests {
             let mut after = disk.crash(&mut SplitMix64::new(seed), model);
             let bytes = contents(&mut after, "d/f").expect("a synced file survives");
             assert!(bytes.starts_with(b"synced"), "{bytes:?}");
-            let tail = &bytes[6..];
-            let one = tail.get(..4) == Some(b"-one");
-            let two = tail.get(4..8) == Some(b"-two");
-            if model == CrashModel::InOrder && two {
+            let sector = |i: usize| bytes.get(i * 512..(i + 1) * 512).map(|s| s[511]);
+            let first: Vec<_> = (0..3).map(|i| sector(i) == Some(1)).collect();
+            let second: Vec<_> = (3..6).map(|i| sector(i) == Some(2)).collect();
+            // Every sector is all or nothing.
+            for i in 0..6 {
+                if let Some(range) = bytes.get((i * 512).max(6)..(i + 1) * 512) {
+                    assert!(
+                        range.windows(2).all(|w| w[0] == w[1]),
+                        "sector {i} is split"
+                    );
+                }
+            }
+            if model == CrashModel::InOrder {
                 assert!(
-                    one,
+                    second.iter().all(|&s| !s) || first.iter().all(|&s| s),
                     "in order, the second write survives only after the first"
                 );
+                // Within a write, sectors survive as a prefix.
+                for write in [&first, &second] {
+                    assert!(write.windows(2).all(|w| w[0] || !w[1]), "{write:?}");
+                }
             }
-            seen_reordered |= two && !one;
-            seen_torn |= !tail.is_empty() && !one && !two;
+            seen_reordered |= second.iter().all(|&s| s) && !first.iter().all(|&s| s);
+            seen_torn |= first.iter().any(|&s| s) && !first.iter().all(|&s| s);
+            seen_gap |= first[0] && !first[1] && first[2];
         }
-        assert!(seen_torn && seen_reordered);
+        assert!(seen_torn && seen_reordered && seen_gap);
     }
 
     /// Unsynced creations, renames and removals survive as an ordered prefix.

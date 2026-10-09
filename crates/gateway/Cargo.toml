@@ -1,0 +1,17 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+description = "The exchange's TCP gateway: sessions, pre-trade risk and order routing in front of the engine."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+orderbook = { path = "../orderbook" }
+protocol = { path = "../protocol" }
+
+[dev-dependencies]
+proptest = "1.11.0"

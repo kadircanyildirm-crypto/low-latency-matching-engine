@@ -157,7 +157,9 @@ impl Record {
 }
 
 /// The state every engine must reach: the same trades and the same final book.
+/// `repr(C)`, so the C++ adapter can fill one in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct Summary {
     /// Executions, one per resting order a taker trades with.
     pub trades: u64,

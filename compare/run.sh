@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Head-to-head comparison driver; see docs/COMPARISON.md. Run from anywhere:
 #
+#   compare/run.sh fetch           clone the C++ competitor at its pinned commit into
+#                                  compare/vendor (git-ignored)
 #   compare/run.sh export          record the command streams into compare/data
 #   compare/run.sh ours            one round of our engine over every scenario
 #   compare/run.sh orderbook-rs    one round of OrderBook-rs (crates.io)
+#   compare/run.sh liquibook       one round of liquibook (C++; needs fetch)
 #   compare/run.sh all [ROUNDS]    ROUNDS interleaved rounds (default 5) of every engine,
 #                                  into a fresh compare/results/results.csv, then the report
 #   compare/run.sh report          summarise compare/results/results.csv
@@ -14,19 +17,43 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+vendor="$here/vendor"
 results="$here/results/results.csv"
 
 # Every engine with an adapter, in the order of the first round.
-ENGINES=(ours orderbook-rs)
+ENGINES=(ours orderbook-rs liquibook)
+
+# Competitors built from source, pinned to the commits the comparison used.
+LIQUIBOOK_URL=https://github.com/enewhuis/liquibook.git
+LIQUIBOOK_REV=2427613b32f1667abae68a01df6af9ba8270f8e7
 
 cargo_cmp() {
     cargo "$1" --manifest-path "$here/Cargo.toml" "${@:2}"
+}
+
+# clone_pinned NAME URL REV: a checkout of REV in compare/vendor/NAME.
+clone_pinned() {
+    local dir="$vendor/$1"
+    if [[ ! -d "$dir/.git" ]]; then
+        git clone --quiet "$2" "$dir"
+    fi
+    if ! git -C "$dir" cat-file -e "$3^{commit}" 2>/dev/null; then
+        git -C "$dir" fetch --quiet origin
+    fi
+    git -C "$dir" checkout --quiet --detach "$3"
+    echo "$1 at $(git -C "$dir" rev-parse HEAD)"
+}
+
+fetch() {
+    mkdir -p "$vendor"
+    clone_pinned liquibook "$LIQUIBOOK_URL" "$LIQUIBOOK_REV"
 }
 
 run_engine() {
     case "$1" in
         ours) cargo_cmp run --release --quiet --bin run-ours ;;
         orderbook-rs) cargo_cmp run --release --quiet --bin run-orderbook-rs ;;
+        liquibook) cargo_cmp run --release --quiet --bin run-liquibook ;;
         *)
             echo "unknown engine: $1 (known: ${ENGINES[*]})" >&2
             exit 2
@@ -52,6 +79,7 @@ all() {
 }
 
 case "${1:-}" in
+    fetch) fetch ;;
     export) cargo_cmp run --release --quiet --bin export ;;
     all) all "${2:-5}" ;;
     report) cargo_cmp run --release --quiet --bin report ;;

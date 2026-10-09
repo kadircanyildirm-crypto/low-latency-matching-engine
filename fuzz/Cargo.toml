@@ -14,6 +14,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 engine = { path = "../crates/engine" }
+gateway = { path = "../crates/gateway" }
 libfuzzer-sys = "0.4.13"
 orderbook = { path = "../crates/orderbook" }
 protocol = { path = "../crates/protocol" }
@@ -54,6 +55,13 @@ bench = false
 [[bin]]
 name = "protocol"
 path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway"
+path = "fuzz_targets/gateway.rs"
 test = false
 doc = false
 bench = false

@@ -33,8 +33,7 @@ use orderbook_fuzz::{CommandInput, ConfigInput, Prices};
 struct Input {
     config: ConfigInput,
     always: bool,
-    /// Records per segment: 1 to 32.
-    segment: u8,
+    segment: SegmentInput,
     /// Commands between snapshots: never, or 1 to 64.
     snapshot_every: Option<u8>,
     /// Snapshots kept: 1 to 3.
@@ -69,6 +68,17 @@ enum Step {
 struct Failure {
     in_order: bool,
     seed: u64,
+    /// Recovery itself dies after this many changes, and the power fails again or not.
+    recovery_dies: Option<(u8, bool)>,
+}
+
+/// Records per segment.
+#[derive(Arbitrary, Clone, Copy, Debug)]
+enum SegmentInput {
+    /// 1 to 32: many rolls.
+    Small(u8),
+    /// 1,024 to 2,816: the next segment is prepared in two or three pieces.
+    Large(u8),
 }
 
 /// Most steps and commands per input, so runs stay fast.
@@ -121,7 +131,10 @@ fuzz_target!(|input: Input| {
         } else {
             SyncPolicy::Os
         },
-        segment_capacity: 1 + u32::from(input.segment % 32),
+        segment_capacity: match input.segment {
+            SegmentInput::Small(n) => 1 + u32::from(n % 32),
+            SegmentInput::Large(n) => 1_024 + 256 * u32::from(n % 8),
+        },
         snapshot_every: input.snapshot_every.map(|n| 1 + u64::from(n % 64)),
         keep_snapshots: 1 + usize::from(input.keep % 3),
         verify_replay: input.verify,
@@ -200,14 +213,35 @@ fuzz_target!(|input: Input| {
         let durable = engine.durable_seq() as usize;
         let acked = history.commands.len();
         drop(engine);
+        let mut power_failed = false;
         match power {
-            Some(Failure { in_order, seed }) => {
+            Some(Failure {
+                in_order,
+                seed,
+                recovery_dies,
+            }) => {
                 let model = if in_order {
                     CrashModel::InOrder
                 } else {
                     CrashModel::AnyOrder
                 };
-                storage = storage.crash(&mut SplitMix64::new(seed), model);
+                let mut rng = SplitMix64::new(seed);
+                storage = storage.crash(&mut rng, model);
+                power_failed = true;
+                if let Some((changes, again)) = recovery_dies {
+                    storage.die_after(u64::from(changes));
+                    let result = open(&storage);
+                    assert!(
+                        result.is_ok() || storage.is_dead() || damaged,
+                        "recovery failed without dying"
+                    );
+                    drop(result);
+                    if again {
+                        storage = storage.crash(&mut rng, model);
+                    } else {
+                        storage.revive();
+                    }
+                }
             }
             None => storage.revive(),
         }
@@ -222,7 +256,7 @@ fuzz_target!(|input: Input| {
             "recovered commands never submitted"
         );
         if !damaged {
-            if power.is_none() {
+            if !power_failed {
                 assert!(
                     kept >= acked,
                     "a killed process lost commands: {kept} of {acked}"

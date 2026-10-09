@@ -1,0 +1,15 @@
+[package]
+name = "ring"
+version = "0.1.0"
+description = "A bounded lock-free single-producer single-consumer ring buffer for the pipeline's stages."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

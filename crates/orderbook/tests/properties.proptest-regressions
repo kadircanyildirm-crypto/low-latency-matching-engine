@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 97e5edf70ad16e0d3ea0c66d578d2595b60bb893f90bd0239d5d9bf79e4ca89c # shrinks to (cfg, commands) = (BookConfig { min_price: 90, max_price: 110, max_orders: 16, max_owners: 1024, max_order_qty: 1152921504606846975, max_iceberg_tranches: 10, price_protection: None, price_band: None, reference_price: None, auction_on_band: false, self_trade: CancelResting }, [SetPhase { phase: Auction }, Limit { id: 0, owner: 0, side: Buy, price: 102, qty: 2, tif: Gtc, display: Some(1) }, Limit { id: 1, owner: 0, side: Sell, price: 95, qty: 2, tif: Gtc, display: None }, SetPhase { phase: Continuous }])
+cc bd7ff8ae0f54832508da35465d21860de9ee476ae6c91a1795fbd8abe673a9b9 # shrinks to (cfg, commands) = (BookConfig { min_price: 100, max_price: 140, max_orders: 2, max_owners: 3, max_order_qty: 9223372036854775807, max_iceberg_tranches: 3, price_protection: None, price_band: Some(10), reference_price: Some(120), auction_on_band: true, self_trade: CancelIncoming }, [Limit { id: 0, owner: 0, side: Buy, price: 100, qty: 0, tif: Gtc, display: None }, SetPhase { phase: Auction }, Limit { id: 0, owner: 0, side: Buy, price: 101, qty: 0, tif: Gtc, display: None }, Limit { id: 0, owner: 0, side: Sell, price: 100, qty: 5, tif: Gtc, display: Some(2) }, Limit { id: 1, owner: 0, side: Buy, price: 101, qty: 5, tif: Gtc, display: None }, SetPhase { phase: Continuous }])

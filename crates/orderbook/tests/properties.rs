@@ -730,7 +730,9 @@ fn check_uncross(before: &State, events: &[Event]) -> Effect {
             (taker_leaves, maker_leaves) == (b.leaves, s.leaves),
             "leaves are wrong",
         )?;
-        for (side, queue) in [(Side::Buy, buy), (Side::Sell, sell)] {
+        // An iceberg shows its next tranche at its own price, not the auction price.
+        let (bid, ask) = (*bid, *ask);
+        for (side, queue, own) in [(Side::Buy, buy, bid), (Side::Sell, sell, ask)] {
             let front = *queue.front().unwrap();
             if front.leaves == 0 {
                 queue.pop_front();
@@ -744,10 +746,10 @@ fn check_uncross(before: &State, events: &[Event]) -> Effect {
                         == Some(&Event::Replenished {
                             id: front.id,
                             side,
-                            price,
+                            price: own,
                             visible,
                         }),
-                    "an iceberg's used-up tranche must be replenished at once, the buy order's first",
+                    "an iceberg's used-up tranche must be replenished at once, at its own price, the buy order's first",
                 )?;
                 i += 1;
                 let mut iceberg = queue.pop_front().unwrap();

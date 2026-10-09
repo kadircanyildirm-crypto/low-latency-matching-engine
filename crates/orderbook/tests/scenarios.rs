@@ -2191,3 +2191,35 @@ fn negative_prices_work() {
     let events = run(&mut b, limit(2, Buy, -30, 4));
     assert_eq!(fills(&events), [(1, -37, 4)]);
 }
+
+/// An iceberg whose tranche runs out in an uncross shows its next one at its own price,
+/// which need not be the auction price.
+#[test]
+fn an_iceberg_replenished_in_an_uncross_shows_at_its_own_price() {
+    let mut b = call();
+    run(&mut b, iceberg(1, 1, Buy, 105, 10, 2));
+    // Most volume executes at 100: 20 against 30 bid, against 10 at 105.
+    run(&mut b, limit(3, Buy, 100, 20));
+    run(&mut b, limit(2, Sell, 100, 20));
+    let events = run(&mut b, set_phase(Phase::Continuous));
+    let price = events
+        .iter()
+        .find_map(|e| match e {
+            Trade { price, .. } => Some(*price),
+            _ => None,
+        })
+        .expect("the uncross trades");
+    let replenished_at: Vec<Price> = events
+        .iter()
+        .filter_map(|e| match e {
+            Replenished { price, .. } => Some(*price),
+            _ => None,
+        })
+        .collect();
+    assert!(!replenished_at.is_empty(), "{events:?}");
+    assert_eq!(price, 100);
+    assert!(
+        replenished_at.iter().all(|&p| p == 105),
+        "auction at {price}, replenished at {replenished_at:?}"
+    );
+}

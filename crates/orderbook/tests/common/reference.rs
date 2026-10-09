@@ -584,8 +584,8 @@ impl ReferenceBook {
                 taker_leaves: buy.leaves,
                 maker_leaves: sell.leaves,
             });
-            self.after_uncross_fill(Side::Buy, bid, price, out);
-            self.after_uncross_fill(Side::Sell, ask, price, out);
+            self.after_uncross_fill(Side::Buy, bid, out);
+            self.after_uncross_fill(Side::Sell, ask, out);
         }
         self.reference = Some(price);
         self.traded = Some((price, price));
@@ -593,7 +593,7 @@ impl ReferenceBook {
 
     /// The order at the front of the queue at `level` just traded in an uncross: it leaves
     /// if it is filled; an iceberg out of its tranche shows the next one at the back.
-    fn after_uncross_fill(&mut self, side: Side, level: Price, price: Price, out: &mut Vec<Event>) {
+    fn after_uncross_fill(&mut self, side: Side, level: Price, out: &mut Vec<Event>) {
         let queue = self.ladder(side).get_mut(&level).unwrap();
         let front = *queue.front().unwrap();
         if front.leaves == 0 {
@@ -605,7 +605,7 @@ impl ReferenceBook {
             out.push(Event::Replenished {
                 id: iceberg.id,
                 side,
-                price,
+                price: level,
                 visible: iceberg.visible,
             });
             queue.push_back(iceberg);

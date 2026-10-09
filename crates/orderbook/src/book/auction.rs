@@ -128,6 +128,7 @@ impl OrderBook {
             return;
         };
         let price = self.price_of(level);
+        let min_price = self.config.min_price;
         self.reference = Some(level);
         self.traded = Some((level, level));
         let Self {
@@ -161,8 +162,11 @@ impl OrderBook {
             });
             bids.levels[bid as usize].total_qty -= fill;
             asks.levels[ask as usize].total_qty -= fill;
-            bids.settle_head(bid, price, pool, index, owners, sink);
-            asks.settle_head(ask, price, pool, index, owners, sink);
+            // Each order's own price, which may be on the far side of the auction price.
+            let bid_price = min_price + Price::from(bid);
+            let ask_price = min_price + Price::from(ask);
+            bids.settle_head(bid, bid_price, pool, index, owners, sink);
+            asks.settle_head(ask, ask_price, pool, index, owners, sink);
         }
     }
 
@@ -231,9 +235,9 @@ impl OrderBook {
 }
 
 impl HalfBook {
-    /// After the order at the head of `level` traded in an uncross: takes it off the book if
-    /// it is filled, or shows an iceberg's next tranche at the back of the queue and of its
-    /// owner's list, as continuous matching does.
+    /// After the order at the head of `level`, whose price is `price`, traded in an uncross:
+    /// takes it off the book if it is filled, or shows an iceberg's next tranche at the back
+    /// of the queue and of its owner's list, as continuous matching does.
     fn settle_head<S: EventSink>(
         &mut self,
         level: u32,

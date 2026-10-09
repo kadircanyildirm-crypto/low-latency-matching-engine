@@ -1,11 +1,12 @@
 # Design of the matching engine
 
 This document explains what the order book in `crates/orderbook`, the journal and recovery
-in `crates/engine` around it, and the gateway in `crates/protocol` and `crates/gateway` in
-front of them, do, how, and why. It also says what they deliberately do not do yet. Every
-claim here is backed by a test: the [verification](#11-verification) section says which
-one for the book, [§14](#how-it-is-verified) for the engine and
-[§15](#how-it-is-verified-1) for the gateway.
+in `crates/engine` around it, the gateway in `crates/protocol` and `crates/gateway` in
+front of them, and the pipeline and market data of `crates/ring` and `crates/marketdata`,
+do, how, and why. It also says what they deliberately do not do yet. Every claim here is
+backed by a test: the [verification](#11-verification) section says which one for the
+book, [§14](#how-it-is-verified) for the engine, [§15](#how-it-is-verified-1) for the
+gateway and [§16](#how-it-is-verified-2) for the pipeline.
 
 ## 1. Goals
 
@@ -537,7 +538,6 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 |---|---|
 | The book has no per-participant limits: one owner can fill it and block others with `BookFull` | Enforced in front of it: the gateway limits each account's open orders and each session's message rate (§15) |
 | The id index's hash is not keyed: a caller choosing ids adversarially could crowd many into one home line, and lookups would then scan several lines | Through the gateway, ids are sequence numbers and participants never choose them (§15). A directly indexed table was considered: ids grow without bound while an order may rest indefinitely, so it would need the collision handling the index already has |
-| One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
 | Ladder memory grows with band width (see §3) | Phase 6: benchmark alternatives and add a windowed or hybrid ladder |
 | Without `auction_on_band`, a price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6). With it, a band tight against the market's moves keeps the book in calls most of the time (§7) | The band's width is a configuration choice; widening the band during a call, as some exchanges do, is not implemented |
 | Calls refuse market orders; there are no auction-only order types, no published imbalance, and no collar on the auction price besides the static band. Market data can read `indicative_uncross()` | Phase 9 |
@@ -548,15 +548,15 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | Self-trade policy is per book, not per order | Phase 9: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
 | Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 8: a standby holds a second copy to compare against |
-| Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, a segment roll stalls one call for 8 to 23 ms on this laptop, and under `SyncPolicy::Always` a sync costs about a millisecond (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 6: measure Linux, `io_uring` and drives with power-loss protection |
+| A segment roll stalls the journal for 8 to 23 ms on this laptop and a sync costs about a millisecond (§14). The pipeline (§16) takes both off the matching thread, but acknowledgements still wait for them, since the book applies only journaled commands | Phase 6: measure Linux, `io_uring` and drives with power-loss protection |
 | Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 4 or 6: take snapshots from a copy, such as the standby's book |
-| Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 4, with the gateway's receive time: a second record format version |
-| The gateway and the book share one thread: while a batch is journaled and synced, no socket is read | Phase 4: the gateway, the journal and the matcher become stages on cores of their own |
+| Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 6, with per-stage timestamps for the latency breakdown: a second record format version |
+| One network thread reads, routes, publishes market data and writes every socket. On this laptop it, not the matcher, bounds throughput (§16) | Phase 6: measure on Linux first; then split the publisher's writes off, or shard sessions over network threads |
 | Plain TCP; tokens travel and are stored in the clear, and are compared in variable time | Phase 5 puts the public demo behind TLS; Phase 7 brings real account management |
-| A client that reconnects cannot ask what it missed: no order status, no replay of reports from a sequence number, and orders recovered after a restart have lost their client references | Phase 4: the publisher keeps the event stream, and clients resume from a sequence number |
-| No market data: clients only hear about their own orders, and phase changes | Phase 4: the market data publisher |
+| A client that reconnects cannot ask what it missed: no order status, no replay of its reports from a sequence number, and orders recovered after a restart have lost their client references. Market data recovers by a new snapshot, not by replay | Phase 7, with the user-facing API: order status queries, and a report history per account |
+| Market data is one book's levels and trades over the order-entry protocol: no per-order (L3) feed, no multicast, and subscribers must log in | Phase 5 serves it to browsers over WebSocket; per-order feeds when an instrument needs them |
 | A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 8's standby to compare against |
-| Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal` | Phase 4: the publisher tracks its consumers and holds retention back |
+| Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal`. The gateway's own consumers do not need it: they recover from the book (§15, §16) | When an outside consumer of the journal appears, such as Phase 8's standby |
 
 ## 13. Performance work
 
@@ -1024,3 +1024,178 @@ measures open-loop on Linux.
 | `crates/gateway/tests/server.rs` | Real sockets and a real journal: trading, 500 orders in one write, bytes that do not decode before and after login, a client that does not read, the session limit, a stop and restart that keeps the orders, a bad token, and the load generator end to end: every order answered exactly once and the book empty when the clients leave. CI runs it on Linux, Windows and macOS. |
 | `fuzz/fuzz_targets/protocol.rs` | Arbitrary byte streams, read as the gateway reads a client and as a client reads the gateway: decoding never panics, every message decoded re-encodes to its bytes, and a stream cut anywhere decodes the same messages up to the cut. |
 | `fuzz/fuzz_targets/gateway.rs` | Up to four connections that come and go and send raw bytes or well-formed messages, with time passing and batches flushing: nothing panics, nothing reaches a closed session, all reports about an order go to one account, the one that owns it on the book, and open-order counts match the book and stay within the limit. |
+
+## 16. The pipeline and market data
+
+Phase 4 takes the journal off the matching thread and publishes the market. The gateway
+can run the engine as before, on its own thread, or as a pipeline of three threads
+connected by ring buffers of our own; either way the exchange keeps the book's depth from
+the events and publishes it.
+
+### The ring buffer
+
+`crates/ring` is a bounded, lock-free, single-producer single-consumer queue. Each side
+counts the items it has moved, its position, and publishes it with a release store; the
+other side reads it with an acquire load. An item's slot is its position modulo the
+capacity, a power of two. The design follows from where the cost of a queue is: in cache
+lines moving between cores.
+
+- **No false sharing.** The two positions sit 128 bytes apart, so they never share a cache
+  line, nor the pair of lines Intel's adjacent-line prefetcher fetches together.
+- **Cached positions.** Each side keeps a copy of the other's position and reads the real
+  one only when its copy says the ring is full (producer) or empty (consumer). In a steady
+  flow neither side touches the other's line except to publish.
+- **Batches publish once.** `push_from` writes as many items as fit and then stores its
+  position once; `drain` loads the producer's position once and stores its own once, when
+  the batch is dropped. A stage that finds a hundred items waiting pays two shared-memory
+  operations, not two hundred.
+- **Backpressure.** A full ring makes the producer wait: nothing is dropped and nothing
+  grows. A side waits by spinning (`Wait::Spin`, for stages pinned to cores of their own)
+  or by backing off from spinning to yielding to naps of up to 50 µs (`Wait::Backoff`).
+
+The unsafe code is two functions, each with its contract written down: writing a free
+slot, and moving an item out of a full one. Three tools check it:
+
+- **Miri** runs the tests and reports undefined behaviour, data races included.
+- **loom** runs two models under every interleaving of the two sides and every order the
+  memory model lets them see each other's writes in: items crossing a ring smaller than
+  their number, one at a time and in batches, and items left behind when one side goes.
+  Weakening the producer's release store to relaxed fails it.
+- A **model test** checks every operation against `VecDeque` over thousands of random
+  sequences, with exact drop counting through wrap-around and leaked batches, and two
+  threads move two million items with mixed single and batched operations.
+
+`cargo bench -p ring --bench ring`, two threads on two P-cores of the i5-12450H laptop,
+queues of 1,024 items, every side spinning:
+
+| | Items/s | Round trip, mean | p50 | p99.9 |
+|---|---:|---:|---:|---:|
+| ring, batches | 372 M | | | |
+| ring, one at a time | 91 M | 367 ns | 200 ns | 800 ns |
+| `crossbeam-channel`, bounded | 53 M | 613 ns | 400 ns | 1,200 ns |
+| `std::sync::mpsc::sync_channel` | 41 M | 539 ns | 300 ns | 1,200 ns |
+
+Percentiles come from a clock of 100 ns resolution on Windows; the means do not. Two
+hyperthreads of one core, which share its caches, run every queue about twice as fast.
+
+### The engine, split
+
+`Engine` is now the composition of two halves. The **writer** numbers commands, writes and
+syncs them, and removes journal segments; it holds the directory lock, and a failed write
+or sync poisons it. The **matcher** applies journaled commands in sequence, takes
+snapshots and deletes old ones, and returns the sequence number through which the writer
+may remove segments. `Engine::split` separates them; `Engine` itself runs them in step and
+behaves exactly as before, every Phase 2 test unchanged. The rule that the journal must
+reach a snapshot before the snapshot exists is enforced where the halves meet:
+`Matcher::snapshot` takes the writer's durable sequence number and panics if it falls
+short. Without that rule, recovery from the snapshot itself would still be right, as a test
+showed when the sync was dropped; what it guarantees is that the journal and an older
+snapshot can rebuild the newer one too.
+
+### The pipeline
+
+```text
+  network thread           writer thread             matcher thread
+  sessions, risk,  ──A──▶  journal: write, sync, ──B──▶  book: apply,  ──┐
+  routing, md      ◀──────────────────────C──────────── snapshots      ◀─┘
+```
+
+- **A** carries commands, numbered by the exchange in the order the writer journals them
+  (an order's id is still its command's sequence number; the writer checks it).
+- **B** carries each command with its sequence number once it is journaled, and synced
+  under `SyncPolicy::Always`: the book never sees a command the journal could lose, and
+  since reports come from the book's events, no client hears of one either.
+- **C** carries the events back. The network thread routes them, keeps the depth, and
+  publishes.
+
+The writer takes whatever waits in A as one batch, so the slower the disk, the larger each
+sync's batch: group commit happens by itself. Segment rolls and syncs happen on the
+writer's thread. The matcher waits for the disk only for a snapshot under `SyncPolicy::Os`:
+it asks the writer for a sync through the snapshot and waits for the writer's durable
+position to reach it. The writer, which owns the journal, also removes the segments a
+snapshot freed.
+
+Every ring is bounded, and the waits cannot form a cycle: the writer waits for room in B,
+the matcher for room in C, but the network thread never blocks on a ring and always drains
+C. When A is full it keeps the rest of the batch and stops reading its sockets, so clients
+wait instead of the batch growing. While the writer waits for room in B it still serves
+the matcher's sync requests, or a matcher waiting for a sync would never get room.
+
+A failure ends its thread, and the rings close behind it: the matcher applies what the
+writer journaled before it stopped, the network thread delivers what the matcher applied,
+then joins the threads and reports why, which logs every session out and stops the server.
+
+For the exchange to work with events that come later, from another thread, it no longer
+holds the engine. It numbers commands as they enter the batch, hands the batch over, and
+keeps the commands in flight with their sender, owner and whether they place an order,
+until a later command's events show theirs are all in. The server is generic over a
+`Core`: an engine on its own thread is one, the pipeline another.
+
+The test that runs the same sessions through the pipeline and through an engine on one
+thread, and requires exactly the same replies, found a lost wake-up. The network thread
+asked whether events might still come by checking the event ring and then the matcher's
+progress; between the two, the matcher could push the last events of a batch and publish
+its progress, and the network thread would wait a whole tick before delivering them. It
+now reads the progress first: the matcher publishes it after the events, so the ring is
+checked after everything it covers is in.
+
+### Market data
+
+`crates/marketdata` keeps a book's depth from its events alone: every resting order's side,
+price, what it shows and what is left, and per level the quantity shown and the number of
+orders. Trades take from what the resting orders show (both of them in an uncross); an
+iceberg shows its next tranche with `Replenished`; a cancel removes the rest; a modify
+that keeps the price and adds nothing shrinks the order in place, its hidden part first,
+and any other modify takes it off, to rest again with a `Rested` of its own. Since it needs
+only the events, it runs on the network thread, not the matcher.
+
+A session that sends `Subscribe` gets a `BookSnapshot` with the number of levels that
+follow, the levels as `LevelUpdate`s, bids best first and then asks, and from then on,
+after every round, the trades as `TradeTick`s and every level that changed, once each, as
+it now is. Everything carries the sequence number of the last command it reflects. The
+subscription first publishes what is pending to the others and then sends the book under
+that publication's number, so the updates that follow start exactly from it. A client
+that loses track subscribes again and starts over: recovery is by snapshot, not replay.
+
+Keeping the depth from the events found a defect that four phases of tests had missed. When
+an iceberg's tranche ran out in an uncross, `Replenished` gave the auction price instead of
+the iceberg's own, which differ for any iceberg priced through the auction price. The
+reference book of the differential tests and fuzzer made the same mistake, and a property
+encoded it, so nothing disagreed. Both are fixed, a scenario pins the case, and the rules
+version rose to 2: a command now emits other events than before.
+
+### Cost
+
+`loadgen` against the gateway on the same laptop, four clients over loopback, the network,
+writer and matcher threads pinned to separate P-cores and spinning, three seconds each:
+
+| Engine | Sync | Orders in flight | Orders/s | p50 | p99 |
+|---|---|---:|---:|---:|---:|
+| one thread | `Always` | 64 | 13,800 | 4.6 ms | 11 ms |
+| pipeline | `Always` | 64 | 13,800 | 4.1 ms | 13 ms |
+| one thread | `Os` | 64 | 344,000 | 96 µs | 600 µs |
+| pipeline | `Os` | 64 | 197,000 | 163 µs | 2.7 ms |
+| one thread | `Os` | 512 | 676,000 | 364 µs | 15 ms |
+| pipeline | `Os` | 512 | 629,000 | 298 µs | 16 ms |
+| pipeline, backing off | `Os` | 512 | 245,000 | 1.2 ms | 18 ms |
+
+The pipeline does not raise throughput here, and the numbers say why: the network thread,
+which reads, routes and writes every socket, is the bottleneck in both modes, and the
+pipeline adds two hops between threads to every order's round trip. With few orders in
+flight those hops are the round trip's cost; with many, both modes saturate the network
+thread. Under `Always` both wait for the same sync. What the pipeline changes is where the
+disk's stalls land: a roll or a sync now stops the writer, not the thread that reads
+sockets and matches. Backing off instead of spinning costs most: a stage that naps wakes
+late. These are closed-loop numbers on a laptop with the clients beside the server; Phase
+6 measures open-loop on Linux, with timestamps per stage.
+
+### How it is verified
+
+| Test | What it shows |
+|---|---|
+| `crates/ring/tests/ring.rs`, `tests/loom.rs`, Miri | As above: a model test with drop counting, two threads at full speed, loom models of every interleaving, and Miri over all of it. |
+| `crates/engine/tests/split.rs` | The halves driven as a pipeline would, the writer ahead by any number of commands and freed segments removed later, under both sync policies and both crash models: recovery keeps every durable command and nothing unjournaled, and the matcher's events are the whole engine's. A snapshot without a durable journal panics. |
+| `crates/gateway/tests/pipeline.rs` | Sessions sending the same messages through the pipeline and through an engine on one thread get exactly the same replies and market data, with snapshots and retention on the threads, rings of 1 to 64 items and both ways of waiting, and the files left recover to the same book. A disk that fails stops the pipeline with every reported command recoverable; a power failure while it runs loses nothing reported. |
+| `crates/marketdata/tests/depth.rs` | 40 flows of 3,000 commands of every kind, half through calls that end in an uncross: after every command the depth equals the book's, every changed level is reported, and a depth taken from the book matches the one kept. |
+| `crates/gateway/tests/exchange.rs`, `tests/server.rs` | A client that subscribes in the middle of trading rebuilds exactly the book's depth from the snapshot and the updates; market data reaches a subscriber over TCP through either core; the load generator trades through the pipeline, which also stops and restarts with its orders. |
+| `fuzz/fuzz_targets/gateway.rs` | Also subscribes sessions and publishes: the depth kept equals the book's after every flush, and market data reaches only logged-in sessions. |

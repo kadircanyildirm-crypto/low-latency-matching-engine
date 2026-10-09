@@ -6,8 +6,9 @@
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
 
-**Status:** Phases 1 to 3 of 9 are complete: the matching core, the journal and crash
-recovery around it, and a TCP gateway in front of them. The next phases lead to a public
+**Status:** Phases 1 to 4 of 9 are complete: the matching core, the journal and crash
+recovery around it, a TCP gateway in front of them, and a pipeline of threads with market
+data. The next phases lead to a public
 web demo with paper trading, then to outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
 decision is in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -304,6 +305,38 @@ loopback):
 
 Details and reasoning are in [DESIGN.md §15](docs/DESIGN.md#15-the-gateway).
 
+## Phase 4: the pipeline and market data
+
+The engine can run as a pipeline of threads, LMAX-style: the network thread hands commands
+to a writer thread that journals them, which hands them to a matcher thread that applies
+them, whose events come back to the network thread to be routed and published. The
+stages are connected by a lock-free ring buffer of our own.
+
+```sh
+cargo run --release -p gateway --bin gateway -- --dir data --accounts crates/gateway/accounts.example \
+    --engine pipeline --wait spin --cores 2,4,6    # network, writer, matcher threads
+```
+
+| Property | How |
+|---|---|
+| A ring buffer of our own | Single producer, single consumer, lock-free; positions 128 bytes apart against false sharing, each side caching the other's, batches published with one store. The unsafe code is checked by Miri, by loom over every interleaving and memory ordering (weakening one release store fails it), and against a model. 91 M items/s one at a time and 372 M in batches between two P-cores, against 53 M for `crossbeam-channel` and 41 M for `std::sync::mpsc`; 367 ns round trips against 613 and 539. |
+| Write-ahead across threads | The writer passes a command on only once it is journaled (and synced under `Always`), so the book never sees a command the journal could lose, and no client hears of one. Segment rolls and syncs happen on the writer's thread; snapshots on the matcher's, after the writer syncs through them. |
+| Backpressure without deadlock | Every ring is bounded. A full ring makes its producer wait; the network thread never blocks on a ring and always drains the events, so the waits cannot form a cycle, and when the writer falls behind it simply stops reading sockets. |
+| Same answers, any core | The same sessions get exactly the same replies and market data through the pipeline as through the engine on one thread, under snapshots and retention, with rings of 1 to 64 items. |
+| Market data | `Subscribe` gets the book's depth by price level, then trades and every level that changes, each under the sequence number of the last command it reflects. The depth is kept from the events alone, on the network thread, and equals the book's after every command of 120,000 tested. |
+
+Keeping the depth from the events exposed a Phase 1 defect that the differential tests had
+missed because their reference model shared it: in an uncross, a replenished iceberg was
+reported at the auction price instead of its own. It is fixed, and the rules version rose
+to 2.
+
+**What the pipeline costs** (`loadgen`, same laptop, loopback, threads pinned and spinning):
+up to 629,000 orders/s against 676,000 for the engine on one thread, with 512 orders in
+flight under `Os`. The pipeline does not raise throughput here: the network thread is the
+bottleneck in both modes, and the pipeline adds two hops between threads to every round
+trip. What it changes is where the disk's stalls land. Phase 6 measures it properly, on
+Linux. Details in [DESIGN.md §16](docs/DESIGN.md#16-the-pipeline-and-market-data).
+
 ## Running
 
 ```sh
@@ -314,7 +347,11 @@ cargo bench --bench throughput            # Criterion before/after comparison (i
 cargo bench -p engine --bench journal    # journaling cost per sync policy, replay and snapshot speed
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
 cargo mutants -p engine --exclude crates/engine/src/sim.rs --exclude crates/engine/src/bin/engine-soak.rs
-cargo mutants -p gateway --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
+cargo mutants -p gateway --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs --file crates/gateway/src/pipeline.rs
+cargo mutants -p ring && cargo mutants -p marketdata
+cargo +nightly miri test -p ring                                         # the ring's unsafe code under Miri
+RUSTFLAGS="--cfg loom" cargo test -p ring --test loom --release          # and under loom
+cargo bench -p ring --bench ring                                         # ring vs crossbeam and std (RING_CORES=a,b)
 cargo +nightly fuzz run differential -s none -a -- -max_total_time=60 -len_control=0   # fuzzing
 (cd crates/orderbook && cargo kani)                                     # proofs (Linux, macOS)
 cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|engine-soak)\.rs' --summary-only   # coverage

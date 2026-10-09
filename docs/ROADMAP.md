@@ -9,8 +9,8 @@ documented are worth more than five half-finished ones.
 | 1 | Matching core + test infrastructure + benchmarks | ✅ Done |
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ✅ Done |
-| 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ⏳ Next |
-| 5 | Public web demo: paper trading against bots, live order book | — |
+| 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ✅ Done |
+| 5 | Public web demo: paper trading against bots, live order book | ⏳ Next |
 | 6 | End-to-end measurement and optimisation on Linux | — |
 | 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
 | 8 | Hot standby replication and failover | — |
@@ -161,21 +161,41 @@ twenty minutes each a week); end-to-end order flow driven by the load generator
 
 ---
 
-## Phase 4 — Pipeline and market data
+## Phase 4 — Pipeline and market data ✅
 
 **Goal:** an LMAX-style staged architecture, with each stage on its own core.
 
-- Our own SPSC ring buffer: cache-line padding, no false sharing, batched reads.
-- Stages: gateway → sequencer/journal → matcher → publisher. The journal leaves the
-  matching thread, taking segment rolls and syncs with it.
-- One command can emit any number of events (a sweep emits one per order it reaches), so
-  the matcher-to-publisher path must handle batches of any size.
-- Market data publisher: L2 snapshots plus incremental updates, and consumers that resume
-  from a sequence number, holding journal retention back while they need it.
-- CPU pinning, busy-spin waiting, backpressure.
+**Delivered** (`crates/ring`, `crates/marketdata`, `crates/gateway/src/pipeline.rs`,
+[DESIGN.md §16](DESIGN.md#16-the-pipeline-and-market-data))
+- Our own SPSC ring buffer: positions on separate cache-line pairs, cached copies of the
+  other side's position, batched writes and reads that publish once, bounded with
+  backpressure, spinning or backing off while it waits. Checked by Miri, loom and a model
+  test; benchmarked against `crossbeam-channel` and `std::sync::mpsc`.
+- The engine split into a writer and a matcher, and a pipeline that runs them on threads
+  of their own behind the network thread: gateway → writer (journal, segment rolls,
+  syncs, retention) → matcher (book, snapshots) → back to the network thread, which routes
+  reports and publishes market data. Write-ahead holds across the threads, group commit
+  happens by itself, and a failure on any thread stops the server cleanly.
+- Events of any number per command: the matcher waits for room rather than drop or buffer
+  them, and the network thread always drains them, so the waits cannot form a cycle.
+- Market data: the depth by price level kept from the events alone, published as a
+  snapshot on subscription and then trades and changed levels after every round, each with
+  the sequence number of the last command it reflects.
+- CPU pinning (`--cores network,writer,matcher`), busy-spin or backoff waiting
+  (`--wait`), and backpressure from the rings to the clients' sockets.
 
-**Acceptance criteria:** separate tests and a benchmark for the ring buffer; the pipeline
-runs end to end.
+Changed from the plan: market data consumers recover by a new snapshot rather than by
+replaying from a sequence number, so nothing holds journal retention back for them; a
+replay of a client's own reports moves to Phase 7 with the user-facing API.
+
+Measured honestly, the pipeline does not raise throughput on the laptop: the network
+thread bounds both modes, and the pipeline adds two hops per round trip. Phase 6 measures
+on Linux, open-loop, with timestamps per stage.
+
+**Acceptance criteria:** separate tests and a benchmark for the ring buffer
+(`crates/ring`: Miri, loom, a model test, `cargo bench -p ring`); the pipeline runs end to
+end (`crates/gateway/tests/server.rs`: the load generator trades through it over TCP, on
+Linux, Windows and macOS). Both met.
 
 ---
 

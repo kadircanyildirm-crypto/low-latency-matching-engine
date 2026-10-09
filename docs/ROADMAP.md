@@ -9,11 +9,17 @@ documented are worth more than five half-finished ones.
 | 1 | Matching core + test infrastructure + benchmarks | ✅ Done |
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ⏳ Next |
-| 4 | Pipeline: gateway → sequencer → matcher → publisher | — |
-| 5 | End-to-end measurement and optimisation on Linux | — |
-| 6 | Hot standby replication and failover | — |
-| 7 | Extensions (optional) | — |
+| 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | — |
+| 5 | Public web demo: paper trading against bots, live order book | — |
+| 6 | End-to-end measurement and optimisation on Linux | — |
+| 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
+| 8 | Hot standby replication and failover | — |
+| 9 | Extensions (optional) | — |
 
+Phases 3 to 6 build something to show: a running exchange anyone can open in a browser,
+with defensible numbers behind it. Phases 7 and 8 turn it into something people use and can
+rely on. Real money is out of scope: it needs a licence, customer identification and
+custody.
 ---
 
 ## Phase 1 — Matching core ✅
@@ -135,15 +141,17 @@ generator.
 
 ---
 
-## Phase 4 — Pipeline
+## Phase 4 — Pipeline and market data
 
 **Goal:** an LMAX-style staged architecture, with each stage on its own core.
 
 - Our own SPSC ring buffer: cache-line padding, no false sharing, batched reads.
-- Stages: gateway → sequencer/journal → matcher → publisher.
+- Stages: gateway → sequencer/journal → matcher → publisher. The journal leaves the
+  matching thread, taking segment rolls and syncs with it.
 - One command can emit any number of events (a sweep emits one per order it reaches), so
   the matcher-to-publisher path must handle batches of any size.
-- Market data publisher: L2 snapshots plus incremental updates.
+- Market data publisher: L2 snapshots plus incremental updates, and consumers that resume
+  from a sequence number, holding journal retention back while they need it.
 - CPU pinning, busy-spin waiting, backpressure.
 
 **Acceptance criteria:** separate tests and a benchmark for the ring buffer; the pipeline
@@ -151,7 +159,27 @@ runs end to end.
 
 ---
 
-## Phase 5 — Measurement and optimisation (Linux)
+## Phase 5 — Public web demo
+
+**Goal:** a link anyone can open to watch and use a live market, for a CV and a first
+audience. Paper money only: running a real-money exchange needs a licence (in Turkey from
+the Capital Markets Board, SPK), customer identification and custody, and is out of scope.
+
+- A WebSocket gateway next to the binary one, speaking JSON to browsers.
+- A browser interface: live order book depth, trades, a price chart, order entry and
+  cancel, the visitor's own orders and fills.
+- Paper-trading accounts with a starting balance, and position and balance checks before
+  an order is accepted.
+- Bots that make the market lively: market makers, noise traders, a trend follower.
+- A live performance panel: commands per second and the engine's latency percentiles.
+- Deployed on a small Linux server, with the journal and snapshots surviving restarts.
+
+**Acceptance criteria:** the public link works; a visitor can trade against the bots; the
+market keeps running across a restart of the server.
+
+---
+
+## Phase 6 — Measurement and optimisation (Linux)
 
 **Goal:** real, defensible latency numbers.
 
@@ -159,6 +187,8 @@ runs end to end.
 - `isolcpus`, `nohz_full`, IRQ affinity settings.
 - `perf` + flamegraphs and cache-miss analysis, with a before/after chart for every
   optimisation.
+- The journal on Linux: `fdatasync` cost on drives with and without power-loss protection,
+  and `io_uring`.
 - **Research question:** a comparison of order book data structures (ladder + bitset,
   `BTreeMap`, sorted `Vec`) by cache misses and tail latency, for an academic report. It
   also decides the design for markets with very wide price bands.
@@ -168,7 +198,25 @@ documented.
 
 ---
 
-## Phase 6 — Hot standby
+## Phase 7 — Users
+
+**Goal:** people who come back, and developers who build on it.
+
+- Accounts that persist, with history and statistics.
+- A bot API (WebSocket and the binary protocol) with documentation and example bots in a
+  few languages.
+- A bot arena: competitions with a leaderboard, for algorithmic-trading clubs and
+  courses.
+- Several instruments, one book per instrument, sharded across cores.
+- The engine released as an open-source crate on crates.io, with a documentation site.
+- Reaching people: write-ups of the design and the measurements, university clubs,
+  algorithmic-trading and Rust communities.
+
+**Acceptance criteria:** outside users trading or running bots; the crate published.
+
+---
+
+## Phase 8 — Hot standby
 
 **Goal:** if the primary node fails, a standby continues from the same state.
 
@@ -181,10 +229,8 @@ primary's.
 
 ---
 
-## Phase 7 — Extensions (optional)
+## Phase 9 — Extensions (optional)
 
 - Auction extensions: market orders in calls, published imbalances, auction price collars.
 - Per-order self-trade prevention instructions.
-- Multiple instruments (a shard / thread per instrument).
 - A network layer on `io_uring`.
-- A web-based live depth view for demos.

@@ -10,7 +10,7 @@ deliberately do not do yet. Every claim here is backed by a test: the
 
 | Goal | Consequence |
 |---|---|
-| Deterministic | One thread, no clocks, no randomness, no iteration over hash maps. The event stream is a pure function of the command stream, so state can be rebuilt by replay (Phase 2) and mirrored by a standby (Phase 6). |
+| Deterministic | One thread, no clocks, no randomness, no iteration over hash maps. The event stream is a pure function of the command stream, so state can be rebuilt by replay (Phase 2) and mirrored by a standby (Phase 8). |
 | Predictable latency | No heap allocation after construction, O(1) work per order touched, cache-friendly layout. |
 | Exchange-grade semantics | Price-time priority, owner checks, FIX-style modifies, self-trade prevention, price protection, explicit rejections. |
 | Safe | No `unsafe` code; quantity sums cannot overflow for any input (§9); property tests feed extreme values (`u64::MAX` quantities, `i64::MIN`/`MAX` prices) without a panic. |
@@ -68,7 +68,7 @@ at compile time, so an accidental size increase breaks the build.
 **Its limit.** Memory is `2 × 24 bytes × (max_price - min_price + 1)`. A 200k-tick band
 needs about 10 MB, which is fine. But BTC with a $0.01 tick and a $0–$1M band would need
 about 4.8 GB. Wide bands need a different structure: a ladder window that re-centres
-around the touch, or a ladder near the touch with a tree beyond it. Phase 5 benchmarks
+around the touch, or a ladder near the touch with a tree beyond it. Phase 6 benchmarks
 the ladder against `BTreeMap` and a sorted `Vec`, and that comparison decides the design
 for wide markets.
 
@@ -537,20 +537,20 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | No per-participant limits: one owner can fill the book and block others with `BookFull` | Phase 3: pre-trade risk in the gateway (per-session order limits, throttling) |
 | The id index's hash is not keyed: a participant choosing ids adversarially could crowd many into one home line, and lookups would then scan several lines | Phase 3: the gateway assigns order ids, so participants never choose them; with sequential ids, a directly indexed table could replace the hash altogether |
 | One command can emit any number of events: a market order that sweeps the book emits one per order it reaches | Phase 4: the publisher and its ring buffers must accept a batch of any size |
-| Ladder memory grows with band width (see §3) | Phase 5: benchmark alternatives and add a windowed or hybrid ladder |
+| Ladder memory grows with band width (see §3) | Phase 6: benchmark alternatives and add a windowed or hybrid ladder |
 | Without `auction_on_band`, a price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6). With it, a band tight against the market's moves keeps the book in calls most of the time (§7) | The band's width is a configuration choice; widening the band during a call, as some exchanges do, is not implemented |
-| Calls refuse market orders; there are no auction-only order types, no published imbalance, and no collar on the auction price besides the static band. Market data can read `indicative_uncross()` | Phase 7 |
-| The uncross does not prevent self-trades (§7) | Phase 7, with per-order self-trade instructions |
+| Calls refuse market orders; there are no auction-only order types, no published imbalance, and no collar on the auction price besides the static band. Market data can read `indicative_uncross()` | Phase 9 |
+| The uncross does not prevent self-trades (§7) | Phase 9, with per-order self-trade instructions |
 | Calls end only when the sequencer says so; the engine has no timers or random call ends | Phase 4: the sequencer schedules phase changes |
 | An uncross sums the queues of the crossed levels where icebergs rest, so its cost grows with those orders | Measure first; a per-level hidden quantity would remove it at 8 bytes per level per side |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
-| Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
+| Self-trade policy is per book, not per order | Phase 9: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
-| Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 6: a standby holds a second copy to compare against |
-| Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, a segment roll stalls one call for 8 to 23 ms on this laptop, and under `SyncPolicy::Always` a sync costs about a millisecond (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 5: measure Linux, `io_uring` and drives with power-loss protection |
+| Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 8: a standby holds a second copy to compare against |
+| Journaling runs on the matching thread: every submit is a system call, filling the next segment with zeros doubles the bytes written, a segment roll stalls one call for 8 to 23 ms on this laptop, and under `SyncPolicy::Always` a sync costs about a millisecond (§14) | Phase 4: a journal stage on its own core writes whatever the ring buffer holds in one call; Phase 6: measure Linux, `io_uring` and drives with power-loss protection |
 | Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 4 or 6: take snapshots from a copy, such as the standby's book |
 | Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 3/4, with the gateway's receive time: a second record format version |
-| A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 6's standby to compare against |
+| A command that makes the book panic does so again on every replay, so the engine cannot recover past it on its own | Operational: recovery up to a given sequence number, and Phase 8's standby to compare against |
 | Retention does not know where consumers stand: a consumer further behind than the oldest kept snapshot cannot resume, and recovery refuses with `MissingJournal` | Phase 4: the publisher tracks its consumers and holds retention back |
 
 ## 13. Performance work
@@ -796,7 +796,7 @@ What the numbers say:
   committing the file's valid data length, which every append into a merely sized file
   advances, on each sync. A consumer NVMe drive without power-loss protection really writes
   to flash on every flush; drives with power-loss protection acknowledge flushes from their
-  protected cache much faster, which Phase 5 measures, on Linux.
+  protected cache much faster, which Phase 6 measures, on Linux.
 - **Group commit is what makes durability affordable**: at 512 commands per sync, durable
   journaling costs a few microseconds per command instead of a millisecond. In Phase 4 the
   journal stage takes whatever the ring buffer holds, so batches grow with load by

@@ -6,9 +6,10 @@
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
 
-**Status:** Phases 1 and 2 of 7 are complete: the matching core, and the journal and crash
-recovery around it. See [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design decision is in
-[docs/DESIGN.md](docs/DESIGN.md).
+**Status:** Phases 1 and 2 of 9 are complete: the matching core, and the journal and crash
+recovery around it. The next phases lead to a public web demo with paper trading, then to
+outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
+decision is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Phase 1: the order book
 
@@ -186,7 +187,7 @@ By command, in the baseline scenario:
   from run to run, and the maximum reaches milliseconds: preemption by the OS. Even
   medians move by several percent between sessions on this laptop, so only
   same-session comparisons are meaningful. Measurements on an isolated Linux core are
-  part of Phase 5.
+  part of Phase 6.
 - **What this does not measure:** network, serialization, journaling or queueing. This
   is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
   coordinated-omission correction) arrives with the gateway and pipeline phases.

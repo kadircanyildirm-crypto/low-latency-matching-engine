@@ -1,0 +1,125 @@
+name: Scheduled
+
+# Checks too slow for every push: the full mutation test suite, the bitset search proofs, and
+# long fuzzing runs. They also run when this file changes, so a change to them is tested
+# before it is relied on.
+on:
+  schedule:
+    - cron: '17 3 * * 1' # Mondays, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      fuzz-minutes:
+        description: Minutes to fuzz each target
+        default: '20'
+  push:
+    paths:
+      - .github/workflows/scheduled.yml
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The full mutation test suite (README.md#mutation-testing), spread over four runners.
+  # A missed mutant fails the job. A mutant that makes the tests hang is detected too:
+  # cargo-mutants reports it as a timeout, with exit code 3.
+  mutants:
+    name: mutants (shard ${{ matrix.shard }} of 4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Run this shard's mutants
+        run: |
+          # A mutant can make a test loop forever while it allocates, which took the whole
+          # runner down within the test timeout. Capping each process's address space at
+          # 8 GiB makes such a test fail instead, which detects the mutant.
+          ulimit -v 8388608
+          status=0
+          cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs \
+            --shard ${{ matrix.shard }}/4 --sharding round-robin || status=$?
+          for outcome in caught timeout unviable missed; do
+            echo "$outcome: $(cat mutants.out/$outcome.txt 2>/dev/null | wc -l)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          cat mutants.out/missed.txt 2>/dev/null || true
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+
+  # The bitset search proofs, too slow for every push: up to half an hour or more each.
+  kani:
+    name: kani (${{ matrix.proofs }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - proofs: dense bitsets
+            harnesses: --harness dense_sets
+          - proofs: sparse bitsets, two summary words
+            harnesses: --harness sparse_sets_in_two_summary_words
+          - proofs: sparse bitsets, two full summary words
+            harnesses: --harness sparse_sets_in_two_full_summary_words
+          - proofs: sparse bitsets, three summary words
+            harnesses: --harness sparse_sets_in_three_summary_words
+    steps:
+      - uses: actions/checkout@v5
+      - uses: model-checking/kani-github-action@v1.1
+        with:
+          kani-version: '0.68.0'
+          working-directory: crates/orderbook
+          args: --output-format=terse ${{ matrix.harnesses }}
+
+  # Each fuzz target in turn, on every core of the runner, starting from and adding to the
+  # corpus that the CI workflow's short runs also use. The corpus is minimized afterwards.
+  # Flags as in the CI workflow's fuzz job.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      FUZZ_FLAGS: --sanitizer none --debug-assertions --target x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v5
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz each target
+        env:
+          MINUTES: ${{ inputs.fuzz-minutes || '20' }}
+        run: |
+          for target in $(cargo fuzz list); do
+            mkdir -p "fuzz/corpus/$target"
+            for i in $(seq 16); do head -c 4096 /dev/urandom > "fuzz/corpus/$target/random-$i"; done
+            cargo fuzz run "$target" $FUZZ_FLAGS -- \
+              -max_total_time=$((MINUTES * 60)) -len_control=0 -max_len=4096 -fork="$(nproc)"
+            rm -f "fuzz/corpus/$target"/random-*
+            cargo fuzz cmin "$target" $FUZZ_FLAGS
+            echo "$target: $(ls "fuzz/corpus/$target" | wc -l) inputs in the corpus" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

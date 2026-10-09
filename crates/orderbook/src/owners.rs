@@ -125,3 +125,67 @@ impl Owners {
         &mut self.links[slot as usize]
     }
 }
+
+/// Kani proofs over every input within the stated bounds. Run with
+/// `cargo kani -p orderbook`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const OWNERS: u32 = 2;
+    const SLOTS: u32 = 4;
+    const STEPS: usize = 5;
+
+    /// Any sequence of links and unlinks the book can make (a slot is linked to one owner
+    /// when an order starts resting in it, and unlinked from that owner when it leaves),
+    /// including the unlink and relink of one slot that an iceberg's new tranche causes:
+    /// each owner's list holds exactly that owner's linked slots, in the order they were
+    /// linked, with consistent back links, tail and count. Mass cancels rely on the order.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn lists_hold_each_owners_orders_in_link_order() {
+        let mut owners = Owners::new(OWNERS, SLOTS);
+        // The model: each slot's owner while linked, and when it was linked.
+        let mut owner_of: [Option<OwnerId>; SLOTS as usize] = [None; SLOTS as usize];
+        let mut linked_at = [0usize; SLOTS as usize];
+
+        for step in 0..STEPS {
+            let slot: u32 = kani::any_where(|&slot| slot < SLOTS);
+            match owner_of[slot as usize] {
+                None => {
+                    let owner: OwnerId = kani::any_where(|&owner| owner < OWNERS);
+                    owners.link(slot, owner);
+                    owner_of[slot as usize] = Some(owner);
+                    linked_at[slot as usize] = step;
+                }
+                Some(owner) => {
+                    owners.unlink(slot, owner);
+                    owner_of[slot as usize] = None;
+                }
+            }
+
+            for owner in 0..OWNERS {
+                let list = owners.list(owner);
+                let (mut count, mut prev, mut cur) = (0u32, NIL, list.head);
+                while cur != NIL {
+                    assert!(cur < SLOTS && count < SLOTS);
+                    assert_eq!(owner_of[cur as usize], Some(owner));
+                    assert_eq!(owners.link_of(cur).prev, prev);
+                    if prev != NIL {
+                        assert!(linked_at[prev as usize] < linked_at[cur as usize]);
+                    }
+                    count += 1;
+                    prev = cur;
+                    cur = owners.link_of(cur).next;
+                }
+                assert_eq!(list.tail, prev);
+                assert_eq!(list.count, count);
+                let owned = owner_of.iter().filter(|&&of| of == Some(owner)).count();
+                assert_eq!(count as usize, owned);
+            }
+        }
+        let outside: OwnerId = kani::any_where(|&owner| owner >= OWNERS);
+        assert_eq!(owners.list(outside), OwnerList::EMPTY);
+        kani::cover!(owners.list(0).count >= 2, "an owner holds several orders");
+    }
+}

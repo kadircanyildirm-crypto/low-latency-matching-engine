@@ -420,12 +420,110 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 | `tests/snapshot.rs` | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field; every kind of impossible snapshot is refused. |
 | `tests/zero_alloc.rs` | A counting global allocator sees zero allocations in normal flow, in a permanently full book (worst case for the id index), in a deep book, under frequent mass cancels, and through phase changes and uncrosses, and none when computing the digest. |
 | `src/bitset.rs` | Bitset searches agree with `BTreeSet`. |
+| `fuzz/` | Coverage-guided fuzzing of the differential test, of the snapshot round trip, and of `restore` on arbitrary snapshots ([below](#fuzzing-and-formal-verification)). |
+| Kani proofs | The bitset, the order pool's free list and iceberg arithmetic, and the owner lists, for every input within stated bounds ([below](#fuzzing-and-formal-verification)). |
+| Coverage | CI measures line and branch coverage of the engine with cargo-llvm-cov ([numbers](../README.md#verification)). |
 | Mutation testing | Before trading phases, `cargo mutants` injected 340 small faults into the engine, and the tests detected every one of the 319 that compile ([results](../README.md#mutation-testing)). The phase code has not been through a run yet. |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just
 outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, with
 `max_order_qty` itself either small or at the overflow limit.
+
+### Fuzzing and formal verification
+
+Property tests sample a fixed distribution. A fuzzer steers its inputs toward code they
+have not reached yet, and a model checker covers every input within a bound. Both add to
+the layers above; neither replaces them.
+
+**Fuzzing** (`fuzz/`, cargo-fuzz with libFuzzer). The fuzz crate is a workspace of its
+own, so normal builds never compile libFuzzer. The fuzzer's bytes are decoded with
+`arbitrary` into a configuration and commands. The decoding always yields a valid
+configuration, and it is biased like the property tests' strategies: few ids and
+owners, prices at band edges and bitset word boundaries, quantities at the limits. But
+the fuzzer also picks every configuration value: bands of up to 12,289 levels anywhere in
+the `i64` range, 1 to 64 orders, 1 to 5 owners or 1,024, any number of protection and
+band ticks up to `u32::MAX`, up to 255 iceberg tranches, and either self-trade policy. An
+input runs at most 512 commands. Tranches stay few because each one is a trade: with
+`u32::MAX` of them, one command could legally emit billions of events, which only
+exhausts the fuzzer's memory.
+
+| Target | What every run checks |
+|---|---|
+| `differential` | The engine matches the reference book event for event, and in its orders, stops, trade count and reference price, with `validate()` after every command. At the end, `digest()` equals the snapshot's digest. Bands keep 2³³ ticks away from the ends of `i64`, because the reference adds tick counts to prices in plain `i64` arithmetic. |
+| `snapshot_roundtrip` | A snapshot taken at a cut the fuzzer chooses restores to a healthy book with the same snapshot and digest, which then emits exactly the original's events, with `validate()` on both books after every command. Bands may reach `i64::MIN` and `i64::MAX`. |
+| `restore` | Up to 64 commands build a live book. Up to 16 edits then turn its snapshot into anything from valid to garbage: entries made from scratch, any field changed, entries removed, duplicated or moved, any trade count and reference price. `restore` must not panic. It must accept exactly the snapshots that keep the rules `SnapshotError` documents, which the target restates independently of the implementation, and a refusal must name a rule the snapshot breaks. An accepted snapshot must yield a healthy book holding exactly its orders and stops, each level's queue in snapshot order, whose own snapshot restores to the same state. The book then runs up to 512 commands in step with the reference book loaded from the same snapshot. |
+
+The targets are built with debug assertions and overflow checks, so an arithmetic
+overflow anywhere fails a run: §9's claim is tested on inputs the property tests never
+produce. They run without a sanitizer, because the library forbids `unsafe`. CI fuzzes
+each target for 30 seconds on every push, and a weekly workflow fuzzes each for 20
+minutes on every core of the runner. Both start from a corpus cached between runs, plus
+long random inputs, so their time adds up.
+
+To run a target locally (needs a nightly toolchain and `cargo install cargo-fuzz`):
+
+```sh
+cargo +nightly fuzz run differential -s none -a -- -max_total_time=60 -len_control=0 -max_len=4096
+cargo +nightly fuzz run differential -s none -a fuzz/artifacts/differential/<file>   # reproduce a failure
+cargo +nightly fuzz fmt differential fuzz/artifacts/differential/<file>              # print it as data
+cargo +nightly fuzz tmin differential -s none -a fuzz/artifacts/differential/<file>  # shrink it
+```
+
+`-len_control=0` lets inputs grow to full length at once, so even a short run reaches long
+command sequences; by default libFuzzer lengthens inputs slowly, and a one-minute run
+stays at a few commands per input. On Windows with MSVC, linking needs AddressSanitizer:
+leave out `-s none`, and put the directory holding `clang_rt.asan_dynamic-x86_64.dll`
+(`VC\Tools\MSVC\<version>\bin\HostX64\x64` in Visual Studio) on `PATH`.
+
+**Proofs** (Kani). Proof harnesses sit in a `#[cfg(kani)] mod proofs` at the end of
+`src/bitset.rs`, `src/pool.rs` and `src/owners.rs`. Kani checks each harness for every
+input within its bounds, and also that nothing in it panics, overflows or indexes out of
+bounds.
+
+| Harness | Proves | Bounds |
+|---|---|---|
+| `bitset::proofs::low_bits_through_…`, `highest_bit_…` | The two bit helpers of the searches. | Every bit position, every non-zero word. |
+| `bitset::proofs::dense_sets_…` | `next_at_or_after` and `prev_at_or_before`, from any start including `usize::MAX`, equal a linear scan over a boolean array, after any insert and remove. | Every subset of bands of 0, 63, 64, 128 and 130 levels: none, a partial word, one and two full words, a partial third word. |
+| `bitset::proofs::sparse_sets_in_…_summary_words` | The same searches return the nearest element on each side when it lies summary words away. | Up to 2 elements anywhere, any one index removed, in bands of 4,097 levels (a second summary word with one level), 8,192 (two full summary words) and 8,193 (two full ones and a third with one level, so a search can skip a whole empty summary word). |
+| `pool::proofs::free_slots_form_a_lifo_stack` | `alloc` returns the slot freed most recently; the free list holds exactly the free slots, each with no quantity, and ends in `NIL`; `is_full` and `live` agree with it. `validate()` and `alloc` rely on this. | 3 slots, any 6 allocations and frees. |
+| `pool::proofs::fills_trade_what_the_order_shows`, `shrinking_takes_the_cut_from_the_hidden_part_first` | The quantity arithmetic of fills, iceberg replenishment and in-place shrinks: amounts, what the order shows afterwards, no underflow. | Every quantity of a plain order or an iceberg. |
+| `owners::proofs::lists_hold_each_owners_orders_in_link_order` | Each owner's list holds exactly that owner's slots in link order, which mass cancels rely on, with consistent back links, tail and count; owners outside the table read as empty. | 2 owners, 4 slots, any 5 links and unlinks, including the unlink and relink an iceberg's new tranche causes. |
+
+The bounds include every shape the code treats differently: a partial and a full last
+word, searches that cross a word or a summary word, an empty and a full pool, an owner
+with no, one or several orders. Band lengths and the pool's capacity are fixed per
+harness, while everything else stays symbolic: a symbolic length makes every vector
+symbolic in size, and those harnesses exhausted the CI runner's memory. CI proves the bit
+helpers, the order pool and the owner lists on every push, each in under a minute. The
+search proofs take far longer (`sparse_sets_in_two_summary_words` took 25 minutes), so
+the weekly workflow runs them. Kani does not run on Windows. On Linux or macOS:
+
+```sh
+cargo install --locked kani-verifier && cargo kani setup
+cd crates/orderbook
+cargo kani                                                # every proof
+cargo kani --harness dense_sets_in_two_full_words        # one proof
+```
+
+cargo-mutants skips `#[cfg(test)]` code but not `#[cfg(kani)]` code, which ordinary
+builds never compile, so `.cargo/mutants.toml` excludes the `proofs` modules.
+
+**Coverage.** A CI job runs the test suite under cargo-llvm-cov and reports line and
+branch coverage of `crates/orderbook/src`, unit-test modules included and the benchmarks'
+workload generator left out. The summary is in the job log, and `lcov.info` is uploaded as
+an artifact. The numbers are in the [README](../README.md#verification). What the tests
+leave unrun is defensive code: `validate()`'s level-overflow error, which §9 makes
+unreachable; single conditions within `validate()`'s corruption checks; the guards of
+`BookConfig::new` and `OrderBook::new` against zero or `u32::MAX` orders; a zero-capacity
+pool; and the failure branch of a debug assertion. Branch coverage needs nightly. To
+measure it locally:
+
+```sh
+rustup component add llvm-tools-preview --toolchain nightly
+cargo install cargo-llvm-cov
+cargo +nightly llvm-cov --package orderbook --branch --ignore-filename-regex 'workload\.rs' --summary-only
+```
 
 ## 12. Known limitations and deliberate deferrals
 
@@ -443,6 +541,7 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
+| Trade ids come from a `u64` counter, and the trade that would get id `u64::MAX` overflows it: a debug build panics, a release build wraps. A live book needs 2⁶⁴ − 1 trades to get there, but `restore` accepts any trade count below `u64::MAX`, so a hand-made snapshot gets there in one trade. The `restore` fuzz target keeps clear of it | Phase 2, when snapshots come from disk: decide what an exhausted counter means (halt trading, or refuse such snapshots with a margin) |
 
 ## 13. Performance work
 

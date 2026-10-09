@@ -1,10 +1,11 @@
 //! The network layer: one thread, one `mio` event loop, every connection non-blocking.
 //!
 //! Each round of the loop reads whatever the sockets hold and hands the decoded messages to
-//! the [`Exchange`], then flushes its batch, so the commands of one round share a journal
-//! sync, and writes the replies. A connection that sends bytes that do not decode is
-//! logged out; one that falls too far behind reading its replies is dropped. Dropping or
-//! losing a connection cancels its account's orders.
+//! the [`Exchange`], then hands its batch to the [`Core`] that runs the engine, so the
+//! commands of one round share a journal sync, delivers the events that have come back, and
+//! writes the replies. A connection that sends bytes that do not decode is logged out; one
+//! that falls too far behind reading its replies is dropped. Dropping or losing a
+//! connection cancels its account's orders.
 //!
 //! Stopping the server leaves the orders on the book, as a crash would: the next start
 //! finds them.
@@ -15,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use engine::Engine;
 use engine::storage::Storage;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -73,6 +75,43 @@ impl From<io::Error> for ServerError {
     }
 }
 
+/// What runs the engine behind a server.
+pub trait Core {
+    /// Takes the exchange's batch, as far as there is room, and delivers the events that
+    /// have come back. An error means the engine takes no more commands.
+    fn turn(
+        &mut self,
+        exchange: &mut Exchange,
+        mail: &mut impl Mailbox,
+    ) -> Result<(), engine::Error>;
+
+    /// Whether events may still come back for commands taken: the server then turns again
+    /// without waiting for its sockets.
+    fn busy(&mut self) -> bool;
+
+    /// Whether commands wait for room: the server then reads no more from its sockets.
+    fn backed_up(&self) -> bool;
+}
+
+/// An engine on the server's own thread: each batch is journaled and applied at once.
+impl<S: Storage> Core for Engine<S> {
+    fn turn(
+        &mut self,
+        exchange: &mut Exchange,
+        mail: &mut impl Mailbox,
+    ) -> Result<(), engine::Error> {
+        exchange.flush(self, mail)
+    }
+
+    fn busy(&mut self) -> bool {
+        false
+    }
+
+    fn backed_up(&self) -> bool {
+        false
+    }
+}
+
 /// The listener's token; a connection's is its session id plus one.
 const LISTENER: Token = Token(0);
 
@@ -127,9 +166,10 @@ impl Mailbox for Wires {
     }
 }
 
-/// A gateway serving an [`Exchange`] on a TCP port.
-pub struct Server<S: Storage> {
-    exchange: Exchange<S>,
+/// A gateway serving an [`Exchange`] on a TCP port, with a [`Core`] running its engine.
+pub struct Server<C: Core> {
+    exchange: Exchange,
+    core: C,
     config: ServerConfig,
     poll: Poll,
     events: Events,
@@ -146,19 +186,21 @@ pub struct Server<S: Storage> {
     last_tick: u64,
 }
 
-impl<S: Storage> Server<S> {
-    /// A server for `exchange`, listening on `addr`.
+impl<C: Core> Server<C> {
+    /// A server for `exchange` and its `core`, listening on `addr`.
     pub fn bind(
-        exchange: Exchange<S>,
+        exchange: Exchange,
+        core: C,
         addr: SocketAddr,
         config: ServerConfig,
-    ) -> io::Result<Server<S>> {
+    ) -> io::Result<Server<C>> {
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(addr)?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         Ok(Server {
             exchange,
+            core,
             config,
             poll,
             events: Events::with_capacity(1_024),
@@ -183,13 +225,18 @@ impl<S: Storage> Server<S> {
     }
 
     /// The exchange.
-    pub fn exchange(&self) -> &Exchange<S> {
+    pub fn exchange(&self) -> &Exchange {
         &self.exchange
     }
 
-    /// Gives the exchange back, to close its engine.
-    pub fn into_exchange(self) -> Exchange<S> {
-        self.exchange
+    /// The core.
+    pub fn core(&self) -> &C {
+        &self.core
+    }
+
+    /// Gives the exchange and the core back, to close the engine.
+    pub fn into_parts(self) -> (Exchange, C) {
+        (self.exchange, self.core)
     }
 
     /// Serves until `stop` is set, then logs every session out. An engine failure stops the
@@ -208,8 +255,10 @@ impl<S: Storage> Server<S> {
     /// One round of the event loop: waits up to one tick for sockets to become ready, reads
     /// them, applies what they sent, and writes the replies.
     pub fn step(&mut self) -> Result<(), ServerError> {
-        // A batch left by dropped connections, or input left unread, does not wait.
-        let timeout = if self.exchange.has_batch() || !self.unread.is_empty() {
+        // A batch left by dropped connections, input left unread, or events still to come
+        // do not wait.
+        let busy = self.exchange.has_batch() || !self.unread.is_empty() || self.core.busy();
+        let timeout = if busy {
             Duration::ZERO
         } else {
             self.config.tick
@@ -236,11 +285,13 @@ impl<S: Storage> Server<S> {
         self.ready.dedup();
         for index in 0..self.ready.len() {
             let session = self.ready[index];
-            if self.read(session, now) {
+            // While the engine is backed up, nothing more is read: the clients wait.
+            if self.core.backed_up() || self.read(session, now) {
                 self.unread.push(session);
             }
         }
-        if let Err(error) = self.exchange.flush(&mut self.wires) {
+        if let Err(error) = self.core.turn(&mut self.exchange, &mut self.wires) {
+            self.exchange.shut_down(&mut self.wires);
             return Err(ServerError::Engine(error));
         }
         if now.saturating_sub(self.last_tick) >= self.config.tick.as_nanos() as u64 {

@@ -88,10 +88,15 @@ fn run() -> Result<(), String> {
         report.journal.replayed,
         engine.book().order_count()
     );
-    let exchange =
-        Exchange::new(engine, &accounts, Timing::default()).map_err(|e| e.to_string())?;
+    let exchange = Exchange::new(
+        engine.book(),
+        engine.last_seq(),
+        &accounts,
+        Timing::default(),
+    )
+    .map_err(|e| e.to_string())?;
     let mut server =
-        Server::bind(exchange, listen, server).map_err(|e| format!("{listen}: {e}"))?;
+        Server::bind(exchange, engine, listen, server).map_err(|e| format!("{listen}: {e}"))?;
     eprintln!(
         "gateway: {} accounts, listening on {}",
         accounts.len(),

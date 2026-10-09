@@ -19,4 +19,4 @@ pub mod server;
 
 pub use accounts::{Account, AccountsError};
 pub use exchange::{Exchange, Mailbox, SessionId, SetupError, Timing};
-pub use server::{Server, ServerConfig, ServerError};
+pub use server::{Core, Server, ServerConfig, ServerError};

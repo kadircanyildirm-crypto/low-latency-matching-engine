@@ -224,7 +224,8 @@ fuzz_target!(|steps: Vec<Step>| {
         heartbeat: 1_000,
         idle_timeout: 5_000,
     };
-    let mut exchange = Exchange::new(engine, &accounts, timing).unwrap();
+    let mut engine = engine;
+    let mut exchange = Exchange::new(engine.book(), engine.last_seq(), &accounts, timing).unwrap();
     let mut mail = Mail::default();
     let mut connected = [false; SESSIONS];
     let mut closing = [false; SESSIONS];
@@ -284,10 +285,10 @@ fuzz_target!(|steps: Vec<Step>| {
                 }
             }
             Step::Flush => {
-                exchange.flush(&mut mail).unwrap();
+                exchange.flush(&mut engine, &mut mail).unwrap();
                 for account in 1..4 {
                     let open = exchange.open_orders(account).unwrap();
-                    assert_eq!(open, open_on_book(exchange.book(), account));
+                    assert_eq!(open, open_on_book(engine.book(), account));
                     assert!(open <= MAX_OPEN);
                 }
             }
@@ -326,7 +327,7 @@ fuzz_target!(|steps: Vec<Step>| {
                             // was not sent.
                             let owner = *owners.entry(report.order_id).or_insert(account);
                             assert_eq!(owner, account);
-                            if let Some(order) = exchange.book().order(report.order_id) {
+                            if let Some(order) = engine.book().order(report.order_id) {
                                 assert_eq!(order.owner, account);
                             }
                         }
@@ -336,6 +337,6 @@ fuzz_target!(|steps: Vec<Step>| {
             }
         }
     }
-    exchange.flush(&mut mail).unwrap();
-    exchange.book().validate().unwrap();
+    exchange.flush(&mut engine, &mut mail).unwrap();
+    engine.book().validate().unwrap();
 });

@@ -2,6 +2,7 @@
 //! cancel-on-disconnect, recovery, and engine failure.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 use engine::sim::SimStorage;
@@ -58,6 +59,49 @@ impl Mail {
     }
 }
 
+/// An exchange with an engine on the same thread, as the single-threaded server runs them.
+struct Direct {
+    exchange: Exchange,
+    engine: Engine<SimStorage>,
+}
+
+impl Direct {
+    fn new(
+        engine: Engine<SimStorage>,
+        accounts: &[Account],
+        timing: Timing,
+    ) -> Result<Direct, SetupError> {
+        let exchange = Exchange::new(engine.book(), engine.last_seq(), accounts, timing)?;
+        Ok(Direct { exchange, engine })
+    }
+
+    fn flush(&mut self, mail: &mut Mail) -> Result<(), engine::Error> {
+        self.exchange.flush(&mut self.engine, mail)
+    }
+
+    fn book(&self) -> &OrderBook {
+        self.engine.book()
+    }
+
+    fn into_engine(self) -> Engine<SimStorage> {
+        self.engine
+    }
+}
+
+impl Deref for Direct {
+    type Target = Exchange;
+
+    fn deref(&self) -> &Exchange {
+        &self.exchange
+    }
+}
+
+impl DerefMut for Direct {
+    fn deref_mut(&mut self) -> &mut Exchange {
+        &mut self.exchange
+    }
+}
+
 fn book() -> BookConfig {
     BookConfig {
         max_owners: 8,
@@ -81,8 +125,8 @@ fn open(storage: &SimStorage, book: BookConfig) -> Engine<SimStorage> {
         .0
 }
 
-fn exchange(accounts: &[Account]) -> Exchange<SimStorage> {
-    Exchange::new(
+fn exchange(accounts: &[Account]) -> Direct {
+    Direct::new(
         open(&SimStorage::new(), book()),
         accounts,
         Timing::default(),
@@ -99,12 +143,7 @@ fn login(account: u32) -> Inbound {
 }
 
 /// Connects `session` and logs it in for `account`.
-fn logged_in(
-    exchange: &mut Exchange<SimStorage>,
-    session: SessionId,
-    account: u32,
-    mail: &mut Mail,
-) {
+fn logged_in(exchange: &mut Exchange, session: SessionId, account: u32, mail: &mut Mail) {
     exchange.connect(session, 0);
     exchange.receive(session, login(account), 0, mail);
     assert!(matches!(
@@ -572,7 +611,7 @@ fn quiet_sessions_get_heartbeats_and_silent_ones_are_logged_out() {
         idle_timeout: 30,
     };
     let engine = open(&SimStorage::new(), book());
-    let mut exchange = Exchange::new(engine, &[account(1)], timing).unwrap();
+    let mut exchange = Direct::new(engine, &[account(1)], timing).unwrap();
     let mut mail = Mail::default();
     exchange.connect(0, 0);
     exchange.receive(0, login(1), 0, &mut mail);
@@ -710,7 +749,7 @@ fn phase_changes_reach_every_session() {
         ..book()
     };
     let engine = open(&SimStorage::new(), config);
-    let mut exchange = Exchange::new(
+    let mut exchange = Direct::new(
         engine,
         &[account(1), account(2), account(3)],
         Timing::default(),
@@ -752,7 +791,7 @@ fn phase_changes_reach_every_session() {
 fn recovered_orders_belong_to_their_accounts() {
     let storage = SimStorage::new();
     {
-        let mut exchange = Exchange::new(
+        let mut exchange = Direct::new(
             open(&storage, book()),
             &[account(1), account(2)],
             Timing::default(),
@@ -777,7 +816,7 @@ fn recovered_orders_belong_to_their_accounts() {
         assert!(!exchange.has_batch());
         exchange.into_engine().close().unwrap();
     }
-    let mut exchange = Exchange::new(
+    let mut exchange = Direct::new(
         open(&storage, book()),
         &[account(1), account(2)],
         Timing::default(),
@@ -810,7 +849,7 @@ fn recovered_orders_belong_to_their_accounts() {
     assert_eq!(exchange.open_orders(1), Some(1));
     // A recovered order of an account that no longer exists counts for no one.
     exchange.into_engine().close().unwrap();
-    let exchange = Exchange::new(open(&storage, book()), &[account(2)], Timing::default()).unwrap();
+    let exchange = Direct::new(open(&storage, book()), &[account(2)], Timing::default()).unwrap();
     assert_eq!(exchange.open_orders(1), None);
     assert_eq!(exchange.book().order_count(), 1);
 }
@@ -818,7 +857,7 @@ fn recovered_orders_belong_to_their_accounts() {
 #[test]
 fn foreign_books_and_accounts_out_of_range_are_refused() {
     let engine = open(&SimStorage::new(), book());
-    let error = Exchange::new(engine, &[account(8)], Timing::default()).err();
+    let error = Direct::new(engine, &[account(8)], Timing::default()).err();
     assert_eq!(error, Some(SetupError::AccountOutOfRange(8)));
 
     // An order placed with its own id scheme could collide with the gateway's ids.
@@ -834,7 +873,7 @@ fn foreign_books_and_accounts_out_of_range_are_refused() {
         display: None,
     };
     engine.submit(order, &mut Discard).unwrap();
-    let error = Exchange::new(engine, &[account(1)], Timing::default()).err();
+    let error = Direct::new(engine, &[account(1)], Timing::default()).err();
     assert_eq!(error, Some(SetupError::ForeignOrder(500)));
     for error in [
         SetupError::AccountOutOfRange(8),
@@ -847,7 +886,7 @@ fn foreign_books_and_accounts_out_of_range_are_refused() {
 #[test]
 fn an_engine_failure_logs_everyone_out() {
     let storage = SimStorage::new();
-    let mut exchange = Exchange::new(
+    let mut exchange = Direct::new(
         open(&storage, book()),
         &[account(1), account(2)],
         Timing::default(),

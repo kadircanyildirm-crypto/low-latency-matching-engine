@@ -66,15 +66,21 @@ impl Gateway {
                 .map_err(|e| e.to_string())?
                 .0;
             let accounts = [account(1), account(2), account(3)];
-            let exchange =
-                Exchange::new(engine, &accounts, Timing::default()).map_err(|e| e.to_string())?;
+            let exchange = Exchange::new(
+                engine.book(),
+                engine.last_seq(),
+                &accounts,
+                Timing::default(),
+            )
+            .map_err(|e| e.to_string())?;
             let addr = "127.0.0.1:0".parse().unwrap();
-            let mut server = Server::bind(exchange, addr, config).map_err(|e| e.to_string())?;
+            let mut server =
+                Server::bind(exchange, engine, addr, config).map_err(|e| e.to_string())?;
             tx.send(server.local_addr().unwrap()).unwrap();
             server.run(&stopping).map_err(|e| e.to_string())?;
-            let exchange = server.into_exchange();
-            let left = exchange.book().order_count();
-            exchange.into_engine().close().map_err(|e| e.to_string())?;
+            let (_, engine) = server.into_parts();
+            let left = engine.book().order_count();
+            engine.close().map_err(|e| e.to_string())?;
             Ok(left)
         });
         let addr = rx

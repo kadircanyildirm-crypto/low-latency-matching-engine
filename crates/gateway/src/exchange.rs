@@ -5,13 +5,17 @@
 //! sends; nothing here blocks or reads a clock, so every rule can be tested, and fuzzed,
 //! deterministically.
 //!
-//! Order-entry messages are not applied one by one: they collect in a batch, which
-//! [`Exchange::flush`] journals and applies at once. Under `SyncPolicy::Always` the whole
-//! batch then shares one sync, which is group commit: the network layer flushes once per
-//! round of reading its sockets, so the more clients send at once, the more commands each
-//! sync carries. Reports go out only after the batch is journaled.
+//! The exchange holds no engine. Order-entry messages collect in a batch, numbered with the
+//! sequence numbers they will be journaled under; whoever runs the engine takes the batch
+//! ([`Exchange::take_batch`]) and hands each event of the book back
+//! ([`Exchange::deliver`]), at once or later from another thread.
+//! [`Exchange::flush`] does both with an engine on the same thread. Under
+//! `SyncPolicy::Always` a batch shares one sync, which is group commit: the network layer
+//! hands one batch over per round of reading its sockets, so the more clients send at once,
+//! the more commands each sync carries. Reports go out only as events come back, which is
+//! after their commands are journaled.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use engine::storage::Storage;
@@ -122,33 +126,49 @@ struct Live {
     client_ref: u64,
 }
 
+/// A command handed over whose events may still come.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    seq: Seq,
+    /// The session that sent it, or `SYSTEM`.
+    session: SessionId,
+    /// The account it acts for.
+    owner: u32,
+    /// Whether it places a new order, whose id is `seq`.
+    places: bool,
+}
+
 /// Marks commands the exchange issues itself, such as the mass cancel on a disconnect.
 const SYSTEM: SessionId = SessionId::MAX;
 
-/// The gateway's logic around an engine.
-pub struct Exchange<S: Storage> {
-    engine: Engine<S>,
+/// The gateway's logic.
+pub struct Exchange {
     timing: Timing,
     accounts: Vec<Option<AccountState>>,
     sessions: Vec<Option<Session>>,
-    /// Every order and pending stop on the book, and those in the batch.
+    /// Every order and pending stop on the book, and those not yet applied.
     live: HashMap<OrderId, Live>,
-    /// Commands waiting to be journaled, and the session each came from.
+    /// Commands not yet handed over.
     batch: Vec<Command>,
-    from: Vec<SessionId>,
+    /// Commands taken whose events may still come, in sequence order.
+    in_flight: VecDeque<InFlight>,
+    /// The sequence number of the last command numbered.
+    last_seq: Seq,
     /// The time passed with the latest call.
     now: u64,
 }
 
-impl<S: Storage> Exchange<S> {
-    /// An exchange around `engine`, for `accounts`. The orders on the recovered book are
-    /// attributed to their accounts, without the client references they were placed with.
+impl Exchange {
+    /// An exchange for `accounts`, in front of an engine whose recovered `book` reflects
+    /// the commands up to `last_seq`. The orders on the book are attributed to their
+    /// accounts, without the client references they were placed with.
     pub fn new(
-        engine: Engine<S>,
+        book: &OrderBook,
+        last_seq: Seq,
         accounts: &[Account],
         timing: Timing,
-    ) -> Result<Exchange<S>, SetupError> {
-        let max_owners = engine.config().book.max_owners;
+    ) -> Result<Exchange, SetupError> {
+        let max_owners = book.config().max_owners;
         let mut states: Vec<Option<AccountState>> = (0..max_owners).map(|_| None).collect();
         for account in accounts {
             let state = states
@@ -160,7 +180,6 @@ impl<S: Storage> Exchange<S> {
                 open: 0,
             });
         }
-        let book = engine.book();
         let mut live = HashMap::new();
         for side in [Side::Buy, Side::Sell] {
             for level in book.depth(side) {
@@ -173,17 +192,17 @@ impl<S: Storage> Exchange<S> {
             }
         }
         let mut exchange = Exchange {
-            engine,
             timing,
             accounts: states,
             sessions: Vec::new(),
             live: HashMap::with_capacity(live.len()),
             batch: Vec::new(),
-            from: Vec::new(),
+            in_flight: VecDeque::new(),
+            last_seq,
             now: 0,
         };
         for (id, account) in live {
-            if id > exchange.engine.last_seq() {
+            if id > last_seq {
                 return Err(SetupError::ForeignOrder(id));
             }
             let client_ref = 0;
@@ -201,19 +220,10 @@ impl<S: Storage> Exchange<S> {
         Ok(exchange)
     }
 
-    /// The book.
-    pub fn book(&self) -> &OrderBook {
-        self.engine.book()
-    }
-
-    /// The engine.
-    pub fn engine(&self) -> &Engine<S> {
-        &self.engine
-    }
-
-    /// Gives the engine back, to close it.
-    pub fn into_engine(self) -> Engine<S> {
-        self.engine
+    /// The sequence number of the last command numbered: handed over, or still in the
+    /// batch.
+    pub fn last_seq(&self) -> Seq {
+        self.last_seq
     }
 
     /// The orders and pending stops `account` has, counting those waiting in the batch.
@@ -321,7 +331,7 @@ impl<S: Storage> Exchange<S> {
         state.account = Some(account);
         state.tokens = u128::from(rate) * TOKEN;
         state.refilled = self.now;
-        let last_seq = self.engine.last_seq() + self.batch.len() as u64;
+        let last_seq = self.last_seq;
         self.send(session, Outbound::LoginAccepted { account, last_seq }, mail);
     }
 
@@ -372,7 +382,7 @@ impl<S: Storage> Exchange<S> {
                 state.open += 1;
                 // An order's id is the sequence number of the command that places it:
                 // unique, increasing, and recovered with the journal.
-                let id = self.engine.last_seq() + self.batch.len() as u64 + 1;
+                let id = self.last_seq + 1;
                 self.live.insert(
                     id,
                     Live {
@@ -430,16 +440,30 @@ impl<S: Storage> Exchange<S> {
                 unreachable!("not an order-entry message")
             }
         };
+        self.push(command, session, account);
+    }
+
+    /// Numbers `command` and puts it into the batch.
+    fn push(&mut self, command: Command, session: SessionId, owner: u32) {
+        self.last_seq += 1;
+        let places = matches!(
+            command,
+            Command::Limit { .. } | Command::Market { .. } | Command::Stop { .. }
+        );
         self.batch.push(command);
-        self.from.push(session);
+        self.in_flight.push_back(InFlight {
+            seq: self.last_seq,
+            session,
+            owner,
+            places,
+        });
     }
 
     /// A connection has closed. A logged-in account's orders are cancelled: a client that
     /// is gone cannot manage them.
     pub fn disconnect(&mut self, session: SessionId) {
         if let Some(account) = self.detach(session) {
-            self.batch.push(Command::CancelAll { owner: account });
-            self.from.push(SYSTEM);
+            self.push(Command::CancelAll { owner: account }, SYSTEM, account);
         }
     }
 
@@ -458,37 +482,46 @@ impl<S: Storage> Exchange<S> {
         Some(account)
     }
 
-    /// Journals and applies the batch, and sends the reports. An error means the engine
-    /// takes no more commands: every session is logged out, and the gateway should stop.
-    pub fn flush(&mut self, mail: &mut impl Mailbox) -> Result<(), Error> {
+    /// Hands the batch over: swaps it with `into`, which must be empty. The commands are
+    /// numbered from the last one handed over plus one, and their events must come back,
+    /// through [`deliver`](Self::deliver), in sequence order.
+    pub fn take_batch(&mut self, into: &mut Vec<Command>) {
+        debug_assert!(into.is_empty(), "the previous batch was handed over");
+        std::mem::swap(&mut self.batch, into);
+    }
+
+    /// Journals and applies the batch on `engine`, on this thread, and sends the reports.
+    /// An error means the engine takes no more commands: every session is logged out, and
+    /// the gateway should stop.
+    pub fn flush<S: Storage>(
+        &mut self,
+        engine: &mut Engine<S>,
+        mail: &mut impl Mailbox,
+    ) -> Result<(), Error> {
         if self.batch.is_empty() {
             return Ok(());
         }
+        debug_assert_eq!(engine.last_seq() + self.batch.len() as u64, self.last_seq);
         let batch = std::mem::take(&mut self.batch);
-        let from = std::mem::take(&mut self.from);
-        let mut router = Router {
-            first: self.engine.last_seq() + 1,
-            batch: &batch,
-            from: &from,
-            accounts: &mut self.accounts,
-            sessions: &mut self.sessions,
-            live: &mut self.live,
-            now: self.now,
-            mail,
-        };
-        let result = self.engine.submit_batch(&batch, &mut router);
-        // The buffers are reused.
+        let result = engine.submit_batch(
+            &batch,
+            &mut Deliver {
+                exchange: self,
+                mail,
+            },
+        );
+        // The buffer is reused.
         self.batch = batch;
         self.batch.clear();
-        self.from = from;
-        self.from.clear();
-        if let Err(error) = result {
-            for session in 0..self.sessions.len() {
-                self.end(session, LogoutReason::Shutdown, mail);
-            }
-            return Err(error);
+        result.map(|_| ()).inspect_err(|_| self.shut_down(mail))
+    }
+
+    /// The engine failed and takes no more commands: every session is logged out, and the
+    /// gateway should stop.
+    pub fn shut_down(&mut self, mail: &mut impl Mailbox) {
+        for session in 0..self.sessions.len() {
+            self.end(session, LogoutReason::Shutdown, mail);
         }
-        Ok(())
     }
 
     /// Sends heartbeats to quiet sessions and logs out idle ones.
@@ -539,31 +572,31 @@ impl<S: Storage> Exchange<S> {
     }
 }
 
-/// Turns the book's events into reports for the sessions they concern.
-struct Router<'a, M: Mailbox> {
-    first: Seq,
-    batch: &'a [Command],
-    from: &'a [SessionId],
-    accounts: &'a mut [Option<AccountState>],
-    sessions: &'a mut [Option<Session>],
-    live: &'a mut HashMap<OrderId, Live>,
-    now: u64,
+/// Hands an engine's events to an exchange.
+struct Deliver<'a, M: Mailbox> {
+    exchange: &'a mut Exchange,
     mail: &'a mut M,
 }
 
-impl<M: Mailbox> Router<'_, M> {
-    fn report(&mut self, session: SessionId, report: Report) {
+impl<M: Mailbox> Output for Deliver<'_, M> {
+    fn on_event(&mut self, seq: Seq, event: Event) {
+        self.exchange.deliver(seq, event, self.mail);
+    }
+}
+
+impl Exchange {
+    fn report(&mut self, session: SessionId, report: Report, mail: &mut impl Mailbox) {
         let Some(state) = self.sessions.get_mut(session).and_then(Option::as_mut) else {
             return;
         };
         if state.open() {
             state.last_sent = self.now;
-            self.mail.send(session, Outbound::Report(report));
+            mail.send(session, Outbound::Report(report));
         }
     }
 
     /// Reports to the session of the account that owns order `id`, if it is logged in.
-    fn tell_owner(&mut self, seq: Seq, id: OrderId, kind: ReportKind) {
+    fn tell_owner(&mut self, seq: Seq, id: OrderId, kind: ReportKind, mail: &mut impl Mailbox) {
         let Some(live) = self.live.get(&id).copied() else {
             return;
         };
@@ -577,7 +610,7 @@ impl<M: Mailbox> Router<'_, M> {
                 client_ref: live.client_ref,
                 kind,
             };
-            self.report(session, report);
+            self.report(session, report, mail);
         }
     }
 
@@ -589,25 +622,34 @@ impl<M: Mailbox> Router<'_, M> {
             }
         }
     }
-}
 
-impl<M: Mailbox> Output for Router<'_, M> {
-    fn on_event(&mut self, seq: Seq, event: Event) {
+    /// The command handed over under `seq`.
+    ///
+    /// # Panics
+    ///
+    /// If no command was handed over under `seq`, or its events came out of order.
+    fn command(&mut self, seq: Seq) -> InFlight {
+        // Every command has at least one event, so a command's events have all come once
+        // a later command's arrive.
+        while self.in_flight.front().is_some_and(|c| c.seq < seq) {
+            self.in_flight.pop_front();
+        }
+        let command = self.in_flight.front().copied();
+        command
+            .filter(|c| c.seq == seq)
+            .unwrap_or_else(|| panic!("an event of command {seq}, which was not handed over"))
+    }
+
+    /// An event of the book, about the command handed over under `seq`: reports it to the
+    /// sessions it concerns. Events must come in sequence order.
+    pub fn deliver(&mut self, seq: Seq, event: Event, mail: &mut impl Mailbox) {
+        let command = self.command(seq);
         match event {
-            Event::Accepted { id } => self.tell_owner(seq, id, ReportKind::Accepted),
+            Event::Accepted { id } => self.tell_owner(seq, id, ReportKind::Accepted, mail),
             Event::Rejected { id, reason } => {
                 // Only a command's sender learns why it was refused: a cancel naming
                 // someone else's order must not reach that order's owner.
-                let index = (seq - self.first) as usize;
-                let (owner, placed) = match self.batch[index] {
-                    Command::Limit { id: new, owner, .. }
-                    | Command::Market { id: new, owner, .. }
-                    | Command::Stop { id: new, owner, .. } => (owner, new == id),
-                    Command::Cancel { owner, .. }
-                    | Command::Modify { owner, .. }
-                    | Command::CancelAll { owner } => (owner, false),
-                    Command::SetPhase { .. } => unreachable!("the gateway changes no phase"),
-                };
+                let placed = command.places && id == seq;
                 let client_ref = match self.live.get(&id) {
                     Some(live) if placed => live.client_ref,
                     _ => 0,
@@ -620,10 +662,9 @@ impl<M: Mailbox> Output for Router<'_, M> {
                 };
                 // The sender may have disconnected, and its connection's id gone to
                 // another account's session since.
-                let session = self.from[index];
-                let sender = self.sessions.get(session).and_then(Option::as_ref);
-                if sender.is_some_and(|s| s.account == Some(owner)) {
-                    self.report(session, report);
+                let sender = self.sessions.get(command.session).and_then(Option::as_ref);
+                if sender.is_some_and(|s| s.account == Some(command.owner)) {
+                    self.report(command.session, report, mail);
                 }
                 if placed {
                     self.retire(id);
@@ -650,7 +691,7 @@ impl<M: Mailbox> Output for Router<'_, M> {
                         qty,
                         leaves,
                     };
-                    self.tell_owner(seq, id, kind);
+                    self.tell_owner(seq, id, kind, mail);
                     if leaves == 0 {
                         self.retire(id);
                     }
@@ -669,7 +710,7 @@ impl<M: Mailbox> Output for Router<'_, M> {
                     qty,
                     visible,
                 };
-                self.tell_owner(seq, id, kind);
+                self.tell_owner(seq, id, kind, mail);
             }
             Event::Replenished {
                 id,
@@ -682,10 +723,10 @@ impl<M: Mailbox> Output for Router<'_, M> {
                     price,
                     visible,
                 };
-                self.tell_owner(seq, id, kind);
+                self.tell_owner(seq, id, kind, mail);
             }
             Event::Cancelled { id, qty, reason } => {
-                self.tell_owner(seq, id, ReportKind::Cancelled { qty, reason });
+                self.tell_owner(seq, id, ReportKind::Cancelled { qty, reason }, mail);
                 self.retire(id);
             }
             Event::Modified {
@@ -694,7 +735,7 @@ impl<M: Mailbox> Output for Router<'_, M> {
                 qty,
                 leaves,
             } => {
-                self.tell_owner(seq, id, ReportKind::Modified { price, qty, leaves });
+                self.tell_owner(seq, id, ReportKind::Modified { price, qty, leaves }, mail);
                 if leaves == 0 {
                     self.retire(id);
                 }
@@ -712,9 +753,9 @@ impl<M: Mailbox> Output for Router<'_, M> {
                     limit,
                     qty,
                 };
-                self.tell_owner(seq, id, kind);
+                self.tell_owner(seq, id, kind, mail);
             }
-            Event::Triggered { id } => self.tell_owner(seq, id, ReportKind::Triggered),
+            Event::Triggered { id } => self.tell_owner(seq, id, ReportKind::Triggered, mail),
             Event::MassCancelled { owner, count } => {
                 let session = self.accounts[owner as usize]
                     .as_ref()
@@ -726,7 +767,7 @@ impl<M: Mailbox> Output for Router<'_, M> {
                         client_ref: 0,
                         kind: ReportKind::MassCancelled { count },
                     };
-                    self.report(session, report);
+                    self.report(session, report, mail);
                 }
             }
             Event::PhaseChanged { phase } => {
@@ -737,7 +778,7 @@ impl<M: Mailbox> Output for Router<'_, M> {
                         client_ref: 0,
                         kind: ReportKind::PhaseChanged(phase),
                     };
-                    self.report(session, report);
+                    self.report(session, report, mail);
                 }
             }
         }

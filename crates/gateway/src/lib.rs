@@ -18,6 +18,7 @@ pub mod exchange;
 pub mod load;
 pub mod pipeline;
 pub mod server;
+pub mod web;
 
 pub use accounts::{Account, AccountsError};
 pub use exchange::{Exchange, Mailbox, SessionId, SetupError, Timing};

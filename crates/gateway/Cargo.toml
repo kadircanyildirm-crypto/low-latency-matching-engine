@@ -9,14 +9,21 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22.1"
 core_affinity = "0.8.3"
 engine = { path = "../engine" }
+getrandom = "0.3.4"
+httparse = "1.10.1"
 marketdata = { path = "../marketdata" }
 # Pinned to a release more than two weeks old.
 mio = { version = "=1.2.3", features = ["net", "os-poll"] }
 orderbook = { path = "../orderbook" }
 protocol = { path = "../protocol" }
 ring = { path = "../ring" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Pinned to a release more than two weeks old.
+sha1 = "=0.10.6"
 
 [dev-dependencies]
 proptest = "1.11.0"

@@ -11,7 +11,7 @@
 //! finds them.
 //!
 //! A second listener, if the server has one, serves browsers: HTTP for the exchange's page,
-//! and sessions over WebSocket that speak JSON ([`web`](crate::web)). A browser's session
+//! and sessions over WebSocket that speak JSON ([`web`]). A browser's session
 //! is a session like any other.
 
 use std::fmt;

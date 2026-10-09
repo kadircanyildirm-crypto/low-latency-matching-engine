@@ -11,5 +11,15 @@ publish.workspace = true
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
+[dev-dependencies]
+core_affinity = "0.8.3"
+# The comparison in the benchmark; pinned to a release more than two weeks old.
+crossbeam-channel = "=0.5.15"
+hdrhistogram = { version = "7.5.4", default-features = false }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[[bench]]
+name = "ring"
+harness = false

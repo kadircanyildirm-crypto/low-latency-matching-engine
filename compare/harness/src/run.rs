@@ -7,7 +7,9 @@
 //!    outcome. This warms caches, the allocator and, for a JIT, the code.
 //! 3. For each run (`CMP_RUNS`, default 1):
 //!    - throughput pass: a fresh engine replays the warm-up prefix, then the measured part
-//!      under one wall-clock interval, with no per-command timers;
+//!      with no per-command timers, timed in chunks of [`CHUNK`] commands. The row records
+//!      the overall rate (everything included) and the median chunk's rate, which an
+//!      occasional preemption by another process cannot move;
 //!    - latency pass: another fresh engine replays the warm-up prefix, then the measured
 //!      part with a TSC read before and after every command.
 //!
@@ -31,6 +33,9 @@ use crate::clock::{self, Clock};
 use crate::scenarios;
 use crate::stream::{self, Header, Kind, Record, Summary};
 use crate::{data_dir, env_count, scenario_selected};
+
+/// Commands per timed chunk of the throughput pass.
+pub const CHUNK: usize = 100_000;
 
 /// An engine under test, driven one record at a time.
 pub trait Engine {
@@ -145,9 +150,12 @@ fn run_scenario<E: Engine>(
     for run in 0..runs {
         let mut engine = E::new(header);
         engine.replay(warm);
-        let started = Instant::now();
-        engine.replay(measured);
-        let elapsed = started.elapsed();
+        let mut chunks = Vec::with_capacity(measured.len().div_ceil(CHUNK));
+        for chunk in measured.chunks(CHUNK) {
+            let started = Instant::now();
+            engine.replay(chunk);
+            chunks.push((chunk.len(), started.elapsed().as_secs_f64()));
+        }
         let mut verified = check(ctx, "throughput pass", header, &engine.summary());
         drop(black_box(engine));
 
@@ -158,13 +166,18 @@ fn run_scenario<E: Engine>(
         drop(black_box(engine));
 
         let stats = Stats::new(&mut ticks, clock);
-        let throughput = measured.len() as f64 / elapsed.as_secs_f64() / 1e6;
+        let elapsed: f64 = chunks.iter().map(|&(_, secs)| secs).sum();
+        let throughput = Throughput {
+            overall: measured.len() as f64 / elapsed / 1e6,
+            chunk_median: chunk_median(&chunks),
+        };
         println!(
-            "  {:<9} run {}: {:>6.2} M cmd/s | p50 {:>5.0} | p90 {:>5.0} | p99 {:>6.0} | \
+            "  {:<9} run {}: {:>6.2} M cmd/s ({:>6.2} median chunk) | p50 {:>5.0} | p90 {:>5.0} | p99 {:>6.0} | \
              p99.9 {:>6.0} | p99.99 {:>7.0} | max {:>8.0} ns | {}",
             ctx.scenario,
             run + 1,
-            throughput,
+            throughput.overall,
+            throughput.chunk_median,
             stats.p50,
             stats.p90,
             stats.p99,
@@ -173,7 +186,30 @@ fn run_scenario<E: Engine>(
             stats.max,
             if verified { "verified" } else { "MISMATCH" }
         );
-        append_row(ctx, run + 1, measured.len(), throughput, &stats, verified);
+        append_row(ctx, run + 1, measured.len(), &throughput, &stats, verified);
+    }
+}
+
+/// Throughput of one run, in millions of commands per second.
+struct Throughput {
+    /// All measured commands over the sum of the chunk times.
+    overall: f64,
+    /// The median chunk's rate.
+    chunk_median: f64,
+}
+
+/// Median rate, in M cmd/s, of `(commands, seconds)` chunks.
+fn chunk_median(chunks: &[(usize, f64)]) -> f64 {
+    let mut rates: Vec<f64> = chunks
+        .iter()
+        .map(|&(n, secs)| n as f64 / secs / 1e6)
+        .collect();
+    rates.sort_by(f64::total_cmp);
+    let n = rates.len();
+    if n % 2 == 1 {
+        rates[n / 2]
+    } else {
+        (rates[n / 2 - 1] + rates[n / 2]) / 2.0
     }
 }
 
@@ -234,8 +270,8 @@ pub fn nearest_rank(n: usize, ppm: u64) -> usize {
 }
 
 /// Column names of `results.csv`.
-pub const CSV_HEADER: &str = "engine,scenario,round,run,commands,throughput_mcmd_s,mean_ns,\
-p50_ns,p90_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,timer_overhead_ns,verified,core";
+pub const CSV_HEADER: &str = "engine,scenario,round,run,commands,throughput_mcmd_s,\
+chunk_median_mcmd_s,mean_ns,p50_ns,p90_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,timer_overhead_ns,verified,core";
 
 /// Where rows go: `$CMP_RESULTS`, or `compare/results/results.csv`.
 pub fn results_path() -> PathBuf {
@@ -248,7 +284,7 @@ fn append_row(
     ctx: &RowContext<'_>,
     run: usize,
     commands: usize,
-    throughput: f64,
+    throughput: &Throughput,
     s: &Stats,
     verified: bool,
 ) {
@@ -256,10 +292,12 @@ fn append_row(
     let mut line = String::new();
     let _ = write!(
         line,
-        "{},{},{},{run},{commands},{throughput:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{}",
+        "{},{},{},{run},{commands},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{}",
         ctx.engine,
         ctx.scenario,
         ctx.round,
+        throughput.overall,
+        throughput.chunk_median,
         s.mean,
         s.p50,
         s.p90,

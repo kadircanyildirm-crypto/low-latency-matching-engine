@@ -60,10 +60,13 @@ public final class ExchangeCoreReplay {
 
     static final String NAME = "exchange-core";
     static final String[] SCENARIOS = {"baseline", "sweep", "deep", "modify"};
-    static final String CSV_HEADER = "engine,scenario,round,run,commands,throughput_mcmd_s,mean_ns,"
-            + "p50_ns,p90_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,timer_overhead_ns,verified,core";
+    static final String CSV_HEADER = "engine,scenario,round,run,commands,throughput_mcmd_s,"
+            + "chunk_median_mcmd_s,mean_ns,p50_ns,p90_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,timer_overhead_ns,verified,core";
 
     static final byte LIMIT = 0, MARKET = 1, CANCEL = 2, MOVE = 3;
+
+    /** Commands per timed chunk of the throughput pass, as in the Rust harness. */
+    static final int CHUNK = 100_000;
 
     /** A stream file, decoded into columns before anything is timed. */
     static final class Stream {
@@ -312,9 +315,21 @@ public final class ExchangeCoreReplay {
                 Engine e = new Engine();
                 e.replay(s, 0, s.warmup);
                 System.gc();
-                long started = System.nanoTime();
-                e.replay(s, s.warmup, s.count);
-                long elapsed = System.nanoTime() - started;
+                int chunks = (measured + CHUNK - 1) / CHUNK;
+                double[] rates = new double[chunks];
+                long elapsed = 0;
+                for (int c = 0; c < chunks; c++) {
+                    int from = s.warmup + c * CHUNK;
+                    int to = Math.min(s.count, from + CHUNK);
+                    long started = System.nanoTime();
+                    e.replay(s, from, to);
+                    long took = System.nanoTime() - started;
+                    elapsed += took;
+                    rates[c] = (to - from) / (took / 1e9) / 1e6;
+                }
+                Arrays.sort(rates);
+                double chunkMedian = chunks % 2 == 1 ? rates[chunks / 2]
+                        : (rates[chunks / 2 - 1] + rates[chunks / 2]) / 2;
                 boolean verified = check(scenario, "throughput pass", s, e.summary());
                 e = null;
 
@@ -339,12 +354,12 @@ public final class ExchangeCoreReplay {
                 long max = ns[measured - 1];
                 double throughput = measured / (elapsed / 1e9) / 1e6;
                 System.out.printf(Locale.ROOT,
-                        "  %-9s run %d: %6.2f M cmd/s | p50 %5d | p90 %5d | p99 %6d | p99.9 %6d | p99.99 %7d | max %8d ns | %s%n",
-                        scenario, run, throughput, p50, p90, p99, p999, p9999, max,
+                        "  %-9s run %d: %6.2f M cmd/s (%6.2f median chunk) | p50 %5d | p90 %5d | p99 %6d | p99.9 %6d | p99.99 %7d | max %8d ns | %s%n",
+                        scenario, run, throughput, chunkMedian, p50, p90, p99, p999, p9999, max,
                         verified ? "verified" : "MISMATCH");
                 String row = String.format(Locale.ROOT,
-                        "%s,%s,%s,%d,%d,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%s",
-                        NAME, scenario, round, run, measured, throughput, mean, (double) p50, (double) p90,
+                        "%s,%s,%s,%d,%d,%.4f,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%s",
+                        NAME, scenario, round, run, measured, throughput, chunkMedian, mean, (double) p50, (double) p90,
                         (double) p99, (double) p999, (double) p9999, (double) max, overhead,
                         verified ? "yes" : "no", pinned);
                 appendRow(results, row);

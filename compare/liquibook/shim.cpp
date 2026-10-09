@@ -102,13 +102,17 @@ static inline void apply(Ctx* c, const Record& r) {
     }
     case MARKET: {
         // Price 0 is liquibook's market price; immediate-or-cancel keeps the remainder
-        // off the book, as a market order of the other engines.
+        // off the book, as a market order of the other engines. The condition must be
+        // passed to add(): OrderTracker reads the order's own immediate_or_cancel() only
+        // under LIQUIBOOK_ORDER_KNOWS_CONDITIONS, and even then ORs it into its
+        // constructor parameter instead of the member, so a market order's unfilled
+        // remainder would rest on the book at the market price.
         Order& o = c->orders[r.id];
         o.price_ = lb::MARKET_ORDER_PRICE;
         o.qty_ = r.qty;
         o.buy_ = r.side == 0;
         o.ioc_ = true;
-        c->book.add(&o);
+        c->book.add(&o, lb::oc_immediate_or_cancel);
         break;
     }
     case CANCEL:

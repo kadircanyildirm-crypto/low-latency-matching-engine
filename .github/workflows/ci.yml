@@ -47,8 +47,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
-  # Line and branch coverage of the engine by the whole test suite. Branch coverage needs
-  # nightly. `src/workload.rs` is the benchmarks' order-flow generator, not engine code.
+  # Line and branch coverage of the book and the engine by the whole test suite. Branch
+  # coverage needs nightly. `src/workload.rs` is the benchmarks' order-flow generator and
+  # `engine-soak` the kill test's child process, not engine code.
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -62,14 +63,14 @@ jobs:
           tool: cargo-llvm-cov
       - name: Run the tests with coverage instrumentation
         run: >
-          cargo llvm-cov --package orderbook --locked --branch
-          --ignore-filename-regex 'workload\.rs'
+          cargo llvm-cov --workspace --locked --branch
+          --ignore-filename-regex '(workload|engine-soak)\.rs'
           --lcov --output-path lcov.info
       - name: Report line and branch coverage
         run: |
-          cargo llvm-cov report --branch --ignore-filename-regex 'workload\.rs' --summary-only \
-            | tee coverage.txt
-          { echo '### Coverage of crates/orderbook'; echo '```'; cat coverage.txt; echo '```'; } \
+          cargo llvm-cov report --branch --ignore-filename-regex '(workload|engine-soak)\.rs' \
+            --summary-only | tee coverage.txt
+          { echo '### Coverage of the book and the engine'; echo '```'; cat coverage.txt; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:

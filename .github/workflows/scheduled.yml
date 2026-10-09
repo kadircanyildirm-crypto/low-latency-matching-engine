@@ -19,17 +19,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The full mutation test suite (README.md#mutation-testing), spread over four runners.
-  # A missed mutant fails the job. A mutant that makes the tests hang is detected too:
-  # cargo-mutants reports it as a timeout, with exit code 3.
+  # The full mutation test suite (README.md#mutation-testing): the order book over four
+  # runners, the engine around it over two. A missed mutant fails the job. A mutant that
+  # makes the tests hang is detected too: cargo-mutants reports it as a timeout.
   mutants:
-    name: mutants (shard ${{ matrix.shard }} of 4)
+    name: mutants (${{ matrix.crate }}, shard ${{ matrix.shard }} of ${{ matrix.shards }})
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        include:
+          - { crate: orderbook, shards: 4, shard: 0, exclude: crates/orderbook/src/workload.rs }
+          - { crate: orderbook, shards: 4, shard: 1, exclude: crates/orderbook/src/workload.rs }
+          - { crate: orderbook, shards: 4, shard: 2, exclude: crates/orderbook/src/workload.rs }
+          - { crate: orderbook, shards: 4, shard: 3, exclude: crates/orderbook/src/workload.rs }
+          - { crate: engine, shards: 2, shard: 0, exclude: crates/engine/src/bin/engine-soak.rs }
+          - { crate: engine, shards: 2, shard: 1, exclude: crates/engine/src/bin/engine-soak.rs }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -44,8 +50,8 @@ jobs:
           # 8 GiB makes such a test fail instead, which detects the mutant.
           ulimit -v 8388608
           status=0
-          cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs \
-            --shard ${{ matrix.shard }}/4 --sharding round-robin || status=$?
+          cargo mutants -p ${{ matrix.crate }} --exclude ${{ matrix.exclude }} \
+            --shard ${{ matrix.shard }}/${{ matrix.shards }} --sharding round-robin || status=$?
           for outcome in caught timeout unviable missed; do
             echo "$outcome: $(cat mutants.out/$outcome.txt 2>/dev/null | wc -l)"
           done | tee -a "$GITHUB_STEP_SUMMARY"
@@ -57,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: mutants-shard-${{ matrix.shard }}
+          name: mutants-${{ matrix.crate }}-shard-${{ matrix.shard }}
           path: mutants.out
 
   # The bitset search proofs, too slow for every push: up to half an hour or more each.

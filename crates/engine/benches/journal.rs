@@ -65,9 +65,9 @@ impl Run {
     fn print(&self) {
         let per = |q: f64| self.calls.value_at_quantile(q) as f64 / self.batch as f64;
         println!(
-            "  {:<32} {:>9.2} {:>10.0} {:>10.0} {:>10.0} {:>11.0} {:>12.0}",
+            "  {:<32} {:>9.1} {:>10.0} {:>10.0} {:>10.0} {:>11.0} {:>12.0}",
             self.label,
-            self.commands as f64 / self.elapsed.as_secs_f64() / 1e6,
+            self.commands as f64 / self.elapsed.as_secs_f64() / 1e3,
             per(0.5),
             per(0.99),
             per(0.999),
@@ -159,7 +159,7 @@ fn main() {
     println!();
     println!(
         "  {:<32} {:>9} {:>10} {:>10} {:>10} {:>11} {:>12}",
-        "", "M cmd/s", "p50 ns/cmd", "p99 ns/cmd", "p99.9", "p50 ns/call", "p99 ns/call"
+        "", "k cmd/s", "p50 ns/cmd", "p99 ns/cmd", "p99.9", "p50 ns/call", "p99 ns/call"
     );
     measure_book(book, &commands, warmup).print();
     let os = EngineConfig {

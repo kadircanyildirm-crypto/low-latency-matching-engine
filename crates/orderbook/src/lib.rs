@@ -59,7 +59,7 @@ pub mod workload;
 /// whenever some command, applied to some book, emits other events or leaves another
 /// state than before. A journal of commands can be replayed only under the rules it was
 /// written under; a snapshot is state, and stays valid across versions.
-pub const RULES_VERSION: u32 = 1;
+pub const RULES_VERSION: u32 = 2;
 
 pub use book::{
     BookConfig, BookSnapshot, ConfigError, Depth, LevelInfo, OrderBook, OrderInfo, Queue,

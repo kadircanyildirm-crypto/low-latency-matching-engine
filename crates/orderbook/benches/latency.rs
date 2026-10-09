@@ -13,7 +13,9 @@
 //!
 //! Run: `cargo bench --bench latency`
 //! Env: `LAT_COMMANDS` measured commands per run (default 2,000,000), `LAT_RUNS` (default 3),
-//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep,protected,sessions`.
+//!      `LAT_SCENARIOS` comma-separated subset of `baseline,deep,sweep,protected,sessions`,
+//!      `LAT_CORE` logical core to pin to (default the last one; on a hybrid CPU that can be
+//!      an efficiency core).
 //! Writes merged HdrHistogram percentile files to `target/latency/<scenario>.hgrm`
 //! (plot at https://hdrhistogram.github.io/HdrHistogram/plotFiles.html).
 
@@ -158,7 +160,7 @@ fn main() {
     let runs = env_count("LAT_RUNS", 3).max(1);
     let only = std::env::var("LAT_SCENARIOS").ok();
 
-    let core = pin_to_last_core();
+    let core = pin();
     let clock = Clock::calibrate();
     println!("matching core service time (single thread, closed loop, replayed streams)");
     println!("  cpu            : {}", cpu_brand());
@@ -360,8 +362,13 @@ fn env_count(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn pin_to_last_core() -> Option<usize> {
-    let core = core_affinity::get_core_ids()?.pop()?;
+/// Pins the thread to `$LAT_CORE`, or to the last core, and returns the core's id.
+fn pin() -> Option<usize> {
+    let cores = core_affinity::get_core_ids()?;
+    let core = match std::env::var("LAT_CORE").ok().and_then(|c| c.parse().ok()) {
+        Some(id) => *cores.iter().find(|c| c.id == id)?,
+        None => *cores.last()?,
+    };
     core_affinity::set_for_current(core).then_some(core.id)
 }
 

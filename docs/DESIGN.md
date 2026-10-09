@@ -338,3 +338,29 @@ outside, quantities at 0, at `max_order_qty`, just above it, and at `u64::MAX`, 
 | No market states: trading halts, opening and closing auctions | Phase 7 |
 | Self-trade policy is per book, not per order | Phase 7: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
+
+## 12. Performance work
+
+Each attempt was measured against the commit before it with interleaved A/B runs of
+`cargo bench --bench latency` (base, candidate, base, candidate, ...) on a laptop busy
+with other builds, so only same-session medians are compared. Numbers are medians of the
+per-invocation p50 and p99 (ns) and of the throughput (M cmd/s). The deep scenario is the
+target: its cancels and modifies miss the cache on almost every access.
+
+| Attempt | Deep: p50, p99, throughput | Other scenarios | Verdict |
+|---|---|---|---|
+| Linear-probing index, Fibonacci hash, (id, slot) entries side by side, 2× capacity, backward-shift deletion | 328 → 306, 1280 → 1272, 2.74 → 3.13; cancel 470 → 366, but limit 220 → 238, market 279 → 325 | not measured | Rejected: a new id's probe runs to an empty entry, which at half load often leaves the line, while the hash map's 4 MB of control bytes likely stay mostly in L3 |
+| The same at 4× capacity | 302 → 288 and 334 → 319 in two sessions; cancel 335–373, limit 229–249 | not measured | Rejected: new orders still slower than before |
+| Linear probing with four consecutive ids per 64-byte line, 2× and 4× capacity | 334 → 289 (2×), 334 → 275 (4×); limit 219 → 117–129, cancel back to 418–474 | not measured | Rejected: 45% of removals' backward shift reads the next line, a second miss in a row |
+| Lines of five (id, slot) pairs with overflow counts, four consecutive ids per home line | 305 → 245, 1149 → 1047, 3.08 → 3.96; limit 213 → 122, cancel 452 → 345 | baseline p50 93 → 98, protected 95 → 100: in-cache lookups cost ~8 ns more for new orders | Refined below |
+| **Kept:** the same with the five ways compared without branching | 328 → 254, 1266 → 1010, 2.46 → 3.70; limit 219 → 119, cancel 491 → 362, modify 615 → 533 | baseline 92 → 93, sweep 91 → 91, protected 95 → 95; p99 lower in all three | Kept (`src/index.rs`) |
+| Order nodes aligned to 64 bytes (48 → 64), so none straddles two cache lines, on top of the kept index | 239 → 238, 927 → 918; cancel 342 → 341 | baseline 89 → 89 | Rejected: no measurable effect for a third more memory |
+
+What the kept index changes: a lookup reads one cache line instead of a control-byte group
+and then a bucket, new orders find their line already cached because ids arrive in
+sequence, and removal never leaves tombstones, so no command ever pays for a rehash. Its
+memory for a million orders is about 32 MB, against about 68 MB for the hash map.
+
+Not attempted yet: owner links inside a 64-byte node (cancels would read the owner
+neighbours' nodes instead of three entries of the links array), a hot/cold split of the
+node, and a smaller level struct.

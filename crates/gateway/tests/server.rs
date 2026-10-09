@@ -13,7 +13,7 @@ use std::time::Duration;
 use engine::{Discard, Engine, EngineConfig};
 use gateway::client::Client;
 use gateway::load::{self, LoadConfig};
-use gateway::{Account, Exchange, Server, ServerConfig, Timing};
+use gateway::{Account, Core, Exchange, Pipeline, PipelineConfig, Server, ServerConfig, Timing};
 use orderbook::{BookConfig, CancelReason, Side, TimeInForce};
 use protocol::{Inbound, LogoutReason, NewOrder, OrderKind, Outbound, Report, ReportKind};
 
@@ -43,6 +43,21 @@ fn account(id: u32) -> Account {
     }
 }
 
+/// Serves until `stop` is set, and gives the core back.
+fn serve<C: Core>(
+    exchange: Exchange,
+    core: C,
+    addr: SocketAddr,
+    config: ServerConfig,
+    started: &mpsc::Sender<SocketAddr>,
+    stop: &AtomicBool,
+) -> Result<C, String> {
+    let mut server = Server::bind(exchange, core, addr, config).map_err(|e| e.to_string())?;
+    started.send(server.local_addr().unwrap()).unwrap();
+    server.run(stop).map_err(|e| e.to_string())?;
+    Ok(server.into_parts().1)
+}
+
 /// A running gateway.
 struct Gateway {
     addr: SocketAddr,
@@ -52,7 +67,17 @@ struct Gateway {
 }
 
 impl Gateway {
+    /// A gateway with the engine on its own thread.
     fn start(dir: &TempDir, config: ServerConfig) -> Gateway {
+        Gateway::start_with(dir, config, false)
+    }
+
+    /// A gateway with the engine on threads of its own, in a pipeline.
+    fn pipelined(dir: &TempDir, config: ServerConfig) -> Gateway {
+        Gateway::start_with(dir, config, true)
+    }
+
+    fn start_with(dir: &TempDir, config: ServerConfig, pipelined: bool) -> Gateway {
         let path = dir.0.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -74,14 +99,19 @@ impl Gateway {
             )
             .map_err(|e| e.to_string())?;
             let addr = "127.0.0.1:0".parse().unwrap();
-            let mut server =
-                Server::bind(exchange, engine, addr, config).map_err(|e| e.to_string())?;
-            tx.send(server.local_addr().unwrap()).unwrap();
-            server.run(&stopping).map_err(|e| e.to_string())?;
-            let (_, engine) = server.into_parts();
-            let left = engine.book().order_count();
-            engine.close().map_err(|e| e.to_string())?;
-            Ok(left)
+            if pipelined {
+                let pipeline = Pipeline::start(engine, PipelineConfig::default())
+                    .map_err(|e| e.to_string())?;
+                let pipeline = serve(exchange, pipeline, addr, config, &tx, &stopping)?;
+                let (writer, matcher) = pipeline.stop().map_err(|e| e.to_string())?;
+                writer.close().map_err(|e| e.to_string())?;
+                Ok(matcher.book().order_count())
+            } else {
+                let engine = serve(exchange, engine, addr, config, &tx, &stopping)?;
+                let left = engine.book().order_count();
+                engine.close().map_err(|e| e.to_string())?;
+                Ok(left)
+            }
         });
         let addr = rx
             .recv_timeout(Duration::from_secs(10))
@@ -391,5 +421,56 @@ fn the_load_generator_trades_end_to_end() {
     assert_eq!(report.refused, 0);
     assert!(report.fills > 0);
     assert!(report.percentile(0.5) <= report.percentile(1.0));
+    assert_eq!(gateway.stop(), 0);
+}
+
+/// The same through the pipeline: the writer and the matcher on threads of their own.
+#[test]
+fn the_load_generator_trades_through_the_pipeline() {
+    let dir = TempDir::new("pipelined-load");
+    let gateway = Gateway::pipelined(&dir, ServerConfig::default());
+    let config = LoadConfig {
+        duration: Duration::from_millis(500),
+        window: 8,
+        mid: 500,
+        max_resting: 50,
+        ..LoadConfig::default()
+    };
+    let accounts = [account(1), account(2), account(3)];
+    let report = load::run(gateway.addr, &accounts, config).unwrap();
+    assert!(report.orders > 0);
+    assert_eq!(report.latencies.len() as u64, report.orders);
+    assert_eq!(
+        report.accepted + report.rejected + report.refused,
+        report.orders
+    );
+    assert!(report.fills > 0);
+    assert_eq!(gateway.stop(), 0);
+}
+
+/// A pipelined gateway stops and starts again with the orders where they were.
+#[test]
+fn a_pipelined_gateway_keeps_its_orders_across_a_restart() {
+    let dir = TempDir::new("pipelined-restart");
+    let gateway = Gateway::pipelined(&dir, ServerConfig::default());
+    let mut client = gateway.login(1);
+    client.send(&limit(1, Side::Sell, 100, 1)).unwrap();
+    report(&mut client);
+    report(&mut client);
+    assert_eq!(gateway.stop(), 1);
+    let gateway = Gateway::pipelined(&dir, ServerConfig::default());
+    let mut client = gateway.login(2);
+    let market = Inbound::NewOrder(NewOrder {
+        client_ref: 2,
+        side: Side::Buy,
+        qty: 1,
+        kind: OrderKind::Market,
+    });
+    client.send(&market).unwrap();
+    assert_eq!(report(&mut client).kind, ReportKind::Accepted);
+    assert!(matches!(
+        report(&mut client).kind,
+        ReportKind::Fill { leaves: 0, .. }
+    ));
     assert_eq!(gateway.stop(), 0);
 }

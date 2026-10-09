@@ -82,11 +82,16 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, and a price band. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
 | Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, and computing the digest. |
+| Fuzzing | [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) steers inputs toward code they have not reached yet. Three targets: the differential test over any configuration, bands out to the ends of `i64` included; the snapshot round trip; and `restore` on arbitrary snapshots, which must never panic and must accept exactly the snapshots the documented rules allow. Debug assertions and overflow checks stay on. Each target runs 30 seconds on every push and 20 minutes every week. |
+| Formal proofs | [Kani](https://github.com/model-checking/kani) checks every input within stated bounds: the bitset searches agree with a linear scan, the order pool's free list is a LIFO stack of exactly the free slots, the iceberg fill arithmetic is exact, and each owner's list holds its orders in the order they started resting. |
+| Coverage | The tests run **99.86%** of the engine's lines (3 of 2,076 missed) and **96.1%** of its branches (13 of 334 missed), measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) in CI. What they miss is defensive code, such as `validate()`'s overflow error that the capacity rule makes unreachable. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
 owners, prices at bitset word boundaries and band edges, and quantities at `0`,
-`max_order_qty`, `max_order_qty + 1` and `u64::MAX`.
+`max_order_qty`, `max_order_qty + 1` and `u64::MAX`. What each fuzz target and proof
+checks, its bounds, and how to run it are in
+[DESIGN.md §10](docs/DESIGN.md#fuzzing-and-formal-verification).
 
 ### Mutation testing
 
@@ -106,7 +111,8 @@ Every one of the 319 mutants that compile was detected in the last full run, whi
 includes the snapshot module's own run. `src/workload.rs`, the benchmark's order-flow
 generator, is excluded because it is not part of the engine. Every change since has been
 mutation-tested on the lines it touches (`cargo mutants --in-diff`), and none has left a
-mutant alive. A full run is repeated at the end of each milestone.
+mutant alive. A full run is repeated at the end of each milestone, and a scheduled
+workflow repeats it every week, failing on any missed mutant.
 
 The first full run missed two mutants. Both changed the bound in a `.min(last)` clamp in
 `protection_cap`. The clamp turned out to have no effect: the matcher compares levels
@@ -163,7 +169,16 @@ cargo test                                # all tests
 cargo bench --bench latency               # latency per scenario; writes target/latency/*.hgrm
 cargo bench --bench throughput            # Criterion before/after comparison (includes generator cost)
 cargo mutants -p orderbook --exclude crates/orderbook/src/workload.rs   # mutation testing
+cargo +nightly fuzz run differential -s none -a -- -max_total_time=60 -len_control=0   # fuzzing
+cd crates/orderbook && cargo kani                                       # proofs (Linux, macOS)
+cargo +nightly llvm-cov -p orderbook --branch --ignore-filename-regex 'workload\.rs' --summary-only   # coverage
 ```
+
+The fuzz targets are `differential`, `snapshot_roundtrip` and `restore`. Each needs its
+tool first: `cargo install cargo-fuzz`, `cargo install --locked kani-verifier && cargo kani
+setup`, or `cargo install cargo-llvm-cov` with the nightly `llvm-tools-preview` component.
+Windows needs a different fuzzing setup, described in
+[DESIGN.md §10](docs/DESIGN.md#fuzzing-and-formal-verification).
 
 The `.hgrm` files can be plotted with the
 [HdrHistogram plotter](https://hdrhistogram.github.io/HdrHistogram/plotFiles.html)

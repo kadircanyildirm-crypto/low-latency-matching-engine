@@ -1,3 +1,4 @@
 /target
 graphify-out/
 mutants.out*/
+.claude/worktrees/

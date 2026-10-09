@@ -643,11 +643,16 @@ impl Exchange {
         }
         // The account's open orders, as if they had just rested, so that a client that
         // comes back, or a gateway that restarted, does not lose sight of them. Pending
-        // stops have no price to rest at, and are not told.
+        // stops have no price to rest at, and are not told; nor are orders whose command
+        // is still in flight, which the book has not seen and which will be reported as
+        // they are applied.
+        let delivered = self.delivered;
         let mut orders: Vec<(OrderId, Live)> = self
             .live
             .iter()
-            .filter(|(_, live)| live.account == account && live.price.is_some())
+            .filter(|&(&id, live)| {
+                live.account == account && live.price.is_some() && id <= delivered
+            })
             .map(|(&id, &live)| (id, live))
             .collect();
         orders.sort_unstable_by_key(|&(id, _)| id);

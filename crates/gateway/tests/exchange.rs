@@ -1450,3 +1450,21 @@ fn paper_money_is_neither_made_nor_lost() {
         }
     }
 }
+
+/// An account that logs in again while its last order is still in flight is told of it as
+/// the book applies it, not before: it has not rested yet.
+#[test]
+fn orders_in_flight_are_not_told_on_login() {
+    let mut exchange = exchange(&[account(1)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    exchange.receive(0, limit(7, Side::Buy, 10, 1), 1, &mut mail);
+    exchange.disconnect(0);
+    logged_in(&mut exchange, 1, 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let kinds: Vec<ReportKind> = mail.reports(1).into_iter().map(|r| r.kind).collect();
+    assert_eq!(kinds[0], ReportKind::Accepted);
+    assert!(matches!(kinds[1], ReportKind::Rested { .. }));
+    // The disconnect cancels it.
+    assert!(matches!(kinds[2], ReportKind::Cancelled { .. }));
+}

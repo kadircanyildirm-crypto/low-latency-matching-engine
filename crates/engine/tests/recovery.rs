@@ -315,8 +315,8 @@ fn damage_anywhere_is_refused_or_harmless() {
                 recovered += 1;
                 let n = engine.last_seq() as usize;
                 assert_eq!(engine.book().digest(), digests[n], "seed {seed}");
-                // Everything was synced. Only the last record has no later record to show
-                // that it was, so only it can go missing without an error.
+                // Everything was synced, one command at a time. Only the last record has no
+                // later record to vouch for it, so only it can go missing without an error.
                 assert!(n + 1 >= commands.len(), "seed {seed}: kept {n}");
                 lost_last += usize::from(n < commands.len());
             }

@@ -13,6 +13,10 @@
 //! follows, so stale records can never be mistaken for new ones later. But if a later record
 //! says the bad one had already been synced, data that was durable is gone, and recovery
 //! stops with an error instead of quietly losing acknowledged commands.
+//!
+//! Records vouch only for what was synced before they were written. Damage to the records
+//! of the last synced batch, when nothing was written after it, therefore looks exactly like
+//! a torn write, and recovery cuts them like one.
 
 use std::io;
 use std::path::{Path, PathBuf};

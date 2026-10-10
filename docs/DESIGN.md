@@ -1293,7 +1293,8 @@ server tells it the commands per second, how long the turns that handed commands
 engine took, as percentiles and as counts in buckets that double from a microsecond, the
 sessions and resting orders, and its clock.
 
-A subscribed browser is also shown the engine at work. Five times a second it gets the
+A subscribed browser is also shown the engine at work. It gets the statistics of the last
+two minutes when it subscribes, so its charts of them start full. Five times a second it gets the
 best ten levels of each side order by order, with each order's id and the quantity it
 shows in queue priority, when they changed since the last time; and the commands the
 engine sequenced since then, the latest twelve, each with what came of it: trades and

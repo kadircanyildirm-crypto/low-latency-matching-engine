@@ -9,7 +9,8 @@
 //! (`login_accepted`, `login_rejected`, `heartbeat`, `logout`, `reject`, `report`, `book`,
 //! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error`
 //! (`message`). A subscribed browser also gets `history` (the last hour as candles),
-//! `queues` (the best levels order by order), `log` (the commands the engine sequenced, with
+//! `stats_history` (the statistics of the last two minutes), `queues` (the best levels
+//! order by order), `log` (the commands the engine sequenced, with
 //! what came of them), `leaders` (the most profitable paper accounts) and `rank` (its own
 //! place among them); every browser gets `stats`. Codes such as reasons and sides are
 //! snake-case strings. Tokens are 16 hexadecimal digits.
@@ -465,6 +466,12 @@ pub struct Stats {
     pub turn_buckets: [u64; TURN_BUCKETS],
 }
 
+/// The JSON for the statistics of the last seconds, oldest first, as `stats_history`.
+pub fn stats_history<'a>(stats: impl Iterator<Item = &'a Stats>) -> String {
+    let stats: Vec<&Stats> = stats.collect();
+    json!({"type": "stats_history", "stats": stats}).to_string()
+}
+
 /// Buckets of [`Stats::turn_buckets`].
 pub const TURN_BUCKETS: usize = 18;
 
@@ -823,6 +830,14 @@ mod tests {
             [0, 0, 1, 1, 2, 2, 3, 16, TURN_BUCKETS - 1]
         );
         assert_eq!(turn_bucket(u64::MAX), TURN_BUCKETS - 1);
+        let second = Stats {
+            commands_per_second: 1,
+            ..Stats::default()
+        };
+        let history: Value = serde_json::from_str(&stats_history([second, second].iter())).unwrap();
+        assert_eq!(history["type"], "stats_history");
+        assert_eq!(history["stats"].as_array().unwrap().len(), 2);
+        assert_eq!(history["stats"][1]["commands_per_second"], 1);
         let mut candles = crate::candles::Candles::default();
         candles.record(1_000, 100, 2);
         let history: serde_json::Value =

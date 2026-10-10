@@ -284,6 +284,7 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert_eq!(browser.expect("book")["levels"], 0);
     // Nothing has traded yet.
     let history = browser.expect("history");
+    assert!(browser.expect("stats_history")["stats"].is_array());
     assert_eq!(
         (history["interval"].clone(), history["candles"].clone()),
         (json!(5), json!([]))

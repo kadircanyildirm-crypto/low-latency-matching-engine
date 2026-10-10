@@ -14,6 +14,7 @@
 //! and sessions over WebSocket that speak JSON ([`web`]). A browser's session
 //! is a session like any other.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -153,6 +154,10 @@ const LOG_SHOWN: usize = 12;
 /// Paper accounts on the leaderboard.
 const LEADERS: usize = 10;
 
+/// Seconds of statistics a browser that subscribes is sent: what the engine room's charts
+/// show.
+const STATS_KEPT: usize = 120;
+
 /// What a connection speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -249,6 +254,8 @@ pub struct Server<C: Core> {
     shown_queues: String,
     /// Scratch space for the engine log.
     logged: Vec<Logged>,
+    /// The statistics of the last seconds, oldest first.
+    recent_stats: VecDeque<json::Stats>,
 }
 
 impl<C: Core> Server<C> {
@@ -291,6 +298,7 @@ impl<C: Core> Server<C> {
             last_show: 0,
             shown_queues: String::new(),
             logged: Vec::new(),
+            recent_stats: VecDeque::with_capacity(STATS_KEPT),
         })
     }
 
@@ -652,6 +660,8 @@ impl<C: Core> Server<C> {
                     let history =
                         json::history(crate::candles::INTERVAL, self.exchange.candles().iter());
                     self.send_web(session, &history);
+                    let stats = json::stats_history(self.recent_stats.iter());
+                    self.send_web(session, &stats);
                     let queues = json::queues(self.exchange.depth(), QUEUE_LEVELS);
                     self.send_web(session, &queues);
                 }
@@ -698,6 +708,10 @@ impl<C: Core> Server<C> {
             orders: self.exchange.depth().order_count() as u64,
             time: unix_millis(),
         };
+        if self.recent_stats.len() == STATS_KEPT {
+            self.recent_stats.pop_front();
+        }
+        self.recent_stats.push_back(stats);
         let text = json::stats(&stats);
         for connection in self.wires.slots.iter_mut().flatten() {
             if matches!(connection.kind, Kind::WebSocket { .. }) && !connection.closing {

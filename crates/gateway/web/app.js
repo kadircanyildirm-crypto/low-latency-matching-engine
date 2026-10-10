@@ -620,7 +620,7 @@ function renderQueues() {
     most = Math.max(most, orders.reduce((sum, order) => sum + order.qty, 0));
     crowd = Math.max(crowd, orders.length);
   }
-  const scale = Math.max(0.05, (width - 2 * crowd) / most);
+  const scale = Math.max(0, width - 2 * crowd) / most;
   askSlots.forEach((slot, index) => showQueue(slot, asks[DEPTH - 1 - index], scale, mine));
   bidSlots.forEach((slot, index) => showQueue(slot, bids[index], scale, mine));
 }

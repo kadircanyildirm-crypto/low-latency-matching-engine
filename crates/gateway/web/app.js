@@ -713,7 +713,9 @@ function logRow(entry) {
   const row = document.createElement("div");
   const you = entry.paper && entry.owner === state.account;
   row.className = `log-row enter${you ? " mine" : ""}`;
-  const who = you ? "YOU" : entry.paper ? `GUEST ${entry.owner}` : `BOT ${entry.owner}`;
+  // In a mirrored market, the accounts without paper money are the venue's orders and trades.
+  const robot = market.source ? market.source.toUpperCase() : `BOT ${entry.owner}`;
+  const who = you ? "YOU" : entry.paper ? `GUEST ${entry.owner}` : robot;
   const command = span("", "log-cmd");
   command.append(...commandOf(entry));
   const [text, kind] = outcomeOf(entry);

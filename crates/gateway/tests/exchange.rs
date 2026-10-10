@@ -576,6 +576,71 @@ fn logging_in_again_does_not_refill_the_bucket() {
     );
 }
 
+/// With a collar, a paper account prices limit orders near the market's price: the last
+/// trade an account without funds took part in. Paper accounts trading with each other do
+/// not move it, so they cannot walk it away, and the leaderboard values them at it.
+#[test]
+fn paper_orders_stay_near_the_market() {
+    let paper = |id| Account {
+        funds: Some(gateway::Funds {
+            cash: 1_000_000,
+            position: 100,
+        }),
+        ..account(id)
+    };
+    let mut exchange = exchange(&[account(1), paper(2), paper(3)]);
+    exchange.set_paper_collar(Some(10));
+    let mut mail = Mail::default();
+    for (session, id) in [(0, 1), (1, 2), (2, 3)] {
+        logged_in(&mut exchange, session, id, &mut mail);
+    }
+    // Before the market's first trade, anything goes.
+    exchange.receive(1, limit(1, Side::Sell, 300, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    assert!(
+        !mail
+            .take(1)
+            .iter()
+            .any(|m| matches!(m, Outbound::Reject { .. }))
+    );
+    // The market trades at 100.
+    exchange.receive(0, limit(2, Side::Sell, 100, 1), 0, &mut mail);
+    exchange.receive(2, limit(3, Side::Buy, 100, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    mail.sent.clear();
+    // Ten percent either way is allowed; more is not.
+    for (price, allowed) in [(110, true), (90, true), (111, false), (89, false)] {
+        exchange.receive(2, limit(4, Side::Buy, price, 1), 0, &mut mail);
+        exchange.flush(&mut mail).unwrap();
+        let refused = mail.take(2).iter().any(|message| {
+            *message
+                == Outbound::Reject {
+                    reason: RejectCode::OffMarket,
+                    client_ref: 4,
+                }
+        });
+        assert_eq!(refused, !allowed, "at {price}");
+    }
+    // Two paper accounts trading at the edge do not move the market's price.
+    exchange.receive(1, limit(5, Side::Sell, 110, 1), 0, &mut mail);
+    exchange.receive(2, limit(6, Side::Buy, 110, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    mail.sent.clear();
+    exchange.receive(2, limit(7, Side::Buy, 120, 1), 0, &mut mail);
+    assert_eq!(
+        mail.take(2),
+        [Outbound::Reject {
+            reason: RejectCode::OffMarket,
+            client_ref: 7
+        }]
+    );
+    // And the leaderboard values positions at it: account 3 bought two lots, one at 100
+    // and one at 110, and they are worth 100 each.
+    let standings = exchange.standings();
+    let three = standings.iter().find(|s| s.account == 3).unwrap();
+    assert_eq!(three.profit, -10);
+}
+
 #[test]
 fn a_disconnect_cancels_the_accounts_orders() {
     let mut exchange = exchange(&[account(1), account(2)]);

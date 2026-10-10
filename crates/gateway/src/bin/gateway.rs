@@ -6,7 +6,7 @@
 //! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
 //! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>] [--symbol ETH/USD]
 //! [--price-decimals 2] [--lot-decimals 6] [--source <name>] [--source-url <url>]
-//! [--trust-forwarded-for false]`
+//! [--trust-forwarded-for false] [--paper-collar 10]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
@@ -15,7 +15,9 @@
 //! WebSocket. Visitors may create accounts with ids from `--guest-ids`, which are saved to
 //! the `--guests` file (`<dir>/guests.txt` by default) and loaded from it on the next start.
 //! They trade paper money: `--guest-cash` (in price ticks times lots) and
-//! `--guest-position` (in lots) to start with. `--public-url`, where the page is published
+//! `--guest-position` (in lots) to start with, at limit prices within `--paper-collar`
+//! percent of the market's price, the last trade an account without funds took part in
+//! (0 for no limit). `--public-url`, where the page is published
 //! such as `https://demo.example.com`, gives its link preview the image's full address.
 //! `--symbol`, `--price-decimals` and `--lot-decimals` tell browsers what is traded: a price
 //! is an integer number of ticks of `10^-price-decimals` of the quote currency, a quantity
@@ -60,7 +62,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
 [--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
-[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>] [--trust-forwarded-for true|false]";
+[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>] [--trust-forwarded-for true|false] [--paper-collar <percent>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -178,6 +180,7 @@ fn run() -> Result<(), String> {
         cash: parse(take("guest-cash"), "10000000", "guest-cash")?,
         position: parse(take("guest-position"), "1000", "guest-position")?,
     };
+    let collar: u32 = parse(take("paper-collar"), "10", "paper-collar")?;
     if let Some(name) = args.keys().next() {
         return Err(format!("unknown flag --{name}\n{USAGE}"));
     }
@@ -200,7 +203,7 @@ fn run() -> Result<(), String> {
         ..EngineConfig::new(book)
     };
     let opening = Instant::now();
-    let (engine, exchange, recovered) = recovery::open(
+    let (engine, mut exchange, recovered) = recovery::open(
         FsStorage,
         Path::new(&dir),
         config,
@@ -208,6 +211,7 @@ fn run() -> Result<(), String> {
         Timing::default(),
     )
     .map_err(|e| format!("opening {dir}: {e}"))?;
+    exchange.set_paper_collar((collar > 0).then_some(collar));
     let started = Started {
         started: SystemTime::now()
             .duration_since(UNIX_EPOCH)

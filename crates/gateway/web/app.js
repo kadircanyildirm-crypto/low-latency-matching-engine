@@ -149,6 +149,7 @@ const REASONS = {
   unavailable: "The exchange is not taking orders right now.",
   insufficient_funds: "Your paper account does not cover this order.",
   not_allowed: "Paper accounts place limit orders and cancel them.",
+  off_market: "Paper orders must be priced near the market's last price.",
   price_out_of_range: "That price is outside the allowed range.",
   price_outside_protection: "That price is too far from the market.",
   price_outside_band: "That price is too far from the last trade.",

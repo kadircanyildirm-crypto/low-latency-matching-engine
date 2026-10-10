@@ -322,6 +322,12 @@ pub struct Exchange {
     log: VecDeque<Logged>,
     /// The price of the last trade delivered.
     last_price: Option<Price>,
+    /// The price of the last trade delivered that an account without funds took part in,
+    /// such as one that mirrors a real market: paper accounts trading with each other do
+    /// not move it.
+    market_price: Option<Price>,
+    /// How far from `market_price` paper accounts may price limit orders, in percent.
+    paper_collar: Option<u32>,
 }
 
 impl Exchange {
@@ -394,7 +400,27 @@ impl Exchange {
             changed_wallets: Vec::new(),
             log: VecDeque::new(),
             last_price: None,
+            market_price: None,
+            paper_collar: None,
         })
+    }
+
+    /// Keeps paper-trading accounts' limit orders within `percent` of the market's price:
+    /// the last trade an account without funds took part in. Without it, two paper accounts
+    /// could trade with each other at any price, which moves paper money from one to the
+    /// other as they like, and puts either at the top of the leaderboard. Paper accounts
+    /// trade freely before the market's first trade.
+    pub fn set_paper_collar(&mut self, percent: Option<u32>) {
+        self.paper_collar = percent;
+    }
+
+    /// Whether a paper account's limit `price` lies within the collar.
+    fn near_market(&self, price: Price) -> bool {
+        let (Some(percent), Some(mark)) = (self.paper_collar, self.market_price) else {
+            return true;
+        };
+        let (price, mark, percent) = (i128::from(price), i128::from(mark), i128::from(percent));
+        (price - mark).abs() * 100 <= mark * percent
     }
 
     /// The sequence number of the last command numbered: handed over, or still in the
@@ -793,6 +819,9 @@ impl Exchange {
                 // A paper-trading account places limit orders it can pay for in full.
                 if let Some(wallet) = state.wallet {
                     let refusal = match (kind, price) {
+                        (OrderKind::Limit { .. }, Some(price)) if !self.near_market(price) => {
+                            Some(RejectCode::OffMarket)
+                        }
                         (OrderKind::Limit { .. }, Some(price)) => {
                             match Wallet::hold_of(side, price, qty) {
                                 Some(hold) if hold >= 0 && wallet.covers(side, hold) => None,
@@ -925,11 +954,12 @@ impl Exchange {
         self.sessions.get(session)?.as_ref()?.account
     }
 
-    /// The paper-trading accounts that have traded, valued at the last trade price, the
-    /// most profitable first and, for equal profits, the lowest account. Empty before the
-    /// first trade.
+    /// The paper-trading accounts that have traded, valued at the market's price (the last
+    /// trade an account without funds took part in, or the last trade if there was none
+    /// such), the most profitable first and, for equal profits, the lowest account. Empty
+    /// before the first trade.
     pub fn standings(&self) -> Vec<Standing> {
-        let Some(mark) = self.last_price else {
+        let Some(mark) = self.market_price.or(self.last_price) else {
             return Vec::new();
         };
         let worth = |cash: i64, position: i64| {
@@ -1316,12 +1346,22 @@ impl Exchange {
         }
         if let Event::Trade {
             trade_id,
+            taker,
+            maker,
             taker_side,
             price,
             qty,
             ..
         } = event
         {
+            let paper = |id| {
+                self.live
+                    .get(&id)
+                    .is_some_and(|live| self.wallet(live.account).is_some())
+            };
+            if !(paper(taker) && paper(maker)) {
+                self.market_price = Some(price);
+            }
             self.trades.push(TradeTick {
                 seq,
                 trade_id,

@@ -268,6 +268,9 @@ pub enum RejectCode {
     /// The account may not send this kind of message: a paper-trading account places limit
     /// orders and cancels them, nothing else.
     NotAllowed,
+    /// A paper-trading account's limit price is further from the market's price than the
+    /// exchange lets paper accounts go.
+    OffMarket,
 }
 
 /// An event of the book, as reported to a client.
@@ -972,6 +975,7 @@ codes!(reject_code, reject_of, RejectCode, "reject reason", [
     RejectCode::Unavailable => 3,
     RejectCode::InsufficientFunds => 4,
     RejectCode::NotAllowed => 5,
+    RejectCode::OffMarket => 6,
 ]);
 codes!(reject_reason_code, reject_reason_of, RejectReason, "reject reason", [
     RejectReason::InvalidQuantity => 1,

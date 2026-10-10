@@ -1294,6 +1294,15 @@ no price to hold against, and a modify could need more than is held while it wai
 applied. Accounts without funds, such as the bots', are not checked. A session is told its
 balance on login and after every round in which it changed.
 
+Paper accounts price limit orders within `--paper-collar` percent (10 by default) of the
+market's price: the last trade an account without funds, the mirror or a bot, took part in.
+Otherwise two paper accounts could trade with each other at any price in the book's range,
+and so move paper money from one to the other as they liked, putting either at the top of
+the leaderboard; this mattered most when the venue's feed was down and the mirror had
+withdrawn its orders. Trades between paper accounts do not move the market's price, so
+they cannot walk the collar away either, and the leaderboard values positions at it.
+Before the market's first trade, paper accounts trade freely.
+
 ### Checkpoints
 
 The engine rebuilds the book after a restart (§14). The exchange's own state, paper money
@@ -1449,7 +1458,7 @@ fill the web listener; the last hour as candles for a browser that subscribes, t
 | `mirror/tests/exchange.rs` | The mirror against a real exchange over real sockets: after each of three venue books, the exchange's book holds the venue's orders at the followed prices, level by level; trades sent again trade at the venue's price; and a modify that raced a fill is put right. |
 | `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |
 | `crates/gateway/src/web/json.rs` | The queues of the best levels, order by order, with those past the first 24 summed; every command kind in the engine log with each part of its outcome; the leaderboard, a browser's rank, and which bucket a turn of any length falls in. |
-| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. The engine log tells each command once, in sequence, only after all its events came, with its trades, what rested, a refusal, and what a mass cancel took off; paper accounts that traded are ranked by profit at the last trade price. |
+| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; paper orders kept near the market's price, which paper accounts trading with each other do not move; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. The engine log tells each command once, in sequence, only after all its events came, with its trades, what rested, a refusal, and what a mass cancel took off; paper accounts that traded are ranked by profit at the last trade price. |
 | `crates/gateway/tests/recovery.rs` | 40 random runs with checkpoints now and then and a power failure, in order and out of order, on the simulated disk: the exchange comes back exactly, only the client references of orders placed after the checkpoint lost. A damaged newest checkpoint falls back to the one before; one that contradicts the book is refused. |
 | `crates/engine/tests/operations.rs` | Commands reach an output before their events, live and on replay from where it stands. |
 | `crates/gateway/tests/server.rs` | Bots make a market within a second: both sides quoted, trades. |

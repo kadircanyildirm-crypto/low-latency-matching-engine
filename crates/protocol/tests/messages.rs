@@ -160,6 +160,7 @@ fn outbound() -> impl Strategy<Value = Outbound> {
                 Just(RejectCode::Unavailable),
                 Just(RejectCode::InsufficientFunds),
                 Just(RejectCode::NotAllowed),
+                Just(RejectCode::OffMarket),
             ],
             any::<u64>()
         )

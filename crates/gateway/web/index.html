@@ -28,6 +28,10 @@
     <span class="brand-tag">Live demo</span>
   </a>
   <nav class="nav" aria-label="About this demo">
+    <a class="nav-link" href="#engine">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/><path d="M6.5 1.5v2M9.5 1.5v2M6.5 12.5v2M9.5 12.5v2M1.5 6.5h2M1.5 9.5h2M12.5 6.5h2M12.5 9.5h2"/><rect x="6.25" y="6.25" width="3.5" height="3.5" rx=".5"/></svg>
+      <span>Engine room</span>
+    </a>
     <button id="about-open" class="nav-link" type="button">
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v4M8 4.75v.01"/></svg>
       <span>How it works</span>
@@ -76,14 +80,20 @@
   <div class="col col-main">
     <section class="panel chart-panel" aria-label="Price chart">
       <div class="panel-head">
-        <div class="segmented" role="group" aria-label="Candle length">
-          <button class="seg active" type="button" data-interval="5" aria-pressed="true">5s</button>
-          <button class="seg" type="button" data-interval="15" aria-pressed="false">15s</button>
-          <button class="seg" type="button" data-interval="60" aria-pressed="false">1m</button>
+        <div class="segmented" role="group" aria-label="Chart">
+          <button class="seg active" type="button" data-view="price" aria-pressed="true">Price</button>
+          <button class="seg" type="button" data-view="depth" aria-pressed="false">Depth</button>
         </div>
-        <div class="segmented" role="group" aria-label="Chart style">
-          <button class="seg active" type="button" data-style="candles" aria-pressed="true">Candles</button>
-          <button class="seg" type="button" data-style="line" aria-pressed="false">Line</button>
+        <div id="price-tools" class="tools">
+          <div class="segmented" role="group" aria-label="Candle length">
+            <button class="seg active" type="button" data-interval="5" aria-pressed="true">5s</button>
+            <button class="seg" type="button" data-interval="15" aria-pressed="false">15s</button>
+            <button class="seg" type="button" data-interval="60" aria-pressed="false">1m</button>
+          </div>
+          <div class="segmented" role="group" aria-label="Chart style">
+            <button class="seg active" type="button" data-style="candles" aria-pressed="true">Candles</button>
+            <button class="seg" type="button" data-style="line" aria-pressed="false">Line</button>
+          </div>
         </div>
       </div>
       <div class="chart-wrap">
@@ -110,7 +120,7 @@
       </div>
       <div id="open-view" class="table-view" role="tabpanel" aria-labelledby="tab-open">
         <table>
-          <thead><tr><th class="left">Placed</th><th class="left">Side</th><th>Price</th><th>Amount</th><th>Filled</th><th>Order</th><th><span class="sr-only">Cancel</span></th></tr></thead>
+          <thead><tr><th class="left">Placed</th><th class="left">Side</th><th>Price</th><th>Amount</th><th>Filled</th><th>Queue</th><th>Order</th><th><span class="sr-only">Cancel</span></th></tr></thead>
           <tbody id="open-orders"></tbody>
         </table>
         <div id="open-empty" class="empty">
@@ -137,9 +147,12 @@
     <section class="panel book-panel" aria-label="Order book">
       <div class="panel-head">
         <h2>Order book</h2>
-        <span class="hint">Click a price to trade it</span>
+        <div class="segmented small" role="group" aria-label="Book view">
+          <button class="seg active" type="button" data-book="levels" aria-pressed="true">Levels</button>
+          <button class="seg" type="button" data-book="orders" aria-pressed="false" title="Every order in its queue, first in line on the left">Orders</button>
+        </div>
       </div>
-      <div class="book-head"><span>Price (USD)</span><span>Size</span><span>Total</span></div>
+      <div class="book-head"><span>Price (USD)</span><span class="by-level">Size</span><span class="by-level">Total</span><span class="by-order">Queue: first in line on the left</span></div>
       <div id="asks" class="levels asks"></div>
       <div class="book-mid">
         <span id="mid-last" class="mid-last">—</span>
@@ -236,6 +249,68 @@
   </div>
 </main>
 
+<section id="engine" class="engine-room" aria-labelledby="engine-title">
+  <div class="room-head">
+    <div>
+      <span class="eyebrow">Engine room</span>
+      <h2 id="engine-title" class="room-title">Watch the matching engine work</h2>
+      <p class="room-sub">Every command is numbered, written to the journal, synced to disk and matched, in that order. This is the live feed.</p>
+    </div>
+    <div class="seq-counter" title="The sequence number of the latest command: every command the exchange has taken since it started">
+      <span class="seq-label"><i class="dot live-dot" aria-hidden="true"></i>Commands sequenced</span>
+      <span id="seq" class="seq-value">—</span>
+    </div>
+  </div>
+  <div class="room-grid">
+    <section class="panel log-panel" aria-label="Sequencer log">
+      <div class="panel-head">
+        <h2>Sequencer</h2>
+        <span id="log-state" class="hint">Hover to pause</span>
+      </div>
+      <div class="log-head"><span>Seq</span><span>From</span><span>Command</span><span>Result</span></div>
+      <div id="log" class="log" role="log" aria-live="off"></div>
+    </section>
+
+    <section class="panel heat-panel" aria-label="Turn latency">
+      <div class="panel-head">
+        <h2>Turn latency</h2>
+        <div class="heat-legend">
+          <span><i class="swatch p50"></i>p50 <b id="heat-p50">—</b></span>
+          <span><i class="swatch p99"></i>p99 <b id="heat-p99">—</b></span>
+          <span>max <b id="heat-max">—</b></span>
+        </div>
+      </div>
+      <div class="canvas-wrap heat-wrap"><canvas id="heat" role="img" aria-label="Heatmap of the server's turn times over the last two minutes"></canvas></div>
+      <p class="caption">One column a second. Colour is how many server turns took that long: read the sockets, journal, sync to disk, match, send the replies.</p>
+    </section>
+
+    <section class="panel tps-panel" aria-label="Throughput">
+      <div class="panel-head">
+        <h2>Throughput</h2>
+        <span class="tps-now"><b id="tps-now">—</b> commands/s</span>
+      </div>
+      <div class="canvas-wrap tps-wrap"><canvas id="tps" role="img" aria-label="Commands per second over the last two minutes"></canvas></div>
+    </section>
+
+    <section class="panel leaders-panel" aria-label="Leaderboard">
+      <div class="panel-head">
+        <h2>Leaderboard</h2>
+        <span class="hint">Paper profit at the last price</span>
+      </div>
+      <table class="leaders">
+        <thead><tr><th class="left">#</th><th class="left">Trader</th><th>Profit</th><th>Value</th></tr></thead>
+        <tbody id="leaders"></tbody>
+      </table>
+      <div id="leaders-empty" class="empty">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M7 6H4v1a3 3 0 0 0 3 3M17 6h3v1a3 3 0 0 1-3 3"/></svg>
+        <b>No one has traded yet</b>
+        <span>Your first trade puts you on the board.</span>
+      </div>
+      <p id="my-rank" class="my-rank">Make a trade to join the leaderboard.</p>
+    </section>
+  </div>
+</section>
+
 <footer class="statusbar">
   <div class="engine-stats" aria-label="How the exchange is doing">
     <span class="engine-state"><i class="dot" aria-hidden="true"></i><span id="engine-text">Engine</span></span>
@@ -286,6 +361,10 @@
       <li>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19.5 6v5.5c0 4.5-3.2 8.2-7.5 9.5-4.3-1.3-7.5-5-7.5-9.5V6z"/><path d="m8.75 12 2.25 2.25 4.25-4.5"/></svg>
         <div><b>Checked, not just tested</b><span>Property tests against a reference model, fuzzing, Miri, loom, Kani proofs and mutation testing in CI.</span></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></svg>
+        <div><b>Nothing hidden</b><span>Switch the book to Orders to see every order in its queue, yours among them. Scroll down to the engine room for every command as it is sequenced, and the server's latency second by second.</span></div>
       </li>
     </ul>
     <div class="about-foot">

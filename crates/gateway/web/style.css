@@ -461,7 +461,8 @@ canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 }
 
 .tape-panel { min-height: 220px; }
-.rows { flex: 1; overflow: hidden; min-height: 0; position: relative; }
+/* As tall as the column leaves it, whatever the number of trades. */
+.rows { flex: 1 1 0px; height: 0; overflow: hidden; min-height: 0; position: relative; }
 .trade-row {
   height: var(--row);
   line-height: var(--row);
@@ -813,9 +814,201 @@ td.muted { color: var(--muted); }
 }
 .primary:hover { filter: brightness(1.08); }
 
+/* ---------- Chart views ---------- */
+
+.tools { display: flex; flex-wrap: wrap; gap: 8px; }
+/* On a narrow screen the chart's controls go onto two lines rather than off the side. */
+.chart-panel .panel-head { flex-wrap: wrap; row-gap: 8px; }
+.segmented.small .seg { padding: 3px 8px; font-size: 11.5px; }
+
+/* ---------- The book, order by order ---------- */
+
+.by-order { display: none; }
+.blocks { display: none; }
+.book-panel.orders-mode .book-head,
+.book-panel.orders-mode .level { grid-template-columns: 64px minmax(0, 1fr); }
+.book-panel.orders-mode .by-level,
+.book-panel.orders-mode .level > .qty,
+.book-panel.orders-mode .level > .total,
+.book-panel.orders-mode .level > .bar { display: none; }
+.book-panel.orders-mode .by-order { display: block; text-align: left; }
+.book-panel.orders-mode .blocks {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  overflow: hidden;
+}
+.blk {
+  flex: none;
+  height: 13px;
+  border-radius: 2px;
+  transition: width 0.35s ease-out, opacity 0.35s ease-out, margin 0.35s ease-out;
+}
+.asks .blk { background: var(--sell-soft); box-shadow: inset 0 0 0 1px rgba(248, 81, 73, 0.45); }
+.bids .blk { background: var(--buy-soft); box-shadow: inset 0 0 0 1px rgba(46, 160, 67, 0.45); }
+.blocks .blk.mine {
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 10px rgba(88, 166, 255, 0.65);
+}
+.blocks .blk.more {
+  background: repeating-linear-gradient(135deg, var(--line) 0 3px, transparent 3px 6px);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.blk.new { animation: blk-in 0.35s ease-out; }
+@keyframes blk-in { from { opacity: 0; transform: scaleX(0.2); } }
+.blk.gone { width: 0 !important; opacity: 0; margin-right: -2px; }
+
+.queue-spot { color: var(--muted); }
+.queue-spot b { color: var(--text); font-weight: 600; }
+.next-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* ---------- Engine room ---------- */
+
+html { scroll-behavior: smooth; }
+.engine-room { padding: 4px 8px 16px; scroll-margin-top: 8px; }
+.room-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  padding: 22px 6px 14px;
+  border-top: 1px solid var(--line);
+}
+.room-title { font-size: 20px; letter-spacing: -0.02em; margin: 4px 0 4px; }
+.room-sub { margin: 0; color: var(--muted); max-width: 640px; }
+.seq-counter { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex: none; }
+.seq-label { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.live-dot { color: var(--buy); animation: pulse 2s ease-out infinite; }
+.seq-value {
+  font-family: var(--mono);
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.room-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 320px;
+  grid-template-areas:
+    "log heat leaders"
+    "log tps leaders";
+}
+.log-panel { grid-area: log; }
+.heat-panel { grid-area: heat; }
+.tps-panel { grid-area: tps; }
+.leaders-panel { grid-area: leaders; }
+
+.log-head, .log-row {
+  display: grid;
+  grid-template-columns: 96px 78px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+.log-head { font-size: 11px; color: var(--muted); padding: 0 8px 6px; }
+.log-head > :last-child { text-align: right; }
+.log {
+  position: relative;
+  height: 392px;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 12px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 80%, transparent);
+  mask-image: linear-gradient(to bottom, #000 80%, transparent);
+}
+.log-row { height: 24px; padding: 0 8px; border-radius: 4px; white-space: nowrap; }
+.log-row > span { overflow: hidden; text-overflow: ellipsis; }
+.log-row.enter { animation: log-in 0.7s ease-out; }
+@keyframes log-in {
+  from { transform: translateY(-4px); background: var(--accent-soft); }
+  25% { transform: none; }
+  to { background: transparent; }
+}
+.log-row.mine, .log-row.mine.enter { background: var(--accent-soft); animation: none; }
+.log-seq { color: var(--muted); }
+.log-who { font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; color: var(--muted); }
+.log-who.guest { color: var(--accent); }
+.log-who.you {
+  justify-self: start;
+  padding: 0 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--bg);
+}
+.log-cmd .buy { color: var(--buy); font-weight: 650; }
+.log-cmd .sell { color: var(--sell); font-weight: 650; }
+.log-cmd .verb { color: var(--text); font-weight: 650; }
+.log-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.log-out { color: var(--muted); text-align: right; }
+.log-out.fill { font-weight: 650; }
+.log-out.fill.buy { color: var(--buy); }
+.log-out.fill.sell { color: var(--sell); }
+.log-out.refused { color: var(--sell); }
+.log-gap { height: 20px; padding: 0 8px; color: var(--muted); font-size: 11px; font-family: var(--font); }
+#log-state.paused { color: var(--accent); font-weight: 600; }
+
+.heat-legend { display: flex; gap: 12px; font-size: 11.5px; color: var(--muted); }
+.heat-legend b { color: var(--text); font-weight: 600; }
+.swatch.p50 { background: var(--text); }
+.swatch.p99 { background: var(--sell); }
+.canvas-wrap { position: relative; }
+.canvas-wrap canvas { cursor: default; }
+.heat-wrap { height: 230px; }
+.tps-wrap { height: 118px; }
+.caption { margin: 8px 0 0; font-size: 11.5px; color: var(--muted); }
+.tps-now { font-size: 12px; color: var(--muted); }
+.tps-now b { color: var(--text); font-size: 15px; font-weight: 650; }
+
+.leaders { margin-bottom: 0; }
+.leaders td { height: 34px; }
+.leaders tr.me td { background: var(--accent-soft); }
+.rank {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--line);
+  font-size: 11px;
+  font-weight: 700;
+}
+.rank.top { background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.trader { font-weight: 600; }
+.trader.me { color: var(--accent); }
+.my-rank {
+  margin: auto 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.my-rank b { color: var(--accent); }
+
 /* ---------- Smaller screens ---------- */
 
 @media (max-width: 1279px) {
+  .room-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: "log log" "heat leaders" "tps leaders";
+  }
   .terminal { grid-template-columns: minmax(0, 1fr) 300px; }
   .col-trade { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
   .hide-small { display: none; }
@@ -835,13 +1028,19 @@ td.muted { color: var(--muted); }
   .ticket { order: 2; }
   .book-panel { order: 3; }
   .wallet { order: 4; }
-  .tape-panel { order: 5; max-height: 360px; }
+  .tape-panel { order: 5; height: 360px; }
   .orders-panel { order: 6; }
   .chart-wrap { height: 300px; }
   .table-view { overflow: auto; }
   .table-view table { min-width: 520px; }
   .engine-stats > :nth-child(n+5) { display: none; }
   .statusbar { padding: 0 16px; }
+  .room-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "log" "heat" "tps" "leaders"; }
+  .room-head { flex-direction: column; align-items: flex-start; }
+  .seq-counter { align-items: flex-start; }
+  .log { height: 300px; font-size: 11px; }
+  .log-head, .log-row { grid-template-columns: 74px minmax(0, 1fr) auto; }
+  .log-head > :nth-child(2), .log-row > .log-who { display: none; }
 }
 
 @media (max-width: 520px) {
@@ -852,5 +1051,6 @@ td.muted { color: var(--muted); }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }

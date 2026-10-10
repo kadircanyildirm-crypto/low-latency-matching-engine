@@ -41,6 +41,9 @@ const state = {
   retry: 500,
   offset: 0, // the server's clock minus ours, in milliseconds
   statsAt: 0,
+  queues: { buy: [], sell: [] },
+  leaders: null,
+  rank: null,
 };
 
 const now = () => Date.now() + state.offset;
@@ -178,6 +181,7 @@ function receive(message) {
       if (message.orders === 0) side.delete(message.price);
       else side.set(message.price, { qty: message.qty, orders: message.orders });
       schedule("book", "ticket");
+      if (chart.view === "depth") schedule("chart");
       break;
     }
     case "history":
@@ -210,6 +214,25 @@ function receive(message) {
       break;
     case "stats":
       stats(message);
+      break;
+    case "queues":
+      state.queues = { buy: unpack(message.buy), sell: unpack(message.sell) };
+      schedule("book", "orders");
+      break;
+    case "log":
+      engineLog(message);
+      break;
+    case "stats_history":
+      engine.heat = message.stats.slice(-SECONDS).map(heatOf);
+      schedule("engine");
+      break;
+    case "leaders":
+      state.leaders = message;
+      schedule("leaders");
+      break;
+    case "rank":
+      state.rank = message;
+      schedule("leaders");
       break;
     default:
       break;
@@ -370,10 +393,15 @@ function makeRows(element, side) {
     const at = document.createElement("span");
     at.className = "price";
     const qty = document.createElement("span");
+    qty.className = "qty";
     const total = document.createElement("span");
     total.className = "total";
-    row.append(bar, at, qty, total);
-    const slot = { row, bar, at, qty, total, price: null, size: null };
+    const blocks = document.createElement("span");
+    blocks.className = "blocks";
+    row.append(bar, at, qty, total, blocks);
+    const slot = {
+      row, bar, at, qty, total, blocks, blockMap: new Map(), queuePrice: null, price: null, size: null,
+    };
     // Clicking a level sets up the order that would trade with it.
     row.addEventListener("click", () => {
       if (slot.price !== null) pick(slot.price, side === "ask" ? "buy" : "sell");
@@ -438,13 +466,16 @@ function renderBook() {
   const myBids = mine("buy");
   const myAsks = mine("sell");
   // The best ask sits at the bottom of its half, next to the spread.
-  askSlots.forEach((slot, index) => {
-    const at = DEPTH - 1 - index;
-    show(slot, asks[at], askTotals[at], max, asks[at] && myAsks.has(asks[at][0]));
-  });
-  bidSlots.forEach((slot, index) => {
-    show(slot, bids[index], bidTotals[index], max, bids[index] && myBids.has(bids[index][0]));
-  });
+  if (book.mode === "orders") renderQueues();
+  else {
+    askSlots.forEach((slot, index) => {
+      const at = DEPTH - 1 - index;
+      show(slot, asks[at], askTotals[at], max, asks[at] && myAsks.has(asks[at][0]));
+    });
+    bidSlots.forEach((slot, index) => {
+      show(slot, bids[index], bidTotals[index], max, bids[index] && myBids.has(bids[index][0]));
+    });
+  }
 
   const spread = bids.length && asks.length ? asks[0][0] - bids[0][0] : null;
   const mid = spread === null ? null : (asks[0][0] + bids[0][0]) / 2;
@@ -464,6 +495,412 @@ function renderBook() {
 
 const arrow = () => (state.direction > 0 ? "↑" : state.direction < 0 ? "↓" : "");
 const tone = () => (state.direction > 0 ? "up" : state.direction < 0 ? "down" : "");
+
+// ---------- The book, order by order ----------
+
+// The best levels as the server last showed them, each order with its id and what it
+// shows, in the order they trade.
+const unpack = (levels) => levels.map(([at, flat]) => {
+  const orders = [];
+  for (let index = 0; index < flat.length; index += 2) orders.push({ id: flat[index], qty: flat[index + 1] });
+  return [at, orders];
+});
+
+const book = { mode: load("exchange-book-mode") === "orders" ? "orders" : "levels", width: 0 };
+
+function setBookMode(mode) {
+  book.mode = mode;
+  book.width = 0;
+  save("exchange-book-mode", mode);
+  document.querySelector(".book-panel").classList.toggle("orders-mode", mode === "orders");
+  choose("[data-book]", "book", mode);
+  for (const slot of [...askSlots, ...bidSlots]) clearQueue(slot);
+  schedule("book");
+}
+
+function clearQueue(slot) {
+  slot.blocks.replaceChildren();
+  slot.blockMap.clear();
+  slot.queuePrice = null;
+}
+
+// One level's orders as blocks as wide as what they show, first in line on the left.
+// Blocks that went shrink away where they were; new ones grow in at the back.
+function showQueue(slot, level, scale, mine) {
+  if (!level) {
+    show(slot, null);
+    clearQueue(slot);
+    return;
+  }
+  const [at, orders] = level;
+  if (slot.queuePrice !== at) clearQueue(slot);
+  const fresh = slot.queuePrice === null;
+  slot.queuePrice = at;
+  const wanted = [];
+  let size = 0;
+  let yours = false;
+  for (const order of orders) {
+    const key = order.id || "more";
+    let block = slot.blockMap.get(key);
+    const added = !block;
+    if (added) {
+      block = document.createElement("i");
+      slot.blockMap.set(key, block);
+    }
+    const isMine = mine.has(order.id);
+    yours ||= isMine;
+    block.className = `blk${order.id === 0 ? " more" : ""}${isMine ? " mine" : ""}${added && !fresh ? " new" : ""}`;
+    block.style.width = `${Math.max(3, Math.round(order.qty * scale))}px`;
+    block.title = order.id === 0
+      ? `${count(order.qty)} DEMO more, behind`
+      : `Order #${count(order.id)}: ${count(order.qty)} DEMO${isMine ? ", yours" : ""}`;
+    wanted.push(block);
+    size += order.qty;
+  }
+  const keep = new Set(wanted);
+  for (const [key, block] of slot.blockMap) {
+    if (keep.has(block)) continue;
+    slot.blockMap.delete(key);
+    block.classList.add("gone");
+    setTimeout(() => block.remove(), 400);
+  }
+  let cursor = slot.blocks.firstChild;
+  for (const block of wanted) {
+    while (cursor && cursor.classList.contains("gone")) cursor = cursor.nextSibling;
+    if (cursor === block) cursor = cursor.nextSibling;
+    else slot.blocks.insertBefore(block, cursor);
+  }
+  slot.at.textContent = price(at);
+  slot.at.className = yours ? "price mine" : "price";
+  slot.row.className = "level";
+  slot.row.title = `${orders.length} order${orders.length === 1 ? "" : "s"}, ${count(size)} DEMO at ${price(at)}: the first in line trades first`;
+  slot.price = at;
+  slot.size = size;
+}
+
+function renderQueues() {
+  const mine = new Set(state.orders.keys());
+  const asks = state.queues.sell.slice(0, DEPTH);
+  const bids = state.queues.buy.slice(0, DEPTH);
+  // One scale for every level, so that blocks compare across the book.
+  const width = book.width || (book.width = askSlots[0].blocks.clientWidth || 180);
+  let most = 1;
+  let crowd = 1;
+  for (const [, orders] of [...asks, ...bids]) {
+    most = Math.max(most, orders.reduce((sum, order) => sum + order.qty, 0));
+    crowd = Math.max(crowd, orders.length);
+  }
+  const scale = Math.max(0.05, (width - 2 * crowd) / most);
+  askSlots.forEach((slot, index) => showQueue(slot, asks[DEPTH - 1 - index], scale, mine));
+  bidSlots.forEach((slot, index) => showQueue(slot, bids[index], scale, mine));
+}
+
+// Where an open order stands in its queue, if its level is among those shown.
+function queueSpot(order) {
+  const level = state.queues[order.side].find(([at]) => at === order.price);
+  if (!level) return null;
+  let ahead = 0;
+  for (const [index, entry] of level[1].entries()) {
+    if (entry.id === order.id) return { place: index + 1, ahead };
+    ahead += entry.qty;
+  }
+  return null;
+}
+
+// ---------- Engine room ----------
+
+const engine = {
+  seq: 0,
+  shown: 0,
+  counting: false,
+  paused: false,
+  held: [],
+  heat: [], // a second each: {buckets, p50, p99, max, cps}
+};
+
+const TIFS = { ioc: "IOC", fok: "FOK", post_only: "POST" };
+
+function span(text, className) {
+  const element = document.createElement("span");
+  element.textContent = text;
+  if (className) element.className = className;
+  return element;
+}
+
+// What a command asked for, as the log shows it.
+function commandOf(entry) {
+  const parts = [];
+  const sideOf = () => span(entry.side === "buy" ? "BUY" : "SELL", entry.side);
+  switch (entry.cmd) {
+    case "limit":
+      parts.push(sideOf(), ` ${count(entry.qty)} @ ${price(entry.price)}`);
+      if (TIFS[entry.tif]) parts.push(span(TIFS[entry.tif], "log-tag"));
+      if (entry.display) parts.push(span(`ICEBERG ${count(entry.display)}`, "log-tag"));
+      break;
+    case "market":
+      parts.push(sideOf(), ` ${count(entry.qty)} `, span("MARKET", "log-tag"));
+      break;
+    case "stop":
+      parts.push(span("STOP ", "verb"), sideOf(), ` ${count(entry.qty)} @ ${price(entry.trigger)}`);
+      if (entry.price !== null) parts.push(` limit ${price(entry.price)}`);
+      break;
+    case "cancel":
+      parts.push(span("CANCEL", "verb"), ` #${count(entry.id)}`);
+      break;
+    case "modify":
+      parts.push(span("MODIFY", "verb"), ` #${count(entry.id)} → ${count(entry.qty)} @ ${price(entry.price)}`);
+      break;
+    case "cancel_all":
+      parts.push(span("CANCEL ALL", "verb"));
+      break;
+    case "set_phase":
+      parts.push(span("PHASE", "verb"), ` ${entry.phase}`);
+      break;
+    default:
+      parts.push(entry.cmd);
+  }
+  return parts;
+}
+
+// What came of it.
+function outcomeOf(entry) {
+  if (entry.rejected) return [`refused: ${entry.rejected.replaceAll("_", " ")}`, "refused"];
+  const parts = [];
+  if (entry.trades) parts.push(`${entry.trades} fill${entry.trades === 1 ? "" : "s"} · ${count(entry.traded)}`);
+  if (entry.rested) parts.push(`rests ${count(entry.rested)}`);
+  if (entry.cancelled) {
+    parts.push(entry.cmd === "cancel_all"
+      ? `${count(entry.cancelled)} cancelled`
+      : `${count(entry.cancelled_qty)} cancelled`);
+  }
+  if (!parts.length) {
+    parts.push({ stop: "waits for its trigger", cancel_all: "none open" }[entry.cmd] || "done");
+  }
+  return [parts.join(" · "), entry.trades ? `fill ${entry.side || ""}` : ""];
+}
+
+function logRow(entry) {
+  const row = document.createElement("div");
+  const you = entry.paper && entry.owner === state.account;
+  row.className = `log-row enter${you ? " mine" : ""}`;
+  const who = you ? "YOU" : entry.paper ? `GUEST ${entry.owner}` : `BOT ${entry.owner}`;
+  const command = span("", "log-cmd");
+  command.append(...commandOf(entry));
+  const [text, kind] = outcomeOf(entry);
+  row.append(
+    span(`#${count(entry.seq)}`, "log-seq"),
+    span(who, `log-who ${you ? "you" : entry.paper ? "guest" : "bot"}`),
+    command,
+    span(text, `log-out ${kind}`),
+  );
+  return row;
+}
+
+function appendLog(entries, skipped) {
+  const log = $("log");
+  if (skipped) log.prepend(span(`… ${count(skipped)} more commands in between`, "log-gap"));
+  for (const entry of entries) log.prepend(logRow(entry));
+  while (log.children.length > 48) log.lastElementChild.remove();
+}
+
+function engineLog(message) {
+  const entries = message.entries;
+  if (!entries.length) return;
+  engine.seq = Math.max(engine.seq, entries[entries.length - 1].seq);
+  countUp();
+  if (engine.paused) {
+    engine.held.push({ entries, skipped: message.skipped });
+    if (engine.held.length > 10) engine.held.shift();
+    return;
+  }
+  appendLog(entries, message.skipped);
+}
+
+// The sequence number rolls up to the latest, like an odometer.
+function countUp() {
+  if (engine.counting) return;
+  engine.counting = true;
+  const step = () => {
+    const gap = engine.seq - engine.shown;
+    if (engine.shown === 0 || gap > 100_000) engine.shown = engine.seq;
+    else engine.shown += Math.max(1, Math.ceil(gap * 0.12));
+    $("seq").textContent = count(engine.shown);
+    if (engine.shown < engine.seq) requestAnimationFrame(step);
+    else engine.counting = false;
+  };
+  requestAnimationFrame(step);
+}
+
+const logPanel = document.querySelector(".log-panel");
+logPanel.addEventListener("pointerenter", () => {
+  engine.paused = true;
+  $("log-state").textContent = "Paused";
+  $("log-state").className = "hint paused";
+});
+logPanel.addEventListener("pointerleave", () => {
+  engine.paused = false;
+  $("log-state").textContent = "Hover to pause";
+  $("log-state").className = "hint";
+  for (const { entries, skipped } of engine.held) appendLog(entries, skipped);
+  engine.held = [];
+});
+
+function sized(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  if (!width || !height) return null;
+  if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  return { context, width, height };
+}
+
+// The accent colour at `alpha`.
+function accent(alpha) {
+  const hex = colors().accent.replace("#", "");
+  const [r, g, b] = [0, 2, 4].map((at) => parseInt(hex.slice(at, at + 2), 16));
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+const SECONDS = 120;
+const BUCKETS = 18;
+// Where a turn of `ns` falls among the buckets, continuously: 1 at a microsecond, one more
+// for each doubling.
+const bucketOf = (ns) => (ns < 1_000 ? ns / 1_000 : Math.min(BUCKETS, 1 + Math.log2(ns / 1_000)));
+
+function drawHeat() {
+  const area = sized($("heat"));
+  if (!area) return;
+  const { context, width, height } = area;
+  const color = colors();
+  const left = 44;
+  const top = 6;
+  const bottom = 18;
+  const plotWidth = width - left - 4;
+  const plotHeight = height - top - bottom;
+  const column = plotWidth / SECONDS;
+  const row = plotHeight / BUCKETS;
+  const y = (bucket) => top + plotHeight - bucket * row;
+  context.font = `10.5px ${color.font}`;
+  context.textBaseline = "middle";
+  context.textAlign = "right";
+  context.fillStyle = color.muted;
+  const labels = [[1, "1µs"], [3, "4µs"], [5, "16µs"], [7, "64µs"], [9, "256µs"], [11, "1ms"], [13, "4ms"], [15, "16ms"], [17, "65ms"]];
+  for (const [bucket, label] of labels) {
+    context.fillText(label, left - 6, y(bucket));
+    context.strokeStyle = color.line;
+    context.globalAlpha = 0.5;
+    context.beginPath();
+    context.moveTo(left, Math.round(y(bucket)) + 0.5);
+    context.lineTo(left + plotWidth, Math.round(y(bucket)) + 0.5);
+    context.stroke();
+    context.globalAlpha = 1;
+  }
+  const seconds = engine.heat;
+  let most = 1;
+  for (const second of seconds) for (const n of second.buckets) most = Math.max(most, n);
+  const x = (index) => left + plotWidth - (seconds.length - index) * column;
+  seconds.forEach((second, index) => {
+    second.buckets.forEach((n, bucket) => {
+      if (!n) return;
+      context.fillStyle = accent(0.18 + 0.82 * Math.sqrt(n / most));
+      context.fillRect(x(index) + 0.5, y(bucket + 1) + 0.5, Math.max(1, column - 1), Math.max(1, row - 1));
+    });
+  });
+  // The percentiles, as lines through the columns.
+  for (const [key, stroke, alpha] of [["p50", color.text, 0.85], ["p99", color.sell, 0.9]]) {
+    context.strokeStyle = stroke;
+    context.globalAlpha = alpha;
+    context.lineWidth = 1.5;
+    context.beginPath();
+    let drawing = false;
+    seconds.forEach((second, index) => {
+      if (!second[key]) {
+        drawing = false;
+        return;
+      }
+      const at = [x(index) + column / 2, y(bucketOf(second[key]))];
+      if (drawing) context.lineTo(...at);
+      else context.moveTo(...at);
+      drawing = true;
+    });
+    context.stroke();
+  }
+  context.globalAlpha = 1;
+  context.lineWidth = 1;
+  context.textAlign = "center";
+  context.fillStyle = color.muted;
+  context.fillText("2 min ago", left + 26, height - bottom / 2 + 2);
+  context.fillText("1 min", left + plotWidth / 2, height - bottom / 2 + 2);
+  context.textAlign = "right";
+  context.fillText("now", left + plotWidth, height - bottom / 2 + 2);
+}
+
+function drawTps() {
+  const area = sized($("tps"));
+  if (!area) return;
+  const { context, width, height } = area;
+  const color = colors();
+  const values = engine.heat.map((second) => second.cps);
+  if (values.length < 2) return;
+  const most = Math.max(10, ...values) * 1.15;
+  const top = 4;
+  const bottom = 4;
+  const x = (index) => width - (values.length - 1 - index) * (width / (SECONDS - 1));
+  const y = (value) => top + (1 - value / most) * (height - top - bottom);
+  const gradient = context.createLinearGradient(0, top, 0, height);
+  gradient.addColorStop(0, accent(0.35));
+  gradient.addColorStop(1, accent(0));
+  context.beginPath();
+  values.forEach((value, index) => (index ? context.lineTo(x(index), y(value)) : context.moveTo(x(index), y(value))));
+  context.strokeStyle = color.accent;
+  context.lineWidth = 1.75;
+  context.stroke();
+  context.lineTo(x(values.length - 1), height);
+  context.lineTo(x(0), height);
+  context.closePath();
+  context.fillStyle = gradient;
+  context.fill();
+  const peak = Math.max(...values);
+  context.font = `10.5px ${color.font}`;
+  context.fillStyle = color.muted;
+  context.textAlign = "left";
+  context.textBaseline = "top";
+  context.fillText(`peak ${count(peak)}/s`, 4, 4);
+}
+
+function renderLeaders() {
+  const data = state.leaders;
+  const leaders = data ? data.leaders : [];
+  $("leaders-empty").hidden = leaders.length > 0;
+  $("leaders").replaceChildren(
+    ...leaders.map((leader, index) => {
+      const row = document.createElement("tr");
+      const me = leader.account === state.account;
+      if (me) row.className = "me";
+      const rank = span(String(index + 1), index < 3 ? "rank top" : "rank");
+      const name = span(me ? "You" : `Guest #${leader.account}`, me ? "trader me" : "trader");
+      const profit = `${leader.profit >= 0 ? "+" : "−"}${money(Math.abs(leader.profit))}`;
+      row.append(
+        cell(rank, "left"),
+        cell(name, "left"),
+        cell(profit, leader.profit > 0 ? "up" : leader.profit < 0 ? "down" : ""),
+        cell(money(leader.value), "muted"),
+      );
+      return row;
+    }),
+  );
+  const mine = state.rank;
+  const line = $("my-rank");
+  if (mine) {
+    line.replaceChildren("You are ", bold(`#${mine.rank}`), ` of ${count(mine.of)} traders`);
+  } else line.textContent = "Make a trade to join the leaderboard.";
+}
 
 // ---------- Trades ----------
 
@@ -516,6 +953,7 @@ function renderTicker() {
 
 const chart = {
   base: [], // the server's candles, then the trades since: {t, o, h, l, c, v}
+  view: "price",
   interval: INTERVAL,
   style: "candles",
   hover: null,
@@ -594,6 +1032,7 @@ function colors() {
       text: take("--text"),
       accent: take("--accent"),
       panel: take("--panel"),
+      bg: take("--bg"),
       font: take("--font"),
     };
   }
@@ -621,6 +1060,10 @@ function drawChart() {
   const context = canvas.getContext("2d");
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
+  if (chart.view === "depth") {
+    drawDepth(context, width, height);
+    return;
+  }
   const candles = series();
   $("chart-empty").hidden = candles.length > 0;
   if (!candles.length) {
@@ -772,6 +1215,45 @@ function drawChart() {
   context.globalAlpha = 1;
   context.lineWidth = 1;
 
+  // Your open orders, as lines at their prices.
+  context.font = `600 10.5px ${color.font}`;
+  for (const order of state.orders.values()) {
+    if (order.price < low || order.price > high) continue;
+    const row = Math.round(y(order.price)) + 0.5;
+    context.strokeStyle = color.accent;
+    context.setLineDash([6, 4]);
+    context.beginPath();
+    context.moveTo(0, row);
+    context.lineTo(plotWidth, row);
+    context.stroke();
+    context.setLineDash([]);
+    const label = `${order.side === "buy" ? "BUY" : "SELL"} ${count(order.leaves)} @ ${price(order.price)}`;
+    const labelWidth = context.measureText(label).width + 12;
+    box(context, 6, row - 9, labelWidth, 18, color.accent);
+    context.fillStyle = color.bg;
+    context.textAlign = "left";
+    context.fillText(label, 12, row);
+  }
+  context.font = `11px ${color.font}`;
+  // Your fills, as markers on their candles: below for a buy, above for a sell.
+  for (const fill of state.fills) {
+    const second = Math.floor(fill.time / 1_000);
+    const t = second - (second % size);
+    if (t < start || fill.price < low || fill.price > high) continue;
+    const cx = Math.round(x(t)) + 0.5;
+    const cy = y(fill.price);
+    const tip = fill.side === "buy" ? 1 : -1;
+    context.beginPath();
+    context.moveTo(cx, cy + 3 * tip);
+    context.lineTo(cx - 5, cy + 11 * tip);
+    context.lineTo(cx + 5, cy + 11 * tip);
+    context.closePath();
+    context.fillStyle = fill.side === "buy" ? color.buy : color.sell;
+    context.strokeStyle = color.text;
+    context.fill();
+    context.stroke();
+  }
+
   // The last price, across the chart and on the axis.
   const lastRow = Math.round(y(lastPrice)) + 0.5;
   const lastColor = state.direction < 0 ? color.sell : color.buy;
@@ -820,6 +1302,179 @@ function drawChart() {
     shown = candles.find((candle) => candle.t === t) || null;
   }
   legend(shown, ma);
+}
+
+// The book's cumulative size on each side of the mid, out to its deepest level.
+function drawDepth(context, width, height) {
+  const color = colors();
+  const bids = sorted("buy");
+  const asks = sorted("sell");
+  $("chart-empty").hidden = bids.length > 0 && asks.length > 0;
+  if (!bids.length || !asks.length) {
+    $("legend").replaceChildren();
+    return;
+  }
+  const axis = 64;
+  const top = 26;
+  const bottom = 22;
+  const plotWidth = width - axis;
+  const plotHeight = height - top - bottom;
+  const mid = (bids[0][0] + asks[0][0]) / 2;
+  const half = Math.max(mid - bids[bids.length - 1][0], asks[asks.length - 1][0] - mid, 1) * 1.04;
+  const low = mid - half;
+  const high = mid + half;
+  const totals = (levels) => {
+    let sum = 0;
+    return levels.map(([at, level]) => [at, (sum += level.qty)]);
+  };
+  const bidSteps = totals(bids);
+  const askSteps = totals(asks);
+  const most = Math.max(bidSteps[bidSteps.length - 1][1], askSteps[askSteps.length - 1][1]) * 1.15;
+  const x = (at) => ((at - low) / (high - low)) * plotWidth;
+  const y = (qty) => top + (1 - qty / most) * plotHeight;
+
+  context.font = `11px ${color.font}`;
+  context.textBaseline = "middle";
+  context.lineWidth = 1;
+  // The size grid on the right, and prices along the bottom.
+  const step = niceStep(most / 5);
+  context.textAlign = "left";
+  for (let qty = step; qty < most; qty += step) {
+    const row = Math.round(y(qty)) + 0.5;
+    context.strokeStyle = color.line;
+    context.beginPath();
+    context.moveTo(0, row);
+    context.lineTo(plotWidth, row);
+    context.stroke();
+    context.fillStyle = color.muted;
+    context.fillText(count(qty), plotWidth + 8, row);
+  }
+  const priceStep = niceStep((high - low) / 6);
+  context.textAlign = "center";
+  for (let at = Math.ceil(low / priceStep) * priceStep; at <= high; at += priceStep) {
+    const column = x(at);
+    if (column < 20 || column > plotWidth - 20) continue;
+    context.fillStyle = color.muted;
+    context.fillText(price(at), column, height - bottom / 2);
+  }
+
+  // The spread, between the two sides.
+  context.fillStyle = color.hover || "rgba(230, 237, 243, 0.05)";
+  context.fillRect(x(bids[0][0]), top, x(asks[0][0]) - x(bids[0][0]), plotHeight);
+
+  // Each side as steps: flat across a level's price, up at the next one.
+  const side = (steps, edge, stroke, fill) => {
+    const path = new Path2D();
+    path.moveTo(x(steps[0][0]), y(0));
+    steps.forEach(([at, total], index) => {
+      if (index > 0) path.lineTo(x(at), y(steps[index - 1][1]));
+      path.lineTo(x(at), y(total));
+    });
+    path.lineTo(edge, y(steps[steps.length - 1][1]));
+    const area = new Path2D(path);
+    area.lineTo(edge, y(0));
+    area.closePath();
+    const gradient = context.createLinearGradient(0, top, 0, top + plotHeight);
+    gradient.addColorStop(0, fill);
+    gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+    context.fillStyle = gradient;
+    context.fill(area);
+    context.strokeStyle = stroke;
+    context.lineWidth = 1.75;
+    context.stroke(path);
+    context.lineWidth = 1;
+  };
+  side(bidSteps, 0, color.buy, color.buySoft);
+  side(askSteps, plotWidth, color.sell, color.sellSoft);
+
+  // The mid.
+  const midColumn = Math.round(x(mid)) + 0.5;
+  context.strokeStyle = color.muted;
+  context.setLineDash([3, 4]);
+  context.beginPath();
+  context.moveTo(midColumn, top);
+  context.lineTo(midColumn, top + plotHeight);
+  context.stroke();
+  context.setLineDash([]);
+
+  // Your orders, as dots on their side's curve.
+  const totalAt = (steps, at, buying) => {
+    let total = 0;
+    for (const [level, sum] of steps) if (buying ? level >= at : level <= at) total = sum;
+    return total;
+  };
+  for (const order of state.orders.values()) {
+    if (order.price < low || order.price > high) continue;
+    const buying = order.side === "buy";
+    const cy = y(totalAt(buying ? bidSteps : askSteps, order.price, buying));
+    context.beginPath();
+    context.arc(x(order.price), cy, 4.5, 0, 2 * Math.PI);
+    context.fillStyle = color.accent;
+    context.fill();
+    context.strokeStyle = color.bg;
+    context.lineWidth = 2;
+    context.stroke();
+    context.lineWidth = 1;
+  }
+
+  // The crosshair: what it would take to reach a price.
+  const hover = chart.hover;
+  let shownAt = null;
+  if (hover && hover.x >= 0 && hover.x < plotWidth && hover.y >= top && hover.y <= top + plotHeight) {
+    const at = Math.round(low + (hover.x / plotWidth) * (high - low));
+    const buying = at <= mid;
+    const steps = buying ? bidSteps : askSteps;
+    const total = totalAt(steps, at, buying);
+    let value = 0;
+    for (const [level, levelData] of buying ? bids : asks) {
+      if (buying ? level >= at : level <= at) value += level * levelData.qty;
+    }
+    const column = Math.round(hover.x) + 0.5;
+    context.strokeStyle = color.muted;
+    context.setLineDash([4, 4]);
+    context.beginPath();
+    context.moveTo(column, top);
+    context.lineTo(column, top + plotHeight);
+    context.stroke();
+    context.setLineDash([]);
+    if (total > 0) {
+      context.beginPath();
+      context.arc(column, y(total), 4, 0, 2 * Math.PI);
+      context.fillStyle = buying ? color.buy : color.sell;
+      context.fill();
+    }
+    const lines = [`${price(at)} USD`, `${count(total)} DEMO`, money(value)];
+    context.font = `600 11px ${color.font}`;
+    const boxWidth = Math.max(...lines.map((line) => context.measureText(line).width)) + 16;
+    const left = hover.x + boxWidth + 14 > plotWidth ? hover.x - boxWidth - 10 : hover.x + 10;
+    const boxTop = Math.max(top, Math.min(hover.y - 30, top + plotHeight - 56));
+    box(context, left, boxTop, boxWidth, 56, color.panel);
+    context.strokeStyle = color.line;
+    context.strokeRect(left + 0.5, boxTop + 0.5, boxWidth - 1, 55);
+    context.textAlign = "left";
+    lines.forEach((line, index) => {
+      context.fillStyle = index === 0 ? color.text : color.muted;
+      context.fillText(line, left + 8, boxTop + 12 + index * 16);
+    });
+    context.font = `11px ${color.font}`;
+    shownAt = { at, total, buying };
+  }
+  const parts = [];
+  const item = (label, value, className) => {
+    const element = document.createElement("span");
+    element.append(label);
+    const b = bold(value);
+    if (className) b.className = className;
+    element.append(b);
+    parts.push(element);
+  };
+  parts.push(span("DEMO/USD · depth"));
+  item("Bids", `${count(bidSteps[bidSteps.length - 1][1])} DEMO`, "up");
+  item("Asks", `${count(askSteps[askSteps.length - 1][1])} DEMO`, "down");
+  item("Mid", price(Math.round(mid)));
+  item("Spread", price(asks[0][0] - bids[0][0]));
+  if (shownAt) item(shownAt.buying ? "Sell into" : "Buy up to", price(shownAt.at));
+  $("legend").replaceChildren(...parts);
 }
 
 function legend(candle, ma) {
@@ -975,6 +1630,7 @@ function renderOrders() {
         cell(price(order.price)),
         cell(order.qty ? `${count(order.leaves)} / ${count(order.qty)}` : count(order.leaves)),
         cell(progress),
+        cell(queueCell(order)),
         cell(`#${order.id}`, "muted"),
         cell(cancel),
       );
@@ -994,6 +1650,21 @@ function renderOrders() {
       return row;
     }),
   );
+}
+
+// An open order's place in its queue: next in line, or how much is ahead of it.
+function queueCell(order) {
+  const spot = queueSpot(order);
+  if (!spot) {
+    const element = span("—", "queue-spot");
+    element.title = "Deeper than the levels shown";
+    return element;
+  }
+  if (spot.place === 1) return span("Next in line", "next-badge");
+  const element = span("", "queue-spot");
+  element.append(bold(`#${spot.place}`), ` · ${count(spot.ahead)} ahead`);
+  element.title = `${spot.place - 1} order${spot.place === 2 ? "" : "s"} with ${count(spot.ahead)} DEMO trade before yours`;
+  return element;
 }
 
 function showTab(tab) {
@@ -1187,6 +1858,15 @@ for (const button of document.querySelectorAll("[data-share]")) {
 
 // ---------- Exchange statistics ----------
 
+// A second of statistics, as the engine room draws it.
+const heatOf = (stats) => ({
+  buckets: stats.turn_buckets || [],
+  p50: stats.turn_p50_ns,
+  p99: stats.turn_p99_ns,
+  max: stats.turn_max_ns,
+  cps: stats.commands_per_second,
+});
+
 const duration = (ns) => (ns >= 1_000_000
   ? `${(ns / 1_000_000).toFixed(2)} ms`
   : ns >= 1_000 ? `${Math.round(ns / 1_000)} µs` : `${ns} ns`);
@@ -1200,7 +1880,13 @@ function stats(message) {
   $("max").textContent = duration(message.turn_max_ns);
   $("sessions").textContent = count(message.sessions);
   $("resting").textContent = count(message.orders);
-  schedule("chart");
+  $("heat-p50").textContent = duration(message.turn_p50_ns);
+  $("heat-p99").textContent = duration(message.turn_p99_ns);
+  $("heat-max").textContent = duration(message.turn_max_ns);
+  $("tps-now").textContent = count(message.commands_per_second);
+  engine.heat.push(heatOf(message));
+  if (engine.heat.length > SECONDS) engine.heat.shift();
+  schedule("chart", "engine");
 }
 
 // The clock, and whether the engine is still talking.
@@ -1254,11 +1940,35 @@ const renderers = {
   wallet: renderWallet,
   orders: renderOrders,
   ticket: updateTicket,
+  engine: () => {
+    drawHeat();
+    drawTps();
+  },
+  leaders: renderLeaders,
 };
+
+for (const button of document.querySelectorAll("[data-view]")) {
+  button.addEventListener("click", () => {
+    chart.view = button.dataset.view;
+    choose("[data-view]", "view", chart.view);
+    $("price-tools").hidden = chart.view !== "price";
+    schedule("chart");
+  });
+}
+for (const button of document.querySelectorAll("[data-book]")) {
+  button.addEventListener("click", () => setBookMode(button.dataset.book));
+}
+const resized = new ResizeObserver(() => {
+  book.width = 0;
+  schedule("engine", "book");
+});
+for (const id of ["heat", "tps", "asks"]) resized.observe($(id));
 
 // The exchange logs out sessions that stay silent for five seconds.
 setInterval(() => send({ type: "heartbeat" }), 2_000);
 setSide("buy");
+setBookMode(book.mode);
 renderOrders();
+renderLeaders();
 if (!load("exchange-seen-about")) openAbout();
 connect();

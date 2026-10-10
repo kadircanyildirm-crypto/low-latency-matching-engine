@@ -53,6 +53,19 @@
   </div>
 </header>
 
+<section id="proof" class="proof" aria-label="How fast the engine is">
+  <div class="proof-items">
+    <div class="proof-item"><b>27.6M</b><span>commands a second through the matching core, on one laptop core</span></div>
+    <div class="proof-item"><b>55 ns</b><span>median time per command, in the same run</span></div>
+    <div class="proof-item"><b>1.7×</b><span>exchange-core's speed on the same orders, with the same trades</span></div>
+    <div class="proof-item"><b>0</b><span>heap allocations while matching, checked by a counting allocator</span></div>
+  </div>
+  <a class="proof-link" href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/blob/main/docs/COMPARISON.md" target="_blank" rel="noopener noreferrer">How it was measured</a>
+  <button id="proof-close" class="close-small" type="button" aria-label="Hide these figures">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+  </button>
+</section>
+
 <section class="ticker" aria-label="Market summary">
   <div class="symbol">
     <span class="symbol-mark" aria-hidden="true">D</span>
@@ -255,6 +268,15 @@
       <span class="eyebrow">Engine room</span>
       <h2 id="engine-title" class="room-title">Watch the matching engine work</h2>
       <p class="room-sub">Every command is numbered, written to the journal, synced to disk and matched, in that order. This is the live feed.</p>
+      <div id="started" class="started" hidden>
+        <span class="chip">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>
+          <span id="rec-what">—</span>
+        </span>
+        <span id="rec-from" class="chip">—</span>
+        <span class="chip" title="A hash of the whole book after recovery: replaying the same journal anywhere gives the same one">State digest <b id="rec-digest" class="mono">—</b></span>
+        <span class="chip">Up <b id="uptime">—</b></span>
+      </div>
     </div>
     <div class="seq-counter" title="The sequence number of the latest command: every command the exchange has taken since it started">
       <span class="seq-label"><i class="dot live-dot" aria-hidden="true"></i>Commands sequenced</span>
@@ -282,6 +304,20 @@
       </div>
       <div class="canvas-wrap heat-wrap"><canvas id="heat" role="img" aria-label="Heatmap of the server's turn times over the last two minutes"></canvas></div>
       <p class="caption">One column a second. Colour is how many server turns took that long: read the sockets, journal, sync to disk, match, send the replies.</p>
+    </section>
+
+    <section class="panel stage-panel" aria-label="Inside the engine">
+      <div class="panel-head">
+        <h2>Inside a turn</h2>
+        <span class="hint">Average over the last second</span>
+      </div>
+      <div class="stage-bar" aria-hidden="true"><i id="bar-write" class="st-write"></i><i id="bar-sync" class="st-sync"></i><i id="bar-apply" class="st-apply"></i></div>
+      <dl class="stages">
+        <div><dt><i class="swatch st-write"></i>Write to the journal</dt><dd id="st-write">—</dd></div>
+        <div><dt><i class="swatch st-sync"></i>Sync to disk</dt><dd id="st-sync">—</dd></div>
+        <div><dt><i class="swatch st-apply"></i>Match and route <span id="st-batch" class="hint"></span></dt><dd id="st-apply">—</dd></div>
+      </dl>
+      <p class="caption">The sync is the price of never confirming an order a crash could lose; commands that arrive together share one. Matching is the smallest part: back to back, as in the benchmark, a command takes 55 ns.</p>
     </section>
 
     <section class="panel tps-panel" aria-label="Throughput">

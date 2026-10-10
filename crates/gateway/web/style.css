@@ -159,6 +159,35 @@ svg.filled { fill: currentColor; stroke: none; }
 }
 .account-chip b { color: var(--text); font-weight: 600; margin-left: 4px; }
 
+/* ---------- The engine's figures ---------- */
+
+.proof {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(90deg, var(--accent-soft), transparent 70%);
+}
+.proof-items { display: flex; flex-wrap: wrap; gap: 10px 30px; }
+.proof-item { display: flex; align-items: center; gap: 9px; }
+.proof-item b { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; white-space: nowrap; }
+.proof-item span { max-width: 190px; color: var(--muted); font-size: 11.5px; line-height: 1.3; }
+.proof-link { margin-left: auto; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.close-small {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+}
+.close-small:hover { color: var(--text); background: var(--hover); }
+.close-small svg { width: 13px; height: 13px; }
+
 /* ---------- Ticker ---------- */
 
 .ticker {
@@ -885,6 +914,38 @@ html { scroll-behavior: smooth; }
 }
 .room-title { font-size: 20px; letter-spacing: -0.02em; margin: 4px 0 4px; }
 .room-sub { margin: 0; color: var(--muted); max-width: 640px; }
+.started { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.chip b { color: var(--text); font-weight: 600; }
+.chip svg { width: 12px; height: 12px; color: var(--buy); }
+.mono { font-family: var(--mono); font-weight: 500; }
+
+.stage-bar {
+  display: flex;
+  height: 10px;
+  margin: 2px 0 12px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--line);
+}
+.stage-bar i { display: block; height: 100%; width: 0; transition: width 0.5s ease-out; }
+.st-write { background: var(--accent); }
+.st-sync { background: var(--muted); }
+.st-apply { background: var(--buy); }
+.stages { margin: 0; display: flex; flex-direction: column; }
+.stages > div { display: flex; justify-content: space-between; padding: 5px 0; border-top: 1px solid var(--line); }
+.stages dt { color: var(--muted); display: flex; align-items: center; gap: 2px; }
+.stages dd { margin: 0; font-weight: 600; font-family: var(--mono); }
+
 .seq-counter { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex: none; }
 .seq-label { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
 .live-dot { color: var(--buy); animation: pulse 2s ease-out infinite; }
@@ -902,8 +963,10 @@ html { scroll-behavior: smooth; }
   grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 320px;
   grid-template-areas:
     "log heat leaders"
+    "log stage leaders"
     "log tps leaders";
 }
+.stage-panel { grid-area: stage; }
 .log-panel { grid-area: log; }
 .heat-panel { grid-area: heat; }
 .tps-panel { grid-area: tps; }
@@ -1007,7 +1070,7 @@ html { scroll-behavior: smooth; }
 @media (max-width: 1279px) {
   .room-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-areas: "log log" "heat leaders" "tps leaders";
+    grid-template-areas: "log log" "heat stage" "tps leaders";
   }
   .terminal { grid-template-columns: minmax(0, 1fr) 300px; }
   .col-trade { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
@@ -1035,7 +1098,11 @@ html { scroll-behavior: smooth; }
   .table-view table { min-width: 520px; }
   .engine-stats > :nth-child(n+5) { display: none; }
   .statusbar { padding: 0 16px; }
-  .room-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "log" "heat" "tps" "leaders"; }
+  .room-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "log" "heat" "stage" "tps" "leaders"; }
+  .proof { padding: 10px 16px; gap: 10px; align-items: flex-start; }
+  .proof-items { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .proof-item { flex-direction: column; align-items: flex-start; gap: 1px; }
+  .proof-link { display: none; }
   .room-head { flex-direction: column; align-items: flex-start; }
   .seq-counter { align-items: flex-start; }
   .log { height: 300px; font-size: 11px; }

@@ -222,6 +222,10 @@ function receive(message) {
     case "log":
       engineLog(message);
       break;
+    case "started":
+      state.started = message;
+      renderStarted();
+      break;
     case "stats_history":
       engine.heat = message.stats.slice(-SECONDS).map(heatOf);
       schedule("engine");
@@ -1858,6 +1862,51 @@ for (const button of document.querySelectorAll("[data-share]")) {
 
 // ---------- Exchange statistics ----------
 
+// Where the time went inside the engine in the last second.
+function stages(message) {
+  if (!message.batch_commands) return;
+  const apply = message.apply_ns * message.batch_commands;
+  const total = Math.max(1, message.write_ns + message.sync_ns + apply);
+  $("bar-write").style.width = `${(100 * message.write_ns) / total}%`;
+  $("bar-sync").style.width = `${(100 * message.sync_ns) / total}%`;
+  $("bar-apply").style.width = `${(100 * apply) / total}%`;
+  $("st-write").textContent = duration(message.write_ns);
+  $("st-sync").textContent = duration(message.sync_ns);
+  $("st-apply").textContent = duration(apply);
+  $("st-batch").textContent = `(${count(message.batch_commands)} command${message.batch_commands === 1 ? "" : "s"} a turn)`;
+}
+
+// What the server recovered when it started.
+function renderStarted() {
+  const started = state.started;
+  if (!started) return;
+  $("started").hidden = false;
+  if (started.recovered === 0) {
+    $("rec-what").textContent = "Started on an empty journal";
+    $("rec-from").textContent = "Nothing to recover";
+  } else {
+    $("rec-what").replaceChildren(
+      "Recovered ", bold(count(started.recovered)), " commands in ", bold(`${count(started.recovery_ms)} ms`),
+    );
+    const replayed = started.recovered - started.snapshot;
+    $("rec-from").replaceChildren(
+      ...(started.snapshot
+        ? ["Snapshot at ", bold(`#${count(started.snapshot)}`), " + ", bold(count(replayed)), " replayed"]
+        : [bold(count(replayed)), " replayed from the journal"]),
+      " · ", bold(count(started.orders)), " orders back",
+    );
+  }
+  $("rec-digest").textContent = started.digest;
+  uptime();
+}
+
+function uptime() {
+  if (!state.started) return;
+  const seconds = Math.max(0, Math.floor((now() - state.started.started) / 1_000));
+  const [d, h, m] = [Math.floor(seconds / 86_400), Math.floor(seconds / 3_600) % 24, Math.floor(seconds / 60) % 60];
+  $("uptime").textContent = d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${seconds % 60}s`;
+}
+
 // A second of statistics, as the engine room draws it.
 const heatOf = (stats) => ({
   buckets: stats.turn_buckets || [],
@@ -1884,6 +1933,7 @@ function stats(message) {
   $("heat-p99").textContent = duration(message.turn_p99_ns);
   $("heat-max").textContent = duration(message.turn_max_ns);
   $("tps-now").textContent = count(message.commands_per_second);
+  stages(message);
   engine.heat.push(heatOf(message));
   if (engine.heat.length > SECONDS) engine.heat.shift();
   schedule("chart", "engine");
@@ -1892,6 +1942,7 @@ function stats(message) {
 // The clock, and whether the engine is still talking.
 setInterval(() => {
   $("clock").textContent = timeOf(now());
+  uptime();
   const alive = state.connected && Date.now() - state.statsAt < 3_000;
   document.querySelector(".engine-state").classList.toggle("live", alive);
   $("engine-text").textContent = alive ? "Engine online" : "Engine unreachable";
@@ -1968,6 +2019,11 @@ for (const id of ["heat", "tps", "asks"]) resized.observe($(id));
 setInterval(() => send({ type: "heartbeat" }), 2_000);
 setSide("buy");
 setBookMode(book.mode);
+$("proof").hidden = Boolean(load("exchange-proof-hidden"));
+$("proof-close").addEventListener("click", () => {
+  $("proof").hidden = true;
+  save("exchange-proof-hidden", true);
+});
 renderOrders();
 renderLeaders();
 if (!load("exchange-seen-about")) openAbout();

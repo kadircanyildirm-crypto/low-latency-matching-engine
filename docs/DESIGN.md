@@ -1300,6 +1300,14 @@ turn; stops wait beyond the market for a move to trigger them; a whale now and t
 several levels at once; noise traders cross the spread with small IOC orders; trend
 followers trade with the recent move. They reconnect when the gateway restarts.
 
+Above the trading screen, the page states the benchmark's figures (throughput and median
+time per command of the matching core, the head-to-head ratio to exchange-core, no heap
+allocation while matching) with a link to how they were measured; they are the figures of
+`docs/COMPARISON.md`, not measured live. The live breakdown of a turn shows that the sync
+dominates. The book's own time on the sampled commands is in the statistics but not on the
+page: with commands arriving one at a time and the server idle in between, it measures cold
+caches, a few microseconds, and a single sample a second swings too much to tell anything.
+
 The page has no dependencies and no build step, and loads nothing from elsewhere: no
 fonts, no scripts, no trackers. It keeps in local storage the account, and the size and
 time of the orders it placed, which the reports after a reload do not tell; it

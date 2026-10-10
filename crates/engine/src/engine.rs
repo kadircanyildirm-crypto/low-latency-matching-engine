@@ -1,6 +1,7 @@
 //! The sequencer: numbers each command, journals it, and only then applies it.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use orderbook::{BookConfig, BookSnapshot, Command, Event, EventSink, OrderBook, Phase};
 
@@ -8,6 +9,54 @@ use crate::journal::{self, Expect, Journal, JournalReport};
 use crate::snapshots;
 use crate::storage::{FsStorage, Storage};
 use crate::{Error, Seq};
+
+/// One command in this many has the book's time on it measured alone: see [`Timings`].
+pub const MATCH_SAMPLE: Seq = 64;
+
+/// Events a sampled command may have and still be measured: past them, its events go out
+/// as they come, and it is not counted. The space is reserved once, so measuring allocates
+/// nothing.
+const SAMPLE_EVENTS: usize = 256;
+
+/// Where the engine's time went, since it was last asked: [`Engine::take_timings`],
+/// [`Writer::take_timings`] and [`Matcher::take_timings`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Batches journaled.
+    pub batches: u64,
+    /// Nanoseconds spent appending them to the journal.
+    pub write_ns: u64,
+    /// Nanoseconds spent syncing the journal.
+    pub sync_ns: u64,
+    /// Commands applied.
+    pub commands: u64,
+    /// Nanoseconds spent applying them, with the output's handling of their events.
+    pub apply_ns: u64,
+    /// Commands whose matching was measured alone: one in [`MATCH_SAMPLE`] by sequence
+    /// number. The book's events are collected while it works and handed on after, so the
+    /// time is the book's own.
+    pub matched: u64,
+    /// Nanoseconds the book spent on them.
+    pub match_ns: u64,
+}
+
+impl Timings {
+    /// Adds `other` to these.
+    pub fn add(&mut self, other: Timings) {
+        self.batches += other.batches;
+        self.write_ns += other.write_ns;
+        self.sync_ns += other.sync_ns;
+        self.commands += other.commands;
+        self.apply_ns += other.apply_ns;
+        self.matched += other.matched;
+        self.match_ns += other.match_ns;
+    }
+}
+
+/// A duration in nanoseconds, as far as a `u64` goes.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// When the journal is synced to stable storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +196,32 @@ impl<O: Output> EventSink for Tagged<'_, O> {
     }
 }
 
+/// Collects the events of a command being measured, to hand them on after. Once the
+/// reserved space is full, it hands on what it has and the rest as they come.
+struct Sampled<'a, O: Output> {
+    seq: Seq,
+    events: &'a mut Vec<Event>,
+    out: &'a mut O,
+    spilled: bool,
+}
+
+impl<O: Output> EventSink for Sampled<'_, O> {
+    #[inline]
+    fn on_event(&mut self, event: Event) {
+        if !self.spilled && self.events.len() < self.events.capacity() {
+            self.events.push(event);
+            return;
+        }
+        if !self.spilled {
+            self.spilled = true;
+            for event in self.events.drain(..) {
+                self.out.on_event(self.seq, event);
+            }
+        }
+        self.out.on_event(self.seq, event);
+    }
+}
+
 /// The order book behind a sequencer and a write-ahead journal.
 ///
 /// An engine is a [`Writer`], which journals commands, and a [`Matcher`], which applies
@@ -166,6 +241,7 @@ pub struct Writer<S: Storage = FsStorage> {
     journal: Journal<S>,
     sync: SyncPolicy,
     poisoned: bool,
+    timings: Timings,
 }
 
 /// The book half of an [`Engine`]: it applies journaled commands to the book and takes
@@ -186,6 +262,9 @@ pub struct Matcher<S: Storage = FsStorage> {
     poisoned: bool,
     /// Scratch space for encoding snapshots.
     snapshot_buf: Vec<u8>,
+    timings: Timings,
+    /// The events of a command being measured.
+    sample: Vec<Event>,
 }
 
 impl Engine<FsStorage> {
@@ -334,6 +413,7 @@ impl<S: Storage> Engine<S> {
             journal,
             sync: config.sync,
             poisoned: false,
+            timings: Timings::default(),
         };
         let matcher = Matcher {
             book,
@@ -346,6 +426,8 @@ impl<S: Storage> Engine<S> {
             snapshot_failure: None,
             poisoned: false,
             snapshot_buf: Vec::new(),
+            timings: Timings::default(),
+            sample: Vec::with_capacity(SAMPLE_EVENTS),
         };
         Ok((Engine { writer, matcher }, report))
     }
@@ -388,9 +470,8 @@ impl<S: Storage> Engine<S> {
         }
         let first = self.writer.last_seq() + 1;
         let last = self.writer.write(commands)?;
-        for (seq, &command) in (first..).zip(commands) {
-            self.matcher.apply(seq, command, out)?;
-        }
+        self.matcher
+            .apply_all((first..).zip(commands.iter().copied()), out)?;
         Ok(last)
     }
 
@@ -447,6 +528,13 @@ impl<S: Storage> Engine<S> {
         &self.matcher.book
     }
 
+    /// Where the engine's time went since the last call.
+    pub fn take_timings(&mut self) -> Timings {
+        let mut timings = self.writer.take_timings();
+        timings.add(self.matcher.take_timings());
+        timings
+    }
+
     /// The sequence number of the last command submitted, or recovered.
     pub fn last_seq(&self) -> Seq {
         self.writer.last_seq()
@@ -490,9 +578,14 @@ impl<S: Storage> Writer<S> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
+        let start = Instant::now();
         let mut journaled = self.journal.append(commands);
+        let appended = Instant::now();
+        self.timings.batches += 1;
+        self.timings.write_ns += nanos(appended - start);
         if self.sync == SyncPolicy::Always {
             journaled = journaled.and_then(|seq| self.journal.sync().map(|()| seq));
+            self.timings.sync_ns += nanos(appended.elapsed());
         }
         journaled.inspect_err(|_| self.poisoned = true)
     }
@@ -502,7 +595,16 @@ impl<S: Storage> Writer<S> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        self.journal.sync().inspect_err(|_| self.poisoned = true)
+        let start = Instant::now();
+        let synced = self.journal.sync().inspect_err(|_| self.poisoned = true);
+        self.timings.sync_ns += nanos(start.elapsed());
+        synced
+    }
+
+    /// Where the writer's time went since the last call: the batches it journaled, and
+    /// how long appending and syncing took.
+    pub fn take_timings(&mut self) -> Timings {
+        std::mem::take(&mut self.timings)
     }
 
     /// Deletes the journal segments that hold nothing after `seq`: what
@@ -562,10 +664,56 @@ impl<S: Storage> Matcher<S> {
         // Poisoned until the command is applied: a panic in the book leaves it so.
         self.poisoned = true;
         out.on_command(seq, command);
-        self.book.process(command, &mut Tagged { seq, out });
+        if seq % MATCH_SAMPLE == 0 {
+            self.sample.clear();
+            let mut sampled = Sampled {
+                seq,
+                events: &mut self.sample,
+                out: &mut *out,
+                spilled: false,
+            };
+            let start = Instant::now();
+            self.book.process(command, &mut sampled);
+            let took = start.elapsed();
+            if !sampled.spilled {
+                self.timings.matched += 1;
+                self.timings.match_ns += nanos(took);
+            }
+            for event in self.sample.drain(..) {
+                out.on_event(seq, event);
+            }
+        } else {
+            self.book.process(command, &mut Tagged { seq, out });
+        }
         self.poisoned = false;
         self.last_seq = seq;
         Ok(())
+    }
+
+    /// Applies `commands`, each as [`apply`](Self::apply) does, and counts how long they
+    /// took together in the [`Timings`]. It stops at the first error.
+    pub fn apply_all<O: Output>(
+        &mut self,
+        commands: impl IntoIterator<Item = (Seq, Command)>,
+        out: &mut O,
+    ) -> Result<(), Error> {
+        let start = Instant::now();
+        let mut result = Ok(());
+        for (seq, command) in commands {
+            if let Err(error) = self.apply(seq, command, out) {
+                result = Err(error);
+                break;
+            }
+            self.timings.commands += 1;
+        }
+        self.timings.apply_ns += nanos(start.elapsed());
+        result
+    }
+
+    /// Where the matcher's time went since the last call: the commands it applied and how
+    /// long they took, and the book's own time on those it measured alone.
+    pub fn take_timings(&mut self) -> Timings {
+        std::mem::take(&mut self.timings)
     }
 
     /// Whether an automatic snapshot is due: `snapshot_every` commands have been applied

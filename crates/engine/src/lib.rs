@@ -28,7 +28,8 @@ use std::io;
 use std::path::PathBuf;
 
 pub use engine::{
-    Discard, Engine, EngineConfig, Matcher, Output, RecoveryReport, SyncPolicy, Writer,
+    Discard, Engine, EngineConfig, MATCH_SAMPLE, Matcher, Output, RecoveryReport, SyncPolicy,
+    Timings, Writer,
 };
 pub use journal::{JournalReport, RECORD_SIZE};
 

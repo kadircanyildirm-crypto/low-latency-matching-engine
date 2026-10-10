@@ -816,6 +816,19 @@ What the numbers say:
   it moves off the matching thread with the journal stage in Phase 4, along with the
   slowest calls, the ones that roll over.
 
+### Where the time goes, live
+
+The engine counts where its time goes, for whoever asks with `take_timings`: the batches
+it journaled and how long appending and syncing them took, the commands it applied and how
+long that took with the output's handling of their events, and the book's own time on
+one command in 64. A batch costs a few readings of the clock, a few tens of nanoseconds
+next to a journal write. The book's time cannot be read around every command, since the
+reading would cost about as much as the matching; the sampled command's events are instead
+collected in space reserved once and handed on after the book is done, so the time is the
+book's alone and nothing is allocated. A command with more than 256 events hands the rest
+on as they come and is not counted. Handing on afterwards changes nothing the output sees:
+the events and their order are the same, as a test checks against a book on its own.
+
 ### When something fails
 
 A failed write or sync poisons the engine: every later call returns `Error::Poisoned`
@@ -846,7 +859,8 @@ change, and says so.
 | `tests/files.rs` | One test per way the files can contradict the engine: leftover temporary files, snapshots that lie about their sequence number, length, digest, format or configuration, missing, misnamed, short, cut or damaged segments, records in the wrong slot, a journal that ends before its snapshot, two engines on one directory, the exact pace of segment preparation. |
 | `tests/operations.rs` | Events with their sequence numbers, redelivered on replay, and consumers resuming where they stood or told they are ahead; replay verified against snapshots before anything changes; failing snapshots and segment preparations that do not stop trading; a failing roll; a failed sync followed by a reopen and a power failure; a clean shutdown; settings that change between runs; the upgrade to new rules and commands under old ones; damage to files recovery does not need; read errors; panics. |
 | `tests/kill.rs` | The acceptance test: a child process on the real file system, killed 48 times at random points under 16 combinations of sync policy, segment size and snapshot interval, recovers every command it had reported applied, and exactly the state after them. CI runs it on Linux, Windows and macOS. |
-| `tests/zero_alloc.rs` | Journaling, syncing and applying commands on the real file system allocate nothing between segment rolls. |
+| `tests/zero_alloc.rs` | Journaling, syncing and applying commands on the real file system allocate nothing between segment rolls, the measured commands included. |
+| `tests/timings.rs` | Measuring hands on exactly the events, in exactly the order, that a book on its own gives, including for a measured command with more events than are reserved, which is then not counted; every batch and command is counted, and one command in 64 is measured. |
 | `fuzz/fuzz_targets/recovery.rs` | Any sequence of commands, syncs, snapshots, power failures, kills, deaths after any number of changes, recoveries that die, and flipped bits, under book configurations the fuzzer picks, segments of 1 to 32 or of 1,024 to 2,816 records, any snapshot interval and either sync policy. |
 
 Each safety mechanism was removed in turn to check that a test notices: zeroing the cut

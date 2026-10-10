@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use engine::storage::{FsStorage, Storage};
-use engine::{Engine, Seq};
+use engine::{Engine, Seq, Timings};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use protocol::{LogoutReason, Outbound, decode_inbound, encode_outbound};
@@ -100,6 +100,9 @@ pub trait Core {
 
     /// Whether commands wait for room: the server then reads no more from its sockets.
     fn backed_up(&self) -> bool;
+
+    /// Where the engine's time went since the last call.
+    fn take_timings(&mut self) -> Timings;
 }
 
 /// An engine on the server's own thread: each batch is journaled and applied at once.
@@ -118,6 +121,10 @@ impl<S: Storage> Core for Engine<S> {
 
     fn backed_up(&self) -> bool {
         false
+    }
+
+    fn take_timings(&mut self) -> Timings {
+        Engine::take_timings(self)
     }
 }
 
@@ -274,6 +281,9 @@ impl<C: Core> Server<C> {
         let mut exchange = exchange;
         exchange.set_epoch(unix_millis() / 1_000);
         let started = Instant::now();
+        // What recovery took is not the work of serving.
+        let mut core = core;
+        core.take_timings();
         // Commands per second count from where the exchange starts, not from zero.
         let stats = Stats {
             seq: exchange.last_seq(),
@@ -699,12 +709,20 @@ impl<C: Core> Server<C> {
             .flatten()
             .filter(|c| !matches!(c.kind, Kind::Http { .. }))
             .count();
+        let timings = self.core.take_timings();
+        let mean = |total: u64, count: u64| total.checked_div(count).unwrap_or(0);
         let mut turn_buckets = [0; json::TURN_BUCKETS];
         for &turn in &turns {
             turn_buckets[json::turn_bucket(turn)] += 1;
         }
         let stats = json::Stats {
             turn_buckets,
+            write_ns: mean(timings.write_ns, timings.batches),
+            sync_ns: mean(timings.sync_ns, timings.batches),
+            batch_commands: mean(timings.commands, timings.batches),
+            apply_ns: mean(timings.apply_ns, timings.commands),
+            match_ns: mean(timings.match_ns, timings.matched),
+            matched: timings.matched,
             commands_per_second: (commands as f64 / seconds.max(1e-9)).round() as u64,
             turn_p50_ns: at(0.5).unwrap_or(0),
             turn_p99_ns: at(0.99).unwrap_or(0),

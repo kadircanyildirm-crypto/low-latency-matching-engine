@@ -261,6 +261,15 @@ fn the_pipeline_replies_as_the_engine_does() {
         }
         assert_eq!(piped_rounds, direct_rounds, "seed {seed}");
         assert_eq!(pipeline.applied(), engine.last_seq());
+        // Both count the same work: every command applied, one in 64 measured alone.
+        let (piped_timings, direct_timings) = (pipeline.take_timings(), engine.take_timings());
+        assert_eq!(
+            piped_timings.commands, direct_timings.commands,
+            "seed {seed}"
+        );
+        assert_eq!(piped_timings.matched, direct_timings.matched, "seed {seed}");
+        assert_eq!(direct_timings.commands, engine.last_seq(), "seed {seed}");
+        assert!(piped_timings.batches > 0, "seed {seed}");
         if config.sync == SyncPolicy::Always {
             assert_eq!(pipeline.durable(), engine.last_seq());
         }

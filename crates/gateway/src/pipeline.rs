@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use engine::storage::Storage;
-use engine::{Engine, Error, Matcher, Output, Seq, Writer};
+use engine::{Engine, Error, Matcher, Output, Seq, Timings, Writer};
 use orderbook::{Command, Event};
 use ring::{Backoff, Consumer, Producer, Wait};
 
@@ -83,6 +83,52 @@ struct Shared {
     trim: AtomicU64,
     /// Set by the writer when it fails, so a matcher waiting for a sync stops waiting.
     failed: AtomicBool,
+    /// Where both threads' time went, as [`Timings`] in field order, added up until the
+    /// network thread takes them.
+    timings: [AtomicU64; 7],
+}
+
+impl Shared {
+    /// Adds a thread's `timings`.
+    fn record(&self, timings: Timings) {
+        let fields = [
+            timings.batches,
+            timings.write_ns,
+            timings.sync_ns,
+            timings.commands,
+            timings.apply_ns,
+            timings.matched,
+            timings.match_ns,
+        ];
+        for (total, value) in self.timings.iter().zip(fields) {
+            total.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes what both threads added up.
+    fn take(&self) -> Timings {
+        let [
+            batches,
+            write_ns,
+            sync_ns,
+            commands,
+            apply_ns,
+            matched,
+            match_ns,
+        ] = self
+            .timings
+            .each_ref()
+            .map(|total| total.swap(0, Ordering::Relaxed));
+        Timings {
+            batches,
+            write_ns,
+            sync_ns,
+            commands,
+            apply_ns,
+            matched,
+            match_ns,
+        }
+    }
 }
 
 /// The writer's and the matcher's threads, behind a server.
@@ -107,8 +153,10 @@ where
     Matcher<S>: Send,
 {
     /// Splits `engine` and starts its writer and matcher on threads of their own.
-    pub fn start(engine: Engine<S>, config: PipelineConfig) -> io::Result<Pipeline<S>> {
+    pub fn start(mut engine: Engine<S>, config: PipelineConfig) -> io::Result<Pipeline<S>> {
         let last_seq = engine.last_seq();
+        // What recovery took is not the pipeline's work.
+        engine.take_timings();
         let (writer, matcher) = engine.split();
         let shared = Arc::new(Shared::default());
         shared
@@ -236,6 +284,10 @@ where
     fn backed_up(&self) -> bool {
         self.pending_at < self.pending.len()
     }
+
+    fn take_timings(&mut self) -> Timings {
+        self.shared.take()
+    }
 }
 
 /// The result of a stage's thread, a panic counting as a poisoned stage.
@@ -292,6 +344,7 @@ fn write_all<S: Storage>(
         backoff.reset();
         let first = writer.last_seq() + 1;
         writer.write(&batch)?;
+        shared.record(writer.take_timings());
         shared
             .durable
             .store(writer.durable_seq(), Ordering::Release);
@@ -329,6 +382,7 @@ fn serve<S: Storage>(writer: &mut Writer<S>, shared: &Shared) -> Result<(), Erro
     }
     if shared.sync_to.load(Ordering::Acquire) > writer.durable_seq() {
         writer.sync()?;
+        shared.record(writer.take_timings());
         shared
             .durable
             .store(writer.durable_seq(), Ordering::Release);
@@ -363,9 +417,9 @@ fn apply<S: Storage>(
         wait,
     };
     while input.wait(wait) {
-        for (seq, command) in input.drain(MAX_BATCH) {
-            matcher.apply(seq, command, &mut events)?;
-        }
+        matcher.apply_all(input.drain(MAX_BATCH), &mut events)?;
+        // Counted before it is told, so whoever sees the commands applied sees them counted.
+        shared.record(matcher.take_timings());
         shared.applied.store(matcher.last_seq(), Ordering::Release);
         if matcher.snapshot_due() {
             snapshot(&mut matcher, shared, wait);

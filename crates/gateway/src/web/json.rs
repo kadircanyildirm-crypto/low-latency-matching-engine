@@ -464,6 +464,20 @@ pub struct Stats {
     /// microsecond, bucket `i` from 1 to 16 those from 2^(i-1) up to 2^i microseconds, and
     /// the last the turns of 65.536 ms or more.
     pub turn_buckets: [u64; TURN_BUCKETS],
+    /// Inside the engine, on average over the same period: nanoseconds appending a batch
+    /// to the journal, ...
+    pub write_ns: u64,
+    /// ... syncing the journal per batch, ...
+    pub sync_ns: u64,
+    /// ... with this many commands in a batch, ...
+    pub batch_commands: u64,
+    /// ... applying a command, with the exchange's routing of its events, ...
+    pub apply_ns: u64,
+    /// ... and matching alone, the book's own time on the `matched` commands it measured:
+    /// one in 64. Zero for nothing measured.
+    pub match_ns: u64,
+    /// See `match_ns`.
+    pub matched: u64,
 }
 
 /// The JSON for the statistics of the last seconds, oldest first, as `stats_history`.
@@ -814,13 +828,20 @@ mod tests {
             orders: 8,
             time: 9,
             turn_buckets: [1; TURN_BUCKETS],
+            write_ns: 10,
+            sync_ns: 11,
+            batch_commands: 12,
+            apply_ns: 13,
+            match_ns: 14,
+            matched: 15,
         }))
         .unwrap();
         assert_eq!(
             stats,
             serde_json::json!({"type": "stats", "commands_per_second": 3, "turn_p50_ns": 4,
                 "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8, "time": 9,
-                "turn_buckets": vec![1; TURN_BUCKETS]})
+                "turn_buckets": vec![1; TURN_BUCKETS], "write_ns": 10, "sync_ns": 11,
+                "batch_commands": 12, "apply_ns": 13, "match_ns": 14, "matched": 15})
         );
         let buckets = [
             0, 999, 1_000, 1_999, 2_000, 3_999, 4_000, 65_535_999, 65_536_000,

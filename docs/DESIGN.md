@@ -1305,7 +1305,11 @@ market data, and the server's clock, sent with the statistics, places them in th
 candle. The candles are not saved: after a restart they start again. Every second the
 server tells it the commands per second, how long the turns that handed commands to the
 engine took, as percentiles and as counts in buckets that double from a microsecond, the
-sessions and resting orders, and its clock.
+sessions and resting orders, and its clock; and, from the engine's own counts, where the
+time went inside it on average: appending a batch to the journal, syncing it, the commands
+in a batch, applying a command with the routing of its events, and the book's own time on
+the commands it measured. A pipeline's two threads add their counts to shared counters
+before they say how far they got, so whoever sees the work done sees it counted.
 
 A subscribed browser is also shown the engine at work. It gets the statistics of the last
 two minutes when it subscribes, so its charts of them start full. Five times a second it gets the

@@ -345,7 +345,7 @@ JSON. A visitor gets a paper-trading account on the first visit and trades again
 that keep the market moving.
 
 ```sh
-sh deploy/make-accounts.sh       # six accounts for the bots, in deploy/bots.txt
+sh deploy/make-accounts.sh       # twelve accounts for the bots, in deploy/bots.txt
 cargo run --release -p gateway --bin gateway -- --dir data --accounts deploy/bots.txt --web 127.0.0.1:8080
 cargo run --release -p gateway --bin bots -- --accounts deploy/bots.txt
 ```
@@ -357,7 +357,7 @@ Then open `http://127.0.0.1:8080`.
 | Browsers are sessions like any other | A second listener speaks HTTP for the page and upgrades to WebSocket; the session then has the same login, risk limits, reports and market data as a binary one. HTTP, WebSocket frames and JSON are decoded strictly and fuzzed. |
 | Paper money | An account can start with cash and shares. Before an order is accepted, the gateway checks that the account can pay for it in full and holds that: cash for a buy, shares for a sell. Trades settle at their own price and give back what was held for less. A property test lets accounts trade only with each other: money and shares are never made or lost, and each account holds exactly what its orders on the book need. |
 | The market survives restarts | The exchange's own state, paper money above all, is checkpointed and rebuilt on start from the checkpoint and the journal after it, which the engine replays to it; it must then agree with the recovered book. Crash tests cut the power at random points; an end-to-end test stops and restarts the gateway under a visitor's account. |
-| A live market | Bots: market makers quoting ten levels a side around a wandering fair price, noise traders crossing the spread, trend followers. |
+| A live market | Bots: market makers quoting six to ten levels a side around a wandering fair price, each in its own style, and moving their quotes only once the price has moved; passive traders leaving small orders behind the best prices; an iceberg; stops beyond the market; a whale that takes several levels at once; noise traders crossing the spread, trend followers. |
 | The page | A trading screen with no dependencies and no build step: a candlestick chart that opens on the last hour of trades, with volume, a moving average, a crosshair and the visitor's orders and fills on it, and a depth chart; the book by level or order by order, every order a block in its queue, the visitor's own lit up; the tape; limit and marketable orders with what they cost; the paper account with its profit; open orders with their place in the queue, and fills. Served under a content security policy that allows nothing from elsewhere. |
 | The engine room | Below the screen, the engine at work: every command it sequences as it happens, with what came of it; a heatmap of the server's turn times second by second, with p50 and p99; throughput; and a leaderboard of the paper accounts. |
 | Deployment | An image, a compose file with Caddy in front for HTTPS, and a guide in [deploy/README.md](deploy/README.md). CI builds the image on every push. |

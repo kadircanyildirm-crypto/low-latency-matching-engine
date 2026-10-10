@@ -1,7 +1,10 @@
 //! Bots that keep a demo market alive: market makers quoting around a fair price that
-//! wanders, noise traders that cross the spread now and then, and trend followers that
-//! trade with the recent move. They are ordinary clients of the binary protocol, each with
-//! an account of its own, and watch the market through its market data like anyone else.
+//! wanders, each in a style of its own; noise traders that cross the spread now and then;
+//! trend followers that trade with the recent move; passive traders that leave small orders
+//! behind the best prices; an iceberg that shows a little of a large order; stops waiting
+//! beyond the market; and a whale that now and then takes several levels at once. They are
+//! ordinary clients of the binary protocol, each with an account of its own, and watch the
+//! market through its market data like anyone else.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -12,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use orderbook::workload::SplitMix64;
 use orderbook::{Side, TimeInForce};
-use protocol::{Inbound, NewOrder, OrderKind, Outbound};
+use protocol::{Inbound, NewOrder, OrderKind, Outbound, ReportKind};
 
 use crate::accounts::Account;
 use crate::client::Client;
@@ -20,13 +23,25 @@ use crate::client::Client;
 /// What a bot does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
-    /// Quotes a few levels on each side of a fair price that wanders and is pulled back
-    /// towards the starting mid, replacing all its quotes every interval.
+    /// Quotes six to ten levels on each side of a fair price that wanders and is pulled
+    /// back towards the starting mid, every tick or every other one, and replaces its quotes
+    /// only once the fair price has moved two ticks, or now and then.
     MarketMaker,
     /// Now and then buys or sells a few lots at once, crossing the spread.
     Noise,
     /// Buys when the recent trades rose, sells when they fell.
     Trend,
+    /// Leaves small limit orders at or a few ticks behind the best price on their side, and
+    /// cancels them all every thirty.
+    Passive,
+    /// Rests one large iceberg order near the best price, showing a small part of it at a
+    /// time; places another once it is done or the market has moved away from it.
+    Iceberg,
+    /// Places stop orders six to twenty-one ticks beyond the market, and cancels those
+    /// still waiting every twelve.
+    Stops,
+    /// Sends a large immediate-or-cancel order that takes several levels at once.
+    Whale,
 }
 
 /// One bot.
@@ -90,13 +105,51 @@ impl Market {
     }
 }
 
+/// What a bot remembers between its actions.
+#[derive(Debug, Default)]
+struct Memory {
+    /// The fair price a market maker believes in.
+    fair: i64,
+    /// The fair price its quotes are around, if it has quotes out.
+    quoted: Option<i64>,
+    /// Orders placed since the bot last cleared them.
+    placed: u32,
+    /// The client reference and price of a resting iceberg order.
+    iceberg: Option<(u64, i64)>,
+}
+
+impl Memory {
+    /// Follows the bot's own reports.
+    fn apply(&mut self, message: &Outbound) {
+        let Outbound::Report(report) = message else {
+            return;
+        };
+        let gone = match report.kind {
+            ReportKind::Fill { leaves, .. } => leaves == 0,
+            ReportKind::Cancelled { .. } | ReportKind::Rejected(_) => true,
+            _ => false,
+        };
+        if gone && self.iceberg.is_some_and(|(r, _)| r == report.client_ref) {
+            self.iceberg = None;
+        }
+    }
+}
+
 /// Runs `bot` against the gateway at `addr` until `stop` is set or the connection fails.
 pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
     let (mut client, _) = Client::login(addr, bot.account.id, bot.account.token)?;
     client.send(&Inbound::Subscribe)?;
     let mut rng = SplitMix64::new(bot.seed ^ u64::from(bot.account.id));
     let mut market = Market::default();
-    let mut fair = bot.mid;
+    let mut memory = Memory {
+        fair: bot.mid,
+        ..Memory::default()
+    };
+    // Each market maker has a style of its own: how many levels, how far apart, how big.
+    let style = bot.seed ^ u64::from(bot.account.id);
+    let levels = 6 + (style % 5) as i64;
+    let spacing = 1 + (style / 5 % 2) as i64;
+    let base = 4 + style / 10 % 12;
     let mut next_ref = 1;
     let mut next_action = Instant::now();
     let interval_ns = bot.interval.as_nanos().max(1) as u64;
@@ -109,6 +162,7 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                 ));
             }
             market.apply(&message);
+            memory.apply(&message);
         }
         let now = Instant::now();
         if now < next_action {
@@ -117,41 +171,66 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
         }
         // Acts on average once an interval, at random within it.
         next_action = now + Duration::from_nanos(interval_ns / 2 + rng.below(interval_ns));
-        let mut order = |side, price: i64, qty, tif| {
+        let mut order = |side, price: i64, qty, kind: Kind| {
             next_ref += 1;
-            Inbound::NewOrder(NewOrder {
-                client_ref: next_ref,
-                side,
-                qty,
-                kind: OrderKind::Limit {
-                    price: price.max(1),
+            let price = price.max(1);
+            let kind = match kind {
+                Kind::Limit(tif) => OrderKind::Limit {
+                    price,
                     tif,
                     display: None,
                 },
-            })
+                Kind::Iceberg(display) => OrderKind::Limit {
+                    price,
+                    tif: TimeInForce::Gtc,
+                    display: Some(display),
+                },
+                Kind::Stop => OrderKind::Stop {
+                    trigger: price,
+                    limit: None,
+                },
+            };
+            let message = Inbound::NewOrder(NewOrder {
+                client_ref: next_ref,
+                side,
+                qty,
+                kind,
+            });
+            (next_ref, message)
         };
+        let side = if rng.below(2) == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let gtc = Kind::Limit(TimeInForce::Gtc);
+        let ioc = Kind::Limit(TimeInForce::Ioc);
         match bot.strategy {
             Strategy::MarketMaker => {
                 // A random walk pulled back towards the mid, and towards the last trade.
                 let step = rng.below(5) as i64 - 2;
-                let pull = (bot.mid - fair) / 200;
-                let last = market.trades.back().map_or(0, |&p| (p - fair) / 4);
-                fair += step + pull + last;
-                client.queue(&Inbound::MassCancel);
-                for level in 0..10_i64 {
-                    // Further from the price, more size, as on a real book.
-                    let qty = 5 + rng.below(45) + 8 * level.unsigned_abs();
-                    let gap = 1 + level * 2;
-                    client.queue(&order(Side::Buy, fair - gap, qty, TimeInForce::Gtc));
-                    client.queue(&order(Side::Sell, fair + gap, qty, TimeInForce::Gtc));
+                let pull = (bot.mid - memory.fair) / 200;
+                let last = market.trades.back().map_or(0, |&p| (p - memory.fair) / 4);
+                memory.fair += step + pull + last;
+                // Quotes move only once the price has, or now and then: until then they
+                // keep their place in their queues, among everyone else's orders.
+                let moved = memory
+                    .quoted
+                    .is_none_or(|quoted| (quoted - memory.fair).abs() >= 2);
+                if moved || rng.below(12) == 0 {
+                    client.queue(&Inbound::MassCancel);
+                    for level in 0..levels {
+                        // Further from the price, more size, as on a real book.
+                        let qty = base + rng.below(2 * base) + base / 2 * level.unsigned_abs();
+                        let gap = 1 + level * spacing;
+                        let fair = memory.fair;
+                        client.queue(&order(Side::Buy, fair - gap, qty, gtc).1);
+                        client.queue(&order(Side::Sell, fair + gap, qty, gtc).1);
+                    }
+                    memory.quoted = Some(memory.fair);
                 }
             }
             Strategy::Noise => {
-                let side = if rng.below(2) == 0 {
-                    Side::Buy
-                } else {
-                    Side::Sell
-                };
                 let reference = match side {
                     Side::Buy => market.best_ask(),
                     Side::Sell => market.best_bid(),
@@ -162,7 +241,7 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                         Side::Buy => price + slip,
                         Side::Sell => price - slip,
                     };
-                    client.queue(&order(side, price, 1 + rng.below(20), TimeInForce::Ioc));
+                    client.queue(&order(side, price, 1 + rng.below(20), ioc).1);
                 }
             }
             Strategy::Trend => {
@@ -180,17 +259,107 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                         None => None,
                     };
                     if let (Some(side), Some(price)) = (side, reference) {
-                        client.queue(&order(side, price, 1 + rng.below(10), TimeInForce::Ioc));
+                        client.queue(&order(side, price, 1 + rng.below(10), ioc).1);
                     }
+                }
+            }
+            Strategy::Passive => {
+                // A small order at or behind the best price on its side, as people leave
+                // them; every so often it clears them all and starts again.
+                if memory.placed >= 30 {
+                    client.queue(&Inbound::MassCancel);
+                    memory.placed = 0;
+                }
+                let behind = rng.below(6) as i64;
+                let price = match side {
+                    Side::Buy => market.best_bid().map(|p| p - behind),
+                    Side::Sell => market.best_ask().map(|p| p + behind),
+                };
+                if let Some(price) = price {
+                    let qty = if rng.below(8) == 0 {
+                        40 + rng.below(80)
+                    } else {
+                        1 + rng.below(25)
+                    };
+                    client.queue(&order(side, price, qty, gtc).1);
+                    memory.placed += 1;
+                }
+            }
+            Strategy::Iceberg => {
+                // One large order near the best price that shows a small part of itself; a
+                // new one once it is done, or once the market has moved away from it.
+                let touch = match side {
+                    Side::Buy => market.best_bid(),
+                    Side::Sell => market.best_ask(),
+                };
+                match (memory.iceberg, touch) {
+                    (Some((_, at)), _) => {
+                        let far = [market.best_bid(), market.best_ask()]
+                            .into_iter()
+                            .flatten()
+                            .all(|best| (best - at).abs() > 12);
+                        if far {
+                            client.queue(&Inbound::MassCancel);
+                        }
+                    }
+                    (None, Some(touch)) => {
+                        let price = match side {
+                            Side::Buy => touch - rng.below(3) as i64,
+                            Side::Sell => touch + rng.below(3) as i64,
+                        };
+                        let qty = 300 + rng.below(700);
+                        let display = 15 + rng.below(25);
+                        let (client_ref, message) = order(side, price, qty, Kind::Iceberg(display));
+                        client.queue(&message);
+                        memory.iceberg = Some((client_ref, price));
+                    }
+                    (None, None) => {}
+                }
+            }
+            Strategy::Stops => {
+                // A stop beyond the market, which a move may trigger; every so often it
+                // clears those still waiting.
+                if memory.placed >= 12 {
+                    client.queue(&Inbound::MassCancel);
+                    memory.placed = 0;
+                }
+                let away = 6 + rng.below(16) as i64;
+                let trigger = match side {
+                    Side::Buy => market.best_ask().map(|p| p + away),
+                    Side::Sell => market.best_bid().map(|p| p - away),
+                };
+                if let Some(trigger) = trigger {
+                    client.queue(&order(side, trigger, 5 + rng.below(25), Kind::Stop).1);
+                    memory.placed += 1;
+                }
+            }
+            Strategy::Whale => {
+                // A large order that takes several levels at once.
+                let reference = match side {
+                    Side::Buy => market.best_ask().map(|p| p + 8),
+                    Side::Sell => market.best_bid().map(|p| p - 8),
+                };
+                if let Some(price) = reference {
+                    client.queue(&order(side, price, 120 + rng.below(240), ioc).1);
                 }
             }
         }
         client.flush()?;
     }
-    if bot.strategy == Strategy::MarketMaker {
+    if bot.strategy != Strategy::Noise && bot.strategy != Strategy::Trend {
         client.send(&Inbound::MassCancel)?;
     }
     client.send(&Inbound::Logout)
+}
+
+/// What kind of order a bot sends.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Limit(TimeInForce),
+    /// A limit order that shows this much at a time.
+    Iceberg(u64),
+    /// A stop that becomes a market order once its price trades.
+    Stop,
 }
 
 #[cfg(test)]

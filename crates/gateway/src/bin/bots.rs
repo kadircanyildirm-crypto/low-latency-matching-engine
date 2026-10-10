@@ -1,10 +1,12 @@
 //! Runs bots against a gateway, to keep a demo market alive.
 //!
-//! Usage: `bots --accounts <file> [--connect 127.0.0.1:9000] [--makers 2] [--noise 3]
-//! [--trend 1] [--mid 10000] [--seed 1]`
+//! Usage: `bots --accounts <file> [--connect 127.0.0.1:9000] [--makers 3] [--noise 3]
+//! [--trend 1] [--passive 2] [--icebergs 1] [--stops 1] [--whales 1] [--mid 10000]
+//! [--seed 1]`
 //!
-//! Each bot logs in with the next account of the file, in order: market makers first, then
-//! noise traders, then trend followers. Use accounts without funds and with generous rates.
+//! Each bot logs in with the next account of the file, in that order: market makers first,
+//! then noise traders, trend followers, passive traders, icebergs, stops and whales; twelve
+//! accounts by default. Use accounts without funds and with generous rates.
 //! A bot whose connection fails, because the gateway restarted say, tries again every few
 //! seconds.
 
@@ -19,7 +21,8 @@ use gateway::accounts;
 use gateway::bots::{self, Bot, Strategy};
 
 const USAGE: &str = "usage: bots --accounts <file> [--connect <addr>] [--makers <n>] \
-[--noise <n>] [--trend <n>] [--mid <price>] [--seed <n>]";
+[--noise <n>] [--trend <n>] [--passive <n>] [--icebergs <n>] [--stops <n>] [--whales <n>] \
+[--mid <price>] [--seed <n>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -49,7 +52,7 @@ fn run() -> Result<(), String> {
     let counts = [
         (
             Strategy::MarketMaker,
-            parse(take("makers"), "2", "makers")?,
+            parse(take("makers"), "3", "makers")?,
             500,
         ),
         (Strategy::Noise, parse(take("noise"), "3", "noise")?, 1_500),
@@ -57,6 +60,22 @@ fn run() -> Result<(), String> {
             Strategy::Trend,
             parse::<usize>(take("trend"), "1", "trend")?,
             3_000,
+        ),
+        (
+            Strategy::Passive,
+            parse(take("passive"), "2", "passive")?,
+            900,
+        ),
+        (
+            Strategy::Iceberg,
+            parse(take("icebergs"), "1", "icebergs")?,
+            2_000,
+        ),
+        (Strategy::Stops, parse(take("stops"), "1", "stops")?, 2_500),
+        (
+            Strategy::Whale,
+            parse(take("whales"), "1", "whales")?,
+            30_000,
         ),
     ];
     let mid: i64 = parse(take("mid"), "10000", "mid")?;

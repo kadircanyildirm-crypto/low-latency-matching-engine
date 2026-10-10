@@ -88,13 +88,13 @@ impl Gateway {
         let (tx, rx) = mpsc::channel();
         let thread = thread::spawn(move || {
             let config_book = BookConfig {
-                max_owners: 8,
+                max_owners: 16,
                 ..BookConfig::new(1, 1_000, 1_024)
             };
             let engine = Engine::open(&path, EngineConfig::new(config_book), &mut Discard)
                 .map_err(|e| e.to_string())?
                 .0;
-            let accounts = [account(1), account(2), account(3), account(4)];
+            let accounts: Vec<Account> = (1..=8).map(account).collect();
             let exchange = Exchange::new(
                 engine.book(),
                 engine.last_seq(),
@@ -531,7 +531,7 @@ fn market_data_reaches_subscribers() {
 }
 
 /// Bots keep a market alive: within a second, makers quote both sides and the others trade
-/// against them.
+/// against them. Every kind of bot runs, and stops cleanly.
 #[test]
 fn bots_make_a_market() {
     use gateway::bots::{self, Bot, Strategy};
@@ -542,6 +542,10 @@ fn bots_make_a_market() {
         (Strategy::MarketMaker, 1, 50),
         (Strategy::Noise, 2, 30),
         (Strategy::Trend, 3, 30),
+        (Strategy::Passive, 4, 20),
+        (Strategy::Iceberg, 5, 20),
+        (Strategy::Stops, 6, 20),
+        (Strategy::Whale, 7, 200),
     ]
     .into_iter()
     .map(|(strategy, id, interval)| {
@@ -556,8 +560,8 @@ fn bots_make_a_market() {
         thread::spawn(move || bots::run(addr, bot, &stop))
     })
     .collect();
-    // A fourth account watches.
-    let mut watcher = Client::login(gateway.addr, 4, 104).unwrap().0;
+    // An eighth account watches.
+    let mut watcher = Client::login(gateway.addr, 8, 108).unwrap().0;
     watcher
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();

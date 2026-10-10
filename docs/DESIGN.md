@@ -1289,9 +1289,15 @@ snapshot.
 ### Bots and the page
 
 Bots are ordinary clients of the binary protocol with accounts of their own, watching the
-market through its market data: market makers quote ten levels each side of a fair price
-that takes random steps and is pulled back towards the start and the last trade, with more
-size further out, replacing their quotes every interval; noise traders cross the spread with small IOC orders; trend
+market through its market data: market makers quote six to ten levels each side of a fair
+price that takes random steps and is pulled back towards the start and the last trade, each
+in a style of its own (every tick or every other one, its own sizes, more further out), and
+replace their quotes only once the fair price has moved two ticks, or now and then, so that
+their orders keep their place in the queues among everyone else's; passive traders leave
+small orders at or behind the best prices and clear them every thirty; an iceberg rests one
+large order showing a small part of it, so its tranches go to the back of the queue in
+turn; stops wait beyond the market for a move to trigger them; a whale now and then takes
+several levels at once; noise traders cross the spread with small IOC orders; trend
 followers trade with the recent move. They reconnect when the gateway restarts.
 
 The page has no dependencies and no build step, and loads nothing from elsewhere: no

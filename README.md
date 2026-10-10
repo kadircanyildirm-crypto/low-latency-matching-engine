@@ -324,7 +324,7 @@ cargo run --release -p gateway --bin gateway -- --dir data --accounts crates/gat
 | Write-ahead across threads | The writer passes a command on only once it is journaled (and synced under `Always`), so the book never sees a command the journal could lose, and no client hears of one. Segment rolls and syncs happen on the writer's thread; snapshots on the matcher's, after the writer syncs through them. |
 | Backpressure without deadlock | Every ring is bounded. A full ring makes its producer wait; the network thread never blocks on a ring and always drains the events, so the waits cannot form a cycle, and when the writer falls behind it simply stops reading sockets. |
 | Same answers, any core | The same sessions get exactly the same replies and market data through the pipeline as through the engine on one thread, under snapshots and retention, with rings of 1 to 64 items. |
-| Market data | `Subscribe` gets the book's depth by price level, then trades and every level that changes, each under the sequence number of the last command it reflects. The depth is kept from the events alone, on the network thread, and equals the book's after every command of 120,000 tested. |
+| Market data | `Subscribe` gets the book's depth by price level, then trades and every level that changes, each under the sequence number of the last command it reflects. The depth is kept from the events alone, on the network thread, down to each order's place in its queue, and equals the book's, order by order, after every command of 120,000 tested. |
 
 Keeping the depth from the events exposed a Phase 1 defect that the differential tests had
 missed because their reference model shared it: in an uncross, a replenished iceberg was

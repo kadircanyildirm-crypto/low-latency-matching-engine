@@ -1,10 +1,11 @@
-//! The depth kept from the events against the book's own, after every command of flows that
-//! use every command kind: limits of every time in force and icebergs, market orders,
-//! cancels, modifies, stops, mass cancels, and calls that end in an uncross.
+//! The depth kept from the events against the book's own, level by level and order by
+//! order, after every command of flows that use every command kind: limits of every time in
+//! force and icebergs, market orders, cancels, modifies, stops, mass cancels, and calls that
+//! end in an uncross.
 
 use std::collections::BTreeMap;
 
-use marketdata::{Depth, Level};
+use marketdata::{Depth, Level, QueueEntry};
 use orderbook::workload::{Mix, TifMix, Workload, WorkloadConfig};
 use orderbook::{BookConfig, OrderBook, Price, Side};
 
@@ -25,6 +26,26 @@ fn book_levels(book: &OrderBook, side: Side) -> Vec<(Price, Level)> {
 
 fn levels(depth: &Depth, side: Side) -> Vec<(Price, Level)> {
     depth.levels(side).collect()
+}
+
+/// The book's orders of one side, level by level in priority order.
+fn book_queues(book: &OrderBook, side: Side) -> Vec<(Price, Vec<QueueEntry>)> {
+    book.depth(side)
+        .map(|level| {
+            let queue = book.queue(side, level.price).map(|order| QueueEntry {
+                id: order.id,
+                visible: order.visible,
+            });
+            (level.price, queue.collect())
+        })
+        .collect()
+}
+
+fn queues(depth: &Depth, side: Side) -> Vec<(Price, Vec<QueueEntry>)> {
+    depth
+        .levels(side)
+        .map(|(price, _)| (price, depth.queue(side, price).collect()))
+        .collect()
 }
 
 fn flow(seed: u64, band: Option<u32>) -> (BookConfig, Workload) {
@@ -100,6 +121,12 @@ fn the_depth_follows_the_book() {
                     book_levels(&book, side),
                     "seed {seed}, step {step}, {side:?} after {command:?}: {events:?}"
                 );
+                // Every order where the book has it, in its place in the queue.
+                assert_eq!(
+                    queues(&depth, side),
+                    book_queues(&book, side),
+                    "seed {seed}, step {step}, {side:?} after {command:?}: {events:?}"
+                );
             }
             // Every level that changed is reported, once, as it is now.
             let changes: Vec<_> = depth.changes().collect();
@@ -132,6 +159,7 @@ fn the_depth_follows_the_book() {
                 let fresh = Depth::of(&book);
                 for side in [Side::Buy, Side::Sell] {
                     assert_eq!(levels(&fresh, side), levels(&depth, side));
+                    assert_eq!(queues(&fresh, side), queues(&depth, side));
                 }
             }
         }

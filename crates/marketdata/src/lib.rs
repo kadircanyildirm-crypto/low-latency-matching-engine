@@ -1,15 +1,17 @@
-//! Market data: the book's depth by price level, kept from the book's events alone, and the
-//! levels each batch of events changed.
+//! Market data: the book's depth by price level and order by order, kept from the book's
+//! events alone, and the levels each batch of events changed.
 //!
-//! A [`Depth`] follows every resting order: its side, price, and how much of it shows and
-//! is left. Each event updates the orders it names and the levels they rest at, so the
-//! depth needs neither the book nor a thread that holds it: it runs wherever the events go.
-//! What shows is what the book shows: an iceberg counts with its visible tranche only.
+//! A [`Depth`] follows every resting order: its side, price, place in its level's queue,
+//! and how much of it shows and is left. Each event updates the orders it names and the
+//! levels they rest at, so the depth needs neither the book nor a thread that holds it: it
+//! runs wherever the events go. What shows is what the book shows: an iceberg counts with
+//! its visible tranche only.
 //!
 //! The rules it follows are the book's (DESIGN.md §4 and §5): an order rests with
-//! `Rested`; a trade takes its quantity from what the resting orders it names show; an
-//! iceberg whose tranche ran out shows the next one with `Replenished`; a cancel removes the
-//! rest; a modify that keeps the price and does not add quantity shrinks the order in
+//! `Rested`, at the back of its level's queue; a trade takes its quantity from what the
+//! resting orders it names show; an iceberg whose tranche ran out shows the next one with
+//! `Replenished`, at the back of the queue again; a cancel removes the rest; a modify that
+//! keeps the price and does not add quantity shrinks the order in place, keeping its
 //! place, its hidden part first, and any other modify takes it off the book, to rest again
 //! with a `Rested` of its own if anything is left.
 
@@ -40,6 +42,15 @@ pub struct LevelUpdate {
     pub level: Level,
 }
 
+/// An order in a level's queue: what market data by order shows of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueEntry {
+    /// The order.
+    pub id: OrderId,
+    /// The quantity it shows; an iceberg's hidden part is not included.
+    pub visible: Qty,
+}
+
 /// A resting order, as far as depth goes.
 #[derive(Clone, Copy, Debug)]
 struct Resting {
@@ -49,6 +60,8 @@ struct Resting {
     visible: Qty,
     /// What is left of it, hidden part included.
     leaves: Qty,
+    /// Its place in its level's queue: lower comes first.
+    place: u64,
 }
 
 /// The depth of a book, kept from its events.
@@ -57,6 +70,10 @@ pub struct Depth {
     orders: HashMap<OrderId, Resting>,
     bids: BTreeMap<Price, Level>,
     asks: BTreeMap<Price, Level>,
+    /// Each level's orders by place, in the order they trade.
+    queues: HashMap<(Side, Price), BTreeMap<u64, OrderId>>,
+    /// The place the next order to join a queue gets.
+    next_place: u64,
     /// Levels changed since the last [`changes`](Depth::changes), possibly repeated.
     changed: Vec<(Side, Price)>,
 }
@@ -97,6 +114,19 @@ impl Depth {
     /// The level of `side` at `price`; an empty one if no order rests there.
     pub fn level(&self, side: Side, price: Price) -> Level {
         self.half(side).get(&price).copied().unwrap_or_default()
+    }
+
+    /// The orders resting at `side` and `price`, in the order they trade: the first is the
+    /// next to be filled. None if no order rests there.
+    pub fn queue(&self, side: Side, price: Price) -> impl Iterator<Item = QueueEntry> + '_ {
+        self.queues
+            .get(&(side, price))
+            .into_iter()
+            .flat_map(|queue| queue.values())
+            .map(|id| QueueEntry {
+                id: *id,
+                visible: self.orders[id].visible,
+            })
     }
 
     /// Takes the levels changed since the last call, each once, in the order they first
@@ -149,6 +179,16 @@ impl Depth {
                 if let Some(order) = self.orders.get_mut(&id) {
                     let (side, price, before) = (order.side, order.price, order.visible);
                     order.visible = visible;
+                    // The new tranche waits behind everything already at the level.
+                    let (from, to) = (order.place, self.next_place);
+                    order.place = to;
+                    self.next_place += 1;
+                    let queue = self
+                        .queues
+                        .get_mut(&(side, price))
+                        .expect("a resting order's queue");
+                    queue.remove(&from);
+                    queue.insert(to, id);
                     self.show(side, price, before, visible);
                 }
             }
@@ -195,6 +235,8 @@ impl Depth {
     }
 
     fn add(&mut self, id: OrderId, side: Side, price: Price, visible: Qty, leaves: Qty) {
+        let place = self.next_place;
+        self.next_place += 1;
         let previous = self.orders.insert(
             id,
             Resting {
@@ -202,9 +244,14 @@ impl Depth {
                 price,
                 visible,
                 leaves,
+                place,
             },
         );
         debug_assert!(previous.is_none(), "order {id} rests twice");
+        self.queues
+            .entry((side, price))
+            .or_default()
+            .insert(place, id);
         let level = self.half_mut(side).entry(price).or_default();
         level.qty += visible;
         level.orders += 1;
@@ -225,6 +272,12 @@ impl Depth {
         let Some(order) = self.orders.remove(&id) else {
             return;
         };
+        let key = (order.side, order.price);
+        let queue = self.queues.get_mut(&key).expect("a resting order's queue");
+        queue.remove(&order.place);
+        if queue.is_empty() {
+            self.queues.remove(&key);
+        }
         let half = self.half_mut(order.side);
         let level = half.get_mut(&order.price).expect("a resting order's level");
         level.qty -= order.visible;

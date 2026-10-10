@@ -1145,12 +1145,16 @@ checked after everything it covers is in.
 ### Market data
 
 `crates/marketdata` keeps a book's depth from its events alone: every resting order's side,
-price, what it shows and what is left, and per level the quantity shown and the number of
-orders. Trades take from what the resting orders show (both of them in an uncross); an
-iceberg shows its next tranche with `Replenished`; a cancel removes the rest; a modify
-that keeps the price and adds nothing shrinks the order in place, its hidden part first,
-and any other modify takes it off, to rest again with a `Rested` of its own. Since it needs
-only the events, it runs on the network thread, not the matcher.
+price, place in its level's queue, what it shows and what is left, and per level the
+quantity shown and the number of orders. Orders join the back of their level's queue
+when they rest. Trades take from what the resting orders show (both of them in an
+uncross); an iceberg shows its next tranche with `Replenished`, at the back of the queue
+again; a cancel removes the rest; a modify that keeps the price and adds nothing shrinks
+the order in place, keeping its place, its hidden part first, and any other modify takes
+it off, to rest again with a `Rested` of its own. So the depth can tell, order by order,
+what is ahead of any order in its queue: market data by order, as a browser's queue view
+shows it. Since it needs only the events, it runs on the network thread, not the
+matcher.
 
 A session that sends `Subscribe` gets a `BookSnapshot` with the number of levels that
 follow, the levels as `LevelUpdate`s, bids best first and then asks, and from then on,
@@ -1199,7 +1203,7 @@ late. These are closed-loop numbers on a laptop with the clients beside the serv
 | `crates/ring/tests/ring.rs`, `tests/loom.rs`, Miri | As above: a model test with drop counting, two threads at full speed, loom models of every interleaving, and Miri over all of it. |
 | `crates/engine/tests/split.rs` | The halves driven as a pipeline would, the writer ahead by any number of commands and freed segments removed later, under both sync policies and both crash models: recovery keeps every durable command and nothing unjournaled, and the matcher's events are the whole engine's. A snapshot without a durable journal panics. |
 | `crates/gateway/tests/pipeline.rs` | Sessions sending the same messages through the pipeline and through an engine on one thread get exactly the same replies and market data, with snapshots and retention on the threads, rings of 1 to 64 items and both ways of waiting, and the files left recover to the same book. A disk that fails stops the pipeline with every reported command recoverable; a power failure while it runs loses nothing reported. |
-| `crates/marketdata/tests/depth.rs` | 40 flows of 3,000 commands of every kind, half through calls that end in an uncross: after every command the depth equals the book's, every changed level is reported, and a depth taken from the book matches the one kept. |
+| `crates/marketdata/tests/depth.rs` | 40 flows of 3,000 commands of every kind, half through calls that end in an uncross: after every command the depth equals the book's, level by level and order by order in queue priority, every changed level is reported, and a depth taken from the book matches the one kept. |
 | `crates/gateway/tests/exchange.rs`, `tests/server.rs` | A client that subscribes in the middle of trading rebuilds exactly the book's depth from the snapshot and the updates; market data reaches a subscriber over TCP through either core; the load generator trades through the pipeline, which also stops and restarts with its orders. |
 | `fuzz/fuzz_targets/gateway.rs` | Also subscribes sessions and publishes: the depth kept equals the book's after every flush, and market data reaches only logged-in sessions. |
 

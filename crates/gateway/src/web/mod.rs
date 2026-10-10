@@ -30,12 +30,30 @@ pub fn page(path: &str) -> Option<(&'static str, &'static [u8])> {
             include_bytes!("../../web/app.js"),
         ),
         "/favicon.svg" => ("image/svg+xml", include_bytes!("../../web/favicon.svg")),
+        "/og.png" => ("image/png", include_bytes!("../../web/og.png")),
         "/style.css" => (
             "text/css; charset=utf-8",
             include_bytes!("../../web/style.css"),
         ),
         _ => return None,
     })
+}
+
+/// The page with its link preview pointing at `url`, where the page is published, such as
+/// `https://demo.example.com`: the sites that show previews want the image's full address.
+pub fn index_at(url: &str) -> Vec<u8> {
+    let url = url.trim_end_matches('/');
+    let (_, page) = page("/").expect("the page");
+    String::from_utf8_lossy(page)
+        .replace(
+            r#"content="/og.png""#,
+            &format!(r#"content="{url}/og.png""#),
+        )
+        .replace(
+            r#"property="og:url" content="/""#,
+            &format!(r#"property="og:url" content="{url}/""#),
+        )
+        .into_bytes()
 }
 
 /// Where guests' accounts come from.
@@ -80,5 +98,28 @@ impl Guests {
             .add_account(account)
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(Some(account))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The link preview points at the image where the page is published, and only that
+    /// changes.
+    #[test]
+    fn the_preview_points_where_the_page_is() {
+        let page = String::from_utf8(index_at("https://demo.example.com/")).unwrap();
+        assert!(page.contains(r#"content="https://demo.example.com/og.png""#));
+        assert!(page.contains(r#"property="og:url" content="https://demo.example.com/""#));
+        let original = std::str::from_utf8(page_bytes("/")).unwrap();
+        assert_eq!(
+            page.len(),
+            original.len() + 2 * "https://demo.example.com".len()
+        );
+    }
+
+    fn page_bytes(path: &str) -> &'static [u8] {
+        page(path).unwrap().1
     }
 }

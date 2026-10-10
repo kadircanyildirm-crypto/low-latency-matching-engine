@@ -4,7 +4,7 @@
 //! [--min-price 1] [--max-price 100000] [--max-orders 1000000] [--max-owners 1024]
 //! [--snapshot-every 1000000] [--max-sessions 1024] [--engine thread|pipeline]
 //! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
-//! [--guests <file>] [--guest-ids 100..1024]`
+//! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
@@ -13,7 +13,8 @@
 //! WebSocket. Visitors may create accounts with ids from `--guest-ids`, which are saved to
 //! the `--guests` file (`<dir>/guests.txt` by default) and loaded from it on the next start.
 //! They trade paper money: `--guest-cash` (in price ticks times lots) and
-//! `--guest-position` (in lots) to start with.
+//! `--guest-position` (in lots) to start with. `--public-url`, where the page is published
+//! such as `https://demo.example.com`, gives its link preview the image's full address.
 //!
 //! The exchange's own state, paper money above all, is checkpointed in the data directory
 //! every `--checkpoint-every` commands (10,000 by default, and at most `--snapshot-every`),
@@ -47,7 +48,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
 [--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
-[--checkpoint-every <n>]";
+[--checkpoint-every <n>] [--public-url <url>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -91,6 +92,8 @@ fn run() -> Result<(), String> {
     book.check().map_err(|e| format!("book settings: {e}"))?;
     let snapshot_every: u64 = parse(take("snapshot-every"), "1000000", "snapshot-every")?;
     let checkpoint_every: u64 = parse(take("checkpoint-every"), "10000", "checkpoint-every")?;
+    // An empty one, as compose passes when none is set, is none.
+    let public_url = take("public-url").filter(|url| !url.is_empty());
     if checkpoint_every == 0 || snapshot_every > 0 && checkpoint_every > snapshot_every {
         return Err(
             "--checkpoint-every must be at least one, and at most --snapshot-every: the journal \
@@ -210,6 +213,7 @@ fn run() -> Result<(), String> {
             recovered.checkpoint.unwrap_or(0),
         ),
         started,
+        public_url,
     };
     if let Some(&core) = cores.first() {
         let found = core_affinity::get_core_ids()
@@ -241,6 +245,7 @@ struct Setup {
     /// The directory, how many commands apart, and the sequence number of the last one.
     checkpoints: (PathBuf, u64, u64),
     started: Started,
+    public_url: Option<String>,
 }
 
 /// The accounts in `path`, with ids below `max_owners`.
@@ -263,11 +268,15 @@ fn serve<C: Core>(
         web,
         checkpoints: (dir, every, since),
         started,
+        public_url,
     } = setup;
     let mut server =
         Server::bind(exchange, core, listen, config).map_err(|e| format!("{listen}: {e}"))?;
     server.checkpoint_to(dir, every, since);
     server.set_started(started);
+    if let Some(url) = public_url {
+        server.set_public_url(&url);
+    }
     eprintln!(
         "gateway: {accounts} accounts, listening on {}",
         server.local_addr().map_err(|e| e.to_string())?

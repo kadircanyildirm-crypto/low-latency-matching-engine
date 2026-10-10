@@ -248,6 +248,9 @@ fn the_page_is_served_and_nothing_else() {
     assert!(page.contains("<!doctype html>"));
     let script = http(gateway.web, b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(script.contains("text/javascript"));
+    assert!(page.contains(r#"<meta property="og:image" content="/og.png">"#));
+    let preview = http(gateway.web, b"GET /og.png HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(preview.contains("Content-Type: image/png"));
     let icon = http(gateway.web, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(
         icon.contains("image/svg+xml") && icon.contains("<svg"),

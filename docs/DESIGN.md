@@ -1344,6 +1344,11 @@ account numbers are all a browser learns of other traders, as on a market-by-ord
 
 ### Deployment
 
+The page carries a link preview for sites like LinkedIn: a title, a description and a
+1200×630 image of the screen, which the gateway serves. The sites that show previews want
+the image's full address, which the page cannot know; `--public-url` tells the gateway
+where the page is published, and it serves the page with that address in it.
+
 `deploy/` holds an image built from source with the gateway and the bots, and a compose
 file that runs them with Caddy in front for HTTPS; only ports 80 and 443 are reachable from
 outside, and the exchange's directory is a volume. CI builds the image on every push.

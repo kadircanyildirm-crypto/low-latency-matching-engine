@@ -3,6 +3,8 @@
 [![CI](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+![The live demo: candles, and an order book that shows every order in its queue](crates/gateway/web/og.png)
+
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
 

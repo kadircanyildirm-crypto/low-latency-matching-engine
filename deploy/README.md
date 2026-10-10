@@ -20,11 +20,12 @@ WebSocket through. Paper money only.
 git clone https://github.com/kadircanyildirm-crypto/low-latency-matching-engine.git
 cd low-latency-matching-engine
 sh deploy/make-accounts.sh                 # the bots' accounts, with random tokens
-DOMAIN=demo.example.com docker compose -f deploy/compose.yaml up -d --build
+DOMAIN=demo.example.com PUBLIC_URL=https://demo.example.com docker compose -f deploy/compose.yaml up -d --build
 ```
 
 The page is then on `https://demo.example.com`. Each visitor gets a paper account with
-$100,000 and 1,000 shares on the first visit.
+$100,000 and 1,000 shares on the first visit. `PUBLIC_URL` gives the link preview that
+LinkedIn and others show the image's full address; without it the preview has no image.
 
 ## Running it
 

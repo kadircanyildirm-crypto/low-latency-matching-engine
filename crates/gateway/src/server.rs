@@ -265,6 +265,8 @@ pub struct Server<C: Core> {
     recent_stats: VecDeque<json::Stats>,
     /// How the server started, if it was told.
     start: Option<json::Started>,
+    /// The page, with its link preview pointing where it is published, if that is known.
+    index: Option<Vec<u8>>,
 }
 
 impl<C: Core> Server<C> {
@@ -317,6 +319,7 @@ impl<C: Core> Server<C> {
             logged: Vec::new(),
             recent_stats: VecDeque::with_capacity(STATS_KEPT),
             start: None,
+            index: None,
         })
     }
 
@@ -324,6 +327,12 @@ impl<C: Core> Server<C> {
     /// long that took.
     pub fn set_started(&mut self, start: json::Started) {
         self.start = Some(start);
+    }
+
+    /// Tells the page where it is published, such as `https://demo.example.com`, so its
+    /// link preview gives the image's full address, as the sites that show previews want.
+    pub fn set_public_url(&mut self, url: &str) {
+        self.index = Some(web::index_at(url));
     }
 
     /// The address the server listens on, with the port the system chose if `addr` asked
@@ -617,7 +626,13 @@ impl<C: Core> Server<C> {
                         self.exchange.connect(session, now);
                     }
                     Ok(Some((http::Request::Get { path }, _))) => {
-                        let response = match web::page(&path) {
+                        let page = match (path.as_str(), &self.index) {
+                            ("/" | "/index.html", Some(index)) => {
+                                Some(("text/html; charset=utf-8", index.as_slice()))
+                            }
+                            _ => web::page(&path),
+                        };
+                        let response = match page {
                             Some((content_type, body)) => {
                                 http::response("200 OK", content_type, body)
                             }

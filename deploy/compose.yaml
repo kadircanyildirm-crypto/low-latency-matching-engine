@@ -21,6 +21,9 @@ services:
       - 0.0.0.0:8080
       - --max-orders
       - "200000"
+      # Where the page is published, for its link preview: https://$DOMAIN.
+      - --public-url
+      - ${PUBLIC_URL:-}
     volumes:
       - exchange-data:/data
       - ./bots.txt:/etc/exchange/bots.txt:ro

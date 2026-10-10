@@ -14,10 +14,10 @@
 //! and sessions over WebSocket that speak JSON ([`web`]). A browser's session
 //! is a session like any other.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +38,20 @@ use crate::web::{self, Guests, http, ws};
 pub struct ServerConfig {
     /// Connections served at once; more are closed as they arrive.
     pub max_sessions: usize,
+    /// Of `max_sessions`, how many only the binary listener may use: browsers that take
+    /// every other one still leave room for the programs that make the market.
+    pub reserved_sessions: usize,
+    /// WebSockets one address may hold at once.
+    pub max_web_per_address: usize,
+    /// Accounts one address may create: so many at once, then one more every so often.
+    pub address_registrations: Rate,
+    /// Accounts all browsers together may create.
+    pub registrations: Rate,
+    /// Whether a browser's address is the last one in the `X-Forwarded-For` header of its
+    /// handshake, as a reverse proxy in front sets it, rather than the connection's. Only
+    /// for a web listener that nothing but the proxy can reach: anyone else could name
+    /// any address.
+    pub trust_forwarded_for: bool,
     /// Bytes of replies a connection may leave unread before it is dropped.
     pub max_output: usize,
     /// How long a connection being logged out has to read its last messages.
@@ -47,16 +61,95 @@ pub struct ServerConfig {
 }
 
 impl Default for ServerConfig {
-    /// 1,024 sessions, 4 MiB of unread replies each, a second to linger, ticks every 10 ms.
+    /// 1,024 sessions, 64 of them kept for the binary listener; 32 WebSockets per address;
+    /// 5 accounts per address and one more every 10 minutes, 120 in all and one more a
+    /// second; 4 MiB of unread replies each, a second to linger, ticks every 10 ms.
     fn default() -> Self {
         ServerConfig {
             max_sessions: 1_024,
+            reserved_sessions: 64,
+            max_web_per_address: 32,
+            address_registrations: Rate {
+                burst: 5,
+                every: Duration::from_secs(600),
+            },
+            registrations: Rate {
+                burst: 120,
+                every: Duration::from_secs(1),
+            },
+            trust_forwarded_for: false,
             max_output: 4 << 20,
             linger: Duration::from_secs(1),
             tick: Duration::from_millis(10),
         }
     }
 }
+
+/// How often something may happen: `burst` times at once, then once more every `every`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rate {
+    /// How many at once, after a pause.
+    pub burst: u32,
+    /// How long one more takes to come back.
+    pub every: Duration,
+}
+
+impl Rate {
+    fn cost(self) -> u64 {
+        u64::try_from(self.every.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn capacity(self) -> u64 {
+        self.cost().saturating_mul(u64::from(self.burst))
+    }
+}
+
+/// A token bucket for a [`Rate`], in nanoseconds of credit.
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+    credit: u64,
+    at: u64,
+}
+
+impl Bucket {
+    fn full(rate: Rate, now: u64) -> Bucket {
+        Bucket {
+            credit: rate.capacity(),
+            at: now,
+        }
+    }
+
+    fn refill(&mut self, rate: Rate, now: u64) {
+        let elapsed = now.saturating_sub(self.at);
+        self.credit = self.credit.saturating_add(elapsed).min(rate.capacity());
+        self.at = self.at.max(now);
+    }
+
+    fn ready(&mut self, rate: Rate, now: u64) -> bool {
+        self.refill(rate, now);
+        self.credit >= rate.cost()
+    }
+
+    fn take(&mut self, rate: Rate) {
+        self.credit -= rate.cost();
+    }
+
+    fn is_full(&mut self, rate: Rate, now: u64) -> bool {
+        self.refill(rate, now);
+        self.credit == rate.capacity()
+    }
+}
+
+/// What the server keeps of one address its browsers come from.
+#[derive(Debug)]
+struct Address {
+    /// Its WebSockets.
+    sockets: usize,
+    registrations: Bucket,
+}
+
+/// Addresses kept before those with nothing to remember are forgotten.
+const ADDRESSES_KEPT: usize = 4_096;
 
 /// Why the server stopped.
 #[derive(Debug)]
@@ -133,8 +226,9 @@ impl<S: Storage> Core for Engine<S> {
 const LISTENER: Token = Token(0);
 const WEB_LISTENER: Token = Token(1);
 
-/// The longest HTTP request a browser may send, headers and all.
-const MAX_REQUEST: usize = 8 << 10;
+/// The longest HTTP request a browser may send, headers and all: a proxy in front adds
+/// headers of its own.
+const MAX_REQUEST: usize = 16 << 10;
 
 /// The longest WebSocket message a browser may send.
 const MAX_WEB_MESSAGE: usize = 4 << 10;
@@ -179,6 +273,10 @@ enum Kind {
 struct Connection {
     stream: TcpStream,
     kind: Kind,
+    /// Where the connection comes from.
+    peer: IpAddr,
+    /// A WebSocket's address, as counted in the server's addresses.
+    address: Option<IpAddr>,
     /// Bytes received but not yet decoded: at most one partial message.
     input: Vec<u8>,
     /// Encoded replies not yet written.
@@ -292,6 +390,12 @@ pub struct Server<C: Core> {
     index: Option<Vec<u8>>,
     /// What is traded, as browsers are told.
     market: json::Market,
+    /// The web listener's connections, HTTP and WebSocket.
+    web_connections: usize,
+    /// The addresses browsers come from.
+    addresses: HashMap<IpAddr, Address>,
+    /// Accounts all browsers together may still create.
+    registrations: Bucket,
 }
 
 impl<C: Core> Server<C> {
@@ -346,6 +450,9 @@ impl<C: Core> Server<C> {
             start: None,
             index: None,
             market: json::Market::default(),
+            web_connections: 0,
+            addresses: HashMap::new(),
+            registrations: Bucket::full(config.registrations, 0),
         })
     }
 
@@ -530,13 +637,20 @@ impl<C: Core> Server<C> {
                 (true, Some(listener)) => listener,
                 (true, None) => return,
             };
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+            let (mut stream, peer) = match listener.accept() {
+                Ok((stream, peer)) => (stream, peer.ip()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 // Would block, or a connection that failed before it was accepted, or out
                 // of file descriptors: try again on the next readiness.
                 Err(_) => return,
             };
+            let web_room = self
+                .config
+                .max_sessions
+                .saturating_sub(self.config.reserved_sessions);
+            if web && self.web_connections >= web_room {
+                continue;
+            }
             let session = match self.free.pop() {
                 Some(session) => session,
                 None if self.wires.slots.len() < self.config.max_sessions => {
@@ -557,6 +671,7 @@ impl<C: Core> Server<C> {
             }
             // A browser's session starts once its connection is upgraded to a WebSocket.
             let kind = if web {
+                self.web_connections += 1;
                 Kind::Http { since: now }
             } else {
                 self.exchange.connect(session, now);
@@ -565,6 +680,8 @@ impl<C: Core> Server<C> {
             self.wires.slots[session] = Some(Connection {
                 stream,
                 kind,
+                peer,
+                address: None,
                 input: Vec::new(),
                 output: Vec::new(),
                 writing: false,
@@ -652,8 +769,30 @@ impl<C: Core> Server<C> {
                 },
                 Kind::Http { .. } => match http::parse(rest, MAX_REQUEST) {
                     Ok(None) => return at,
-                    Ok(Some((http::Request::Upgrade { key }, len))) => {
+                    Ok(Some((http::Request::Upgrade { key, forwarded_for }, len))) => {
                         at += len;
+                        let address = match forwarded_for {
+                            Some(address) if self.config.trust_forwarded_for => address,
+                            _ => connection.peer,
+                        };
+                        let max = self.config.max_web_per_address;
+                        let rate = self.config.address_registrations;
+                        let known = self.addresses.entry(address).or_insert(Address {
+                            sockets: 0,
+                            registrations: Bucket::full(rate, now),
+                        });
+                        if known.sockets >= max {
+                            let response = http::response(
+                                "429 Too Many Requests",
+                                "text/plain",
+                                b"too many connections from one address",
+                            );
+                            connection.output.extend_from_slice(&response);
+                            connection.closing = true;
+                            return input.len();
+                        }
+                        known.sockets += 1;
+                        connection.address = Some(address);
                         connection
                             .output
                             .extend_from_slice(&http::upgrade_response(&key));
@@ -718,7 +857,7 @@ impl<C: Core> Server<C> {
     /// A browser's JSON message.
     fn web_message(&mut self, session: SessionId, text: &str, now: u64) {
         let message = match json::parse(text) {
-            Ok(WebIn::Register) => return self.register(session),
+            Ok(WebIn::Register) => return self.register(session, now),
             Ok(message) => message,
             Err(error) => {
                 self.send_web(session, &json::error(&error.to_string()));
@@ -885,15 +1024,27 @@ impl<C: Core> Server<C> {
         }
     }
 
-    /// Creates an account for the browser on `session`: one per connection.
-    fn register(&mut self, session: SessionId) {
-        let registered = self.wires.slots[session]
-            .as_ref()
-            .is_some_and(|c| c.kind == Kind::WebSocket { registered: true });
-        let reply = match (&mut self.guests, registered) {
-            (_, true) => json::error("one account per connection"),
-            (None, _) => json::error("registration is closed"),
-            (Some(guests), false) => match guests.create(&mut self.exchange) {
+    /// Creates an account for the browser on `session`: one per connection, and as many
+    /// as the rates allow from its address and from all of them.
+    fn register(&mut self, session: SessionId, now: u64) {
+        let Some(connection) = self.wires.slots[session].as_ref() else {
+            return;
+        };
+        let registered = connection.kind == Kind::WebSocket { registered: true };
+        let address = connection.address;
+        let refusal = if registered {
+            Some("one account per connection")
+        } else if self.exchange.account_of(session).is_some() {
+            Some("already logged in")
+        } else if !self.may_register(address, now) {
+            Some("too many new accounts, try again later")
+        } else {
+            None
+        };
+        let reply = match (&mut self.guests, refusal) {
+            (_, Some(refusal)) => json::error(refusal),
+            (None, None) => json::error("registration is closed"),
+            (Some(guests), None) => match guests.create(&mut self.exchange) {
                 Ok(Some(account)) => {
                     if let Some(connection) = self.wires.slots[session].as_mut() {
                         connection.kind = Kind::WebSocket { registered: true };
@@ -905,6 +1056,20 @@ impl<C: Core> Server<C> {
             },
         };
         self.send_web(session, &reply);
+    }
+
+    /// Takes an account from the rates of `address` and of all addresses, if both have one.
+    fn may_register(&mut self, address: Option<IpAddr>, now: u64) -> bool {
+        let (one, all) = (self.config.address_registrations, self.config.registrations);
+        let Some(known) = address.and_then(|address| self.addresses.get_mut(&address)) else {
+            return false;
+        };
+        if !known.registrations.ready(one, now) || !self.registrations.ready(all, now) {
+            return false;
+        }
+        known.registrations.take(one);
+        self.registrations.take(all);
+        true
     }
 
     /// Sends a browser a message the exchange does not know of.
@@ -965,8 +1130,30 @@ impl<C: Core> Server<C> {
         }
     }
 
+    /// Forgets a browser's connection in the counts of the web listener and its address.
+    fn forget(&mut self, connection: &Connection, now: u64) {
+        if connection.kind == Kind::Binary {
+            return;
+        }
+        self.web_connections -= 1;
+        let Some(address) = connection.address else {
+            return;
+        };
+        if let Some(known) = self.addresses.get_mut(&address) {
+            known.sockets -= 1;
+        }
+        // An address with no sockets and a full bucket has nothing to remember.
+        if self.addresses.len() > ADDRESSES_KEPT {
+            let rate = self.config.address_registrations;
+            self.addresses
+                .retain(|_, known| known.sockets > 0 || !known.registrations.is_full(rate, now));
+        }
+    }
+
     fn drop_connection(&mut self, session: SessionId) {
         if let Some(mut connection) = self.wires.slots[session].take() {
+            let now = self.now();
+            self.forget(&connection, now);
             let _ = self.poll.registry().deregister(&mut connection.stream);
             // A program that loses its connection has its orders cancelled; a browser's
             // stay, since it may well come back, and is told them when it logs in.
@@ -996,6 +1183,8 @@ impl<C: Core> Server<C> {
                 let failed = connection.dead || flush(connection).is_err();
                 if failed || connection.output.is_empty() || late {
                     let mut connection = self.wires.slots[session].take().expect("a connection");
+                    let now = self.now();
+                    self.forget(&connection, now);
                     let _ = self.poll.registry().deregister(&mut connection.stream);
                     self.exchange.detach(session);
                     self.free.push(session);

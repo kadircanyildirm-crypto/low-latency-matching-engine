@@ -5,7 +5,8 @@
 //! [--snapshot-every 1000000] [--max-sessions 1024] [--engine thread|pipeline]
 //! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
 //! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>] [--symbol ETH/USD]
-//! [--price-decimals 2] [--lot-decimals 6] [--source <name>] [--source-url <url>]`
+//! [--price-decimals 2] [--lot-decimals 6] [--source <name>] [--source-url <url>]
+//! [--trust-forwarded-for false]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
@@ -20,6 +21,12 @@
 //! is an integer number of ticks of `10^-price-decimals` of the quote currency, a quantity
 //! of lots of `10^-lot-decimals` of the base asset (DEMO/USD, 2 and 0 by default); and
 //! `--source`, with `--source-url`, names the venue a mirrored market's orders come from.
+//!
+//! Browsers are limited by address: the WebSockets each may hold, and the accounts each may
+//! create. Behind a reverse proxy every connection comes from the proxy's address;
+//! `--trust-forwarded-for true` takes a browser's from the `X-Forwarded-For` header the
+//! proxy adds instead, which only a web port that nothing else can reach should do. Of
+//! `--max-sessions`, 64 are kept for the binary listener.
 //!
 //! The exchange's own state, paper money above all, is checkpointed in the data directory
 //! every `--checkpoint-every` commands (10,000 by default, and at most `--snapshot-every`),
@@ -53,7 +60,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
 [--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
-[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>]";
+[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>] [--trust-forwarded-for true|false]";
 
 fn main() -> ExitCode {
     match run() {
@@ -121,6 +128,7 @@ fn run() -> Result<(), String> {
     }
     let server = ServerConfig {
         max_sessions: parse(take("max-sessions"), "1024", "max-sessions")?,
+        trust_forwarded_for: parse(take("trust-forwarded-for"), "false", "trust-forwarded-for")?,
         ..ServerConfig::default()
     };
     let pipelined = match take("engine").as_deref() {

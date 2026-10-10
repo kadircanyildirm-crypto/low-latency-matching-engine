@@ -233,6 +233,8 @@ function receive(message) {
     case "error":
       if (message.message === "no accounts are left") {
         toast("The demo is full", "Every paper account is taken. Try again later.", "error");
+      } else if (message.message === "too many new accounts, try again later") {
+        toast("Too many new accounts", "Accounts from your address are limited. Try again in a few minutes.", "error");
       } else toast("Something went wrong", message.message, "error");
       break;
     case "stats":

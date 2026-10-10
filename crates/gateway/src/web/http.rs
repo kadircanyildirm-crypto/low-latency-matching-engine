@@ -3,6 +3,7 @@
 //! anything larger than a limit are refused.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use base64::Engine as _;
 use sha1::{Digest, Sha1};
@@ -19,6 +20,9 @@ pub enum Request {
     Upgrade {
         /// The client's `Sec-WebSocket-Key`.
         key: String,
+        /// The last address of its `X-Forwarded-For` header, the one a reverse proxy in
+        /// front added, if it has one that reads as an address.
+        forwarded_for: Option<IpAddr>,
     },
 }
 
@@ -48,8 +52,8 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
-/// Headers read at most.
-const MAX_HEADERS: usize = 32;
+/// Headers read at most: a browser's, and those a proxy in front adds.
+const MAX_HEADERS: usize = 64;
 
 /// Parses the request at the start of `buf`: `Ok(None)` if its headers have not all
 /// arrived, otherwise the request and its length. A request whose headers take more than
@@ -96,10 +100,14 @@ pub fn parse(buf: &[u8], max: usize) -> Result<Option<(Request, usize)>, HttpErr
             .decode(key)
             .is_ok_and(|bytes| bytes.len() == 16)
     });
+    let forwarded_for = header("x-forwarded-for")
+        .and_then(|list| list.rsplit(',').next())
+        .and_then(|address| address.trim().parse().ok());
     match (upgrades, header("sec-websocket-version"), key) {
         (true, Some("13"), Some(key)) => Ok(Some((
             Request::Upgrade {
                 key: key.to_owned(),
+                forwarded_for,
             },
             len,
         ))),
@@ -173,11 +181,21 @@ mod tests {
             parse(upgrade, 1_024),
             Ok(Some((
                 Request::Upgrade {
-                    key: "dGhlIHNhbXBsZSBub25jZQ==".into()
+                    key: "dGhlIHNhbXBsZSBub25jZQ==".into(),
+                    forwarded_for: None,
                 },
                 upgrade.len()
             )))
         );
+        // Behind a proxy: the address it added, the last one.
+        let proxied = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+            Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            X-Forwarded-For: 10.0.0.9, 203.0.113.7\r\n\r\n";
+        let Ok(Some((Request::Upgrade { forwarded_for, .. }, _))) = parse(proxied, 1_024) else {
+            panic!("an upgrade");
+        };
+        assert_eq!(forwarded_for, Some("203.0.113.7".parse().unwrap()));
         let refused: [(&[u8], HttpError); 6] = [
             (b"POST / HTTP/1.1\r\n\r\n", HttpError::Method),
             (

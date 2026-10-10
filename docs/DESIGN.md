@@ -1254,6 +1254,25 @@ creates one with the lowest free id of a range kept for guests and a random toke
 connection, and appends it to a file, synced, before answering, so that an account a
 visitor was told of survives a crash.
 
+The web listener is open to anyone, so it is held to limits that one visitor, or a script,
+cannot get around by opening more connections:
+
+- Browsers may take all the sessions but 64, which only the binary listener may use: a
+  flood of browsers never locks out the programs that make the market, which would leave
+  the book empty.
+- An address may hold 32 WebSockets, and create 5 accounts, then one more every ten
+  minutes; all addresses together, 120, then one more a second. Guest ids are never handed
+  out twice, so without these limits a script could take every one in seconds, and the
+  demo would be full for good; the rate for all also bounds how often a registration's
+  sync stalls the loop. A browser that is logged in creates none.
+- Behind a reverse proxy every connection comes from the proxy. With
+  `--trust-forwarded-for true`, a browser's address is the last one in the
+  `X-Forwarded-For` header of its handshake, the one the proxy added; anything before it
+  the browser could have written itself. Only a web port that nothing but the proxy
+  reaches may trust it.
+- The order-entry messages a session sends are counted against its account's token
+  bucket, not its session's: logging in again does not refill it.
+
 ### Paper money
 
 An account can start with cash, in price ticks times lots, and a position, in lots: it is
@@ -1411,7 +1430,9 @@ outside, and the exchange's directory is a volume. CI builds the image on every 
 | Test | What it shows |
 |---|---|
 | `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
-| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles for a browser that subscribes, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
+| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; WebSockets and new accounts limited by address, the
+proxy's word for it taken only when trusted, and room left for programs when browsers
+fill the web listener; the last hour as candles for a browser that subscribes, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
 | `mirror/src/*` | Decimals read exactly, and every malformed or too-fine one refused; Bitstamp's book, trade and reconnect messages; the mirror placing the venue's orders in order, nothing twice while on its way, cancels before changes before new orders, a shrink that keeps the order's place, a refused modify tried again, a filled order placed again, a refused one forgotten. |
 | `mirror/tests/exchange.rs` | The mirror against a real exchange over real sockets: after each of three venue books, the exchange's book holds the venue's orders at the followed prices, level by level; trades sent again trade at the venue's price; and a modify that raced a fill is put right. |
 | `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |

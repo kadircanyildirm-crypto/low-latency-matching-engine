@@ -13,6 +13,7 @@ use std::time::Duration;
 use engine::EngineConfig;
 use engine::storage::FsStorage;
 use gateway::client::Client;
+use gateway::server::Rate;
 use gateway::web::json::Started;
 use gateway::web::{Guests, ws};
 use gateway::{Account, Funds, Server, ServerConfig, Timing, recovery};
@@ -47,6 +48,10 @@ struct Gateway {
 
 impl Gateway {
     fn start(dir: &TempDir) -> Gateway {
+        Gateway::start_with(dir, ServerConfig::default())
+    }
+
+    fn start_with(dir: &TempDir, config: ServerConfig) -> Gateway {
         let path = dir.0.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -85,7 +90,7 @@ impl Gateway {
                 digest: engine.book().digest(),
                 ..Started::default()
             };
-            let mut server = Server::bind(exchange, engine, addr, ServerConfig::default()).unwrap();
+            let mut server = Server::bind(exchange, engine, addr, config).unwrap();
             server.set_started(started);
             server.checkpoint_to(data, 1_000, recovered.checkpoint.unwrap_or(0));
             let guests = Guests {
@@ -145,17 +150,16 @@ struct Browser {
 
 impl Browser {
     fn connect(addr: SocketAddr) -> Browser {
+        Browser::connect_with(addr, "")
+    }
+
+    /// A browser whose handshake carries `headers` as well, each ending in CRLF.
+    fn connect_with(addr: SocketAddr, headers: &str) -> Browser {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        stream
-            .write_all(
-                b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
-                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-            )
-            .unwrap();
+        stream.write_all(handshake(headers).as_bytes()).unwrap();
         let mut browser = Browser {
             stream,
             input: Vec::new(),
@@ -231,6 +235,17 @@ impl Browser {
         }
     }
 }
+
+/// A WebSocket handshake, with `headers` as well, each ending in CRLF.
+fn handshake(headers: &str) -> String {
+    format!(
+        "GET /ws HTTP/1.1{CRLF}Host: localhost{CRLF}Upgrade: websocket{CRLF}\
+         Connection: Upgrade{CRLF}Sec-WebSocket-Version: 13{CRLF}\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=={CRLF}{headers}{CRLF}"
+    )
+}
+
+const CRLF: &str = "\r\n";
 
 /// The wall clock, in seconds since the Unix epoch.
 fn unix_seconds() -> u64 {
@@ -423,9 +438,15 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let kept = again.expect("report");
     assert_eq!(kept["kind"], "accepted");
     drop(again);
-    std::thread::sleep(Duration::from_millis(100));
-    let mut back = Browser::connect(gateway.web);
-    back.send(json!({"type": "login", "account": 10, "token": token}));
+    // Once the server has noticed that it left, the account logs in again.
+    let mut back = loop {
+        let mut back = Browser::connect(gateway.web);
+        back.send(json!({"type": "login", "account": 10, "token": token}));
+        if back.receive()["type"] == "login_accepted" {
+            break back;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let told = back.expect("report");
     assert_eq!(
         (
@@ -547,4 +568,76 @@ fn a_guests_money_survives_a_restart() {
         (cancelled["kind"].clone(), cancelled["ref"].clone()),
         (json!("cancelled"), json!(2))
     );
+}
+
+/// Browsers are limited by address: the WebSockets each holds, and the accounts each
+/// creates. Behind a proxy that is trusted, a browser's address is the one the proxy names
+/// last; otherwise what it names counts for nothing.
+#[test]
+fn browsers_are_limited_by_address() {
+    let dir = TempDir::new("address");
+    let config = ServerConfig {
+        max_web_per_address: 2,
+        address_registrations: Rate {
+            burst: 1,
+            every: Duration::from_secs(3_600),
+        },
+        trust_forwarded_for: true,
+        ..ServerConfig::default()
+    };
+    let gateway = Gateway::start_with(&dir, config);
+    let from = |address: &str| format!("X-Forwarded-For: 10.0.0.1, {address}{CRLF}");
+    let mut first = Browser::connect_with(gateway.web, &from("203.0.113.1"));
+    let mut second = Browser::connect_with(gateway.web, &from("203.0.113.1"));
+    // A third WebSocket from that address is turned away, one from another is not.
+    let refused = http(gateway.web, handshake(&from("203.0.113.1")).as_bytes());
+    assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+    let mut other = Browser::connect_with(gateway.web, &from("203.0.113.2"));
+
+    // One account per address here.
+    first.send(json!({"type": "register"}));
+    let registered = first.expect("registered");
+    assert_eq!(registered["account"], 10);
+    second.send(json!({"type": "register"}));
+    assert_eq!(
+        second.expect("error")["message"],
+        "too many new accounts, try again later"
+    );
+    other.send(json!({"type": "register"}));
+    assert_eq!(other.expect("registered")["account"], 11);
+    // A browser that logged in creates none.
+    let mut back = Browser::connect_with(gateway.web, &from("203.0.113.3"));
+    back.send(json!({"type": "login", "account": 10, "token": registered["token"]}));
+    back.expect("login_accepted");
+    back.send(json!({"type": "register"}));
+    assert_eq!(back.expect("error")["message"], "already logged in");
+    drop(gateway);
+
+    // Without trusting the proxy, every one of these comes from this test's address.
+    let dir = TempDir::new("untrusted");
+    let config = ServerConfig {
+        max_web_per_address: 1,
+        ..ServerConfig::default()
+    };
+    let gateway = Gateway::start_with(&dir, config);
+    let _first = Browser::connect_with(gateway.web, &from("203.0.113.1"));
+    let refused = http(gateway.web, handshake(&from("203.0.113.2")).as_bytes());
+    assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+}
+
+/// Browsers cannot take the sessions kept for programs: with the web listener full, a
+/// program still logs in.
+#[test]
+fn browsers_leave_room_for_programs() {
+    let dir = TempDir::new("reserved");
+    let config = ServerConfig {
+        max_sessions: 3,
+        reserved_sessions: 1,
+        ..ServerConfig::default()
+    };
+    let gateway = Gateway::start_with(&dir, config);
+    let _browsers = [Browser::connect(gateway.web), Browser::connect(gateway.web)];
+    // A third browser's connection is closed as it comes.
+    assert_eq!(http(gateway.web, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "");
+    let (_bot, _) = Client::login(gateway.binary, 1, 101).unwrap();
 }

@@ -4,7 +4,10 @@
 //!
 //! Visitors get accounts of their own: a `register` message creates one from a range of ids
 //! kept for guests, with a random token, and saves it before answering, so it survives a
-//! restart.
+//! restart. A save that a crash or a full disk cut short leaves a last line without its
+//! newline, of an account no visitor was told of: [`Guests::load`] leaves it out, and cuts
+//! it off the file, so that the gateway still starts, and the next account gets a line of
+//! its own.
 
 pub mod http;
 pub mod json;
@@ -13,9 +16,11 @@ pub mod ws;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::accounts::{self, Account, Funds};
+use engine::storage::{FsStorage, Storage};
+
+use crate::accounts::{self, Account, AccountsError, Funds};
 use crate::exchange::Exchange;
 
 /// The page and its files, built into the binary.
@@ -72,7 +77,43 @@ pub struct Guests {
     pub funds: Option<Funds>,
 }
 
+/// Why the guests' file could not be loaded.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Reading the file, or cutting off an unfinished last line, failed.
+    Io(io::Error),
+    /// A finished line is not an account.
+    Accounts(AccountsError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Io(error) => write!(f, "{error}"),
+            LoadError::Accounts(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 impl Guests {
+    /// The accounts saved in the guests' file at `path`, with ids below `max_owners`. A last
+    /// line without its newline is left out, and cut off the file.
+    pub fn load(path: &Path, max_owners: u32) -> Result<Vec<Account>, LoadError> {
+        let text = std::fs::read_to_string(path).map_err(LoadError::Io)?;
+        let whole = text.rfind('\n').map_or(0, |end| end + 1);
+        if whole < text.len() {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(LoadError::Io)?;
+            file.set_len(whole as u64).map_err(LoadError::Io)?;
+            file.sync_all().map_err(LoadError::Io)?;
+        }
+        accounts::parse(&text[..whole], max_owners).map_err(LoadError::Accounts)
+    }
+
     /// Creates an account for a visitor, adds it to `exchange`, and saves it. Returns
     /// `None` if every id is taken.
     pub fn create(&mut self, exchange: &mut Exchange) -> io::Result<Option<Account>> {
@@ -88,11 +129,17 @@ impl Guests {
             messages_per_second: self.messages_per_second,
             funds: self.funds,
         };
-        // Saved before it is used: an account the visitor was told of exists after a crash.
+        // Saved before it is used: an account the visitor was told of exists after a crash,
+        // and so does the file it is in.
         if let Some(path) = &self.file {
+            let created = !path.exists();
             let mut file = OpenOptions::new().create(true).append(true).open(path)?;
             writeln!(file, "{}", accounts::format(&account))?;
             file.sync_data()?;
+            if created {
+                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+                FsStorage.sync_dir(dir.unwrap_or(Path::new(".")))?;
+            }
         }
         exchange
             .add_account(account)
@@ -121,5 +168,26 @@ mod tests {
 
     fn page_bytes(path: &str) -> &'static [u8] {
         page(path).unwrap().1
+    }
+
+    /// A save cut short leaves a last line without its newline: it is left out, and cut
+    /// off the file, so the next account starts on a line of its own.
+    #[test]
+    fn an_unfinished_last_guest_is_left_out() {
+        let path = std::env::temp_dir().join(format!("guests-{}.txt", std::process::id()));
+        std::fs::write(&path, "10 42 5 20 1000 10\n11 99 5 2").unwrap();
+        let loaded = Guests::load(&path, 64).unwrap();
+        assert_eq!(loaded.iter().map(|a| a.id).collect::<Vec<_>>(), [10]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "10 42 5 20 1000 10\n"
+        );
+        // A finished line that is not an account is an error, as in any accounts file.
+        std::fs::write(&path, "10 42 5 20 1000 10\nnot an account\n").unwrap();
+        assert!(matches!(
+            Guests::load(&path, 64),
+            Err(LoadError::Accounts(_))
+        ));
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -189,7 +189,9 @@ fn run() -> Result<(), String> {
 
     let mut accounts = read_accounts(Path::new(&accounts_file), book.max_owners)?;
     if web.is_some() && guests_file.exists() {
-        accounts.extend(read_accounts(&guests_file, book.max_owners)?);
+        let guests = Guests::load(&guests_file, book.max_owners)
+            .map_err(|e| format!("{}: {e}", guests_file.display()))?;
+        accounts.extend(guests);
     }
     let guests = Guests {
         file: Some(guests_file),

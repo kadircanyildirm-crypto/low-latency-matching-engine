@@ -1,10 +1,12 @@
-# The public demo: the exchange, its bots, and Caddy in front for HTTPS.
+# The public demo: the exchange, the mirror of Bitstamp's ETH/USD market that fills its
+# book with real orders and trades, and Caddy in front for HTTPS.
 #
-#   DOMAIN=demo.example.com docker compose -f deploy/compose.yaml up -d --build
+#   DOMAIN=demo.example.com PUBLIC_URL=https://demo.example.com \
+#     docker compose -f deploy/compose.yaml up -d --build
 #
 # Only Caddy is reachable from outside, on ports 80 and 443; the binary protocol's port
-# stays on the compose network, for the bots. deploy/bots.txt holds the bots' accounts:
-# make it with deploy/make-accounts.sh before the first start.
+# stays on the compose network, for the mirror. deploy/bots.txt holds the accounts the
+# mirror uses, its first two: make it with deploy/make-accounts.sh before the first start.
 services:
   exchange:
     build:
@@ -21,6 +23,28 @@ services:
       - 0.0.0.0:8080
       - --max-orders
       - "200000"
+      # ETH/USD as Bitstamp quotes it: prices in cents, quantities in millionths of an
+      # ether, prices from $500 to $10,000.
+      - --symbol
+      - ETH/USD
+      - --price-decimals
+      - "2"
+      - --lot-decimals
+      - "6"
+      - --min-price
+      - "50000"
+      - --max-price
+      - "1000000"
+      # Each visitor starts with $100,000 (in cents times millionths of an ether) and 10
+      # ether.
+      - --guest-cash
+      - "10000000000000"
+      - --guest-position
+      - "10000000"
+      - --source
+      - Bitstamp
+      - --source-url
+      - https://www.bitstamp.net/markets/eth/usd/
       # Where the page is published, for its link preview: https://$DOMAIN.
       - --public-url
       - ${PUBLIC_URL:-}
@@ -29,11 +53,11 @@ services:
       - ./bots.txt:/etc/exchange/bots.txt:ro
     restart: unless-stopped
 
-  bots:
+  mirror:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    entrypoint: ["bots"]
+    entrypoint: ["mirror"]
     command: ["--accounts", "/etc/exchange/bots.txt", "--connect", "exchange:9000"]
     volumes:
       - ./bots.txt:/etc/exchange/bots.txt:ro

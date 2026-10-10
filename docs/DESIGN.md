@@ -1348,6 +1348,46 @@ that traded, ranked by what they made with both what they hold and what they sta
 with valued at the last trade price, and its own place among them. Order ids and
 account numbers are all a browser learns of other traders, as on a market-by-order feed.
 
+### A real market
+
+`mirror` fills the book with a real market's orders. It reads Bitstamp's public WebSocket,
+which needs no account: `detail_order_book_ethusd`, the best hundred orders of each side
+with their ids, sent again whenever they change, a few times a second; and
+`live_trades_ethusd`, every trade with its taker's side. Prices and quantities come as
+decimal strings and are read exactly, as cents and millionths of an ether; a number with
+more decimals is refused rather than rounded.
+
+Every quarter of a second the mirror brings its orders into line with the venue's orders
+at the best 20 prices of each side. Each of its orders stands for one of the venue's, by
+id. It cancels those the venue no longer has, first, so that a side moving across never
+meets the mirror's own; it modifies those whose quantity or price changed, which keeps an
+order's place in its queue when it only shrinks, as on the venue; and it places the
+venue's new orders in the venue's order, so that they queue as there. It learns what
+became of its orders from the exchange's reports. A modify sets an order's total, so one
+computed before a fill was reported leaves too little; the next round sees it and puts it
+right, which is why the mirror follows the book every round, changed or not, and why it
+waits a tenth of a second after sending a trade again. An order filled completely, by the
+tape or a visitor, is placed again while the venue still has it: visitors trade against
+the venue's prices and sizes, not its scarcity.
+
+Each venue trade is sent again from a second account, so that self-trade prevention
+never stops it, as an immediate-or-cancel order on the taker's side for the same
+quantity at the same price: it trades with the mirrored orders at that price, or with a
+visitor's better one, and never through the price. If the venue's connection drops or
+sends nothing for half a minute, the mirror cancels all its orders rather than show a book
+that is no longer real, and connects again, waiting longer each time. If the gateway's
+connection drops, the exchange cancels them itself, and the mirror logs in again.
+
+It lives in a workspace of its own, `mirror/`, like the fuzz targets: building the
+engine's workspace never compiles a TLS stack, and `ring` there names only the ring
+buffer, while rustls brings a crypto crate of that name. Its dependencies are pinned to
+releases more than two weeks old.
+
+Bitstamp asks those who use its data commercially to sign a data licence; Coinbase limits
+its public data to personal and research use, Kraken asks for permission, and Binance's
+historical archive is licensed for non-commercial use only. This demo is not commercial,
+and the page credits Bitstamp.
+
 ### Deployment
 
 The page carries a link preview for sites like LinkedIn: a title, a description and a
@@ -1365,6 +1405,8 @@ outside, and the exchange's directory is a volume. CI builds the image on every 
 |---|---|
 | `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
 | `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles after each subscription, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
+| `mirror/src/*` | Decimals read exactly, and every malformed or too-fine one refused; Bitstamp's book, trade and reconnect messages; the mirror placing the venue's orders in order, nothing twice while on its way, cancels before changes before new orders, a shrink that keeps the order's place, a refused modify tried again, a filled order placed again, a refused one forgotten. |
+| `mirror/tests/exchange.rs` | The mirror against a real exchange over real sockets: after each of three venue books, the exchange's book holds the venue's orders at the followed prices, level by level; trades sent again trade at the venue's price; and a modify that raced a fill is put right. |
 | `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |
 | `crates/gateway/src/web/json.rs` | The queues of the best levels, order by order, with those past the first 24 summed; every command kind in the engine log with each part of its outcome; the leaderboard, a browser's rank, and which bucket a turn of any length falls in. |
 | `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. The engine log tells each command once, in sequence, only after all its events came, with its trades, what rested, a refusal, and what a mass cancel took off; paper accounts that traded are ranked by profit at the last trade price. |

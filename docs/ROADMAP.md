@@ -10,7 +10,7 @@ documented are worth more than five half-finished ones.
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ✅ Done |
 | 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ✅ Done |
-| 5 | Public web demo: paper trading against bots, live order book | 🚀 Built; waits for a server |
+| 5 | Public web demo: paper trading against a live mirror of a real market | 🚀 Built; waits for a server |
 | 6 | End-to-end measurement and optimisation on Linux | — |
 | 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
 | 8 | Hot standby replication and failover | — |
@@ -214,7 +214,11 @@ the Capital Markets Board, SPK), customer identification and custody, and is out
   visitor's open orders and fills, the paper account with profit.
 - Paper-trading accounts created on a visitor's first visit, with a starting balance, and
   balance and position checks before an order is accepted, with holds and settlement.
-- Bots: market makers, noise traders, a trend follower.
+- A real market: `mirror` places the orders resting near the top of Bitstamp's ETH/USD book
+  on the exchange's book, as they are there, and sends Bitstamp's trades again as they
+  happen. Bots make a synthetic market where the network is not there.
+- Bots: market makers, noise traders, a trend follower, passive traders, an iceberg, stops,
+  a whale.
 - A live performance panel: commands per second, and how long the engine's turns take.
 - The market keeps running across restarts: the exchange's state is checkpointed and
   rebuilt from the journal after the checkpoint, which the engine now replays with its
@@ -222,7 +226,7 @@ the Capital Markets Board, SPK), customer identification and custody, and is out
 - An image, a compose file with HTTPS in front, and a guide (`deploy/README.md`); CI builds
   the image.
 
-**Acceptance criteria:** the public link works; a visitor can trade against the bots; the
+**Acceptance criteria:** the public link works; a visitor can trade against the market; the
 market keeps running across a restart of the server. The last two are met locally and in
 tests (`crates/gateway/tests/web.rs`, `tests/recovery.rs`); the first waits for a server.
 

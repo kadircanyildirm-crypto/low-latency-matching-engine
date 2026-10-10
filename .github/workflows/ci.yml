@@ -56,6 +56,25 @@ jobs:
           RUSTFLAGS: --cfg loom
           CARGO_TARGET_DIR: target/loom
 
+  # The mirror of a real market, a workspace of its own: its formatting, lints and tests,
+  # one of them against a real exchange. None reaches the venue.
+  mirror:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mirror
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mirror
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
   # The public demo's image builds, and its compose file is valid (deploy/README.md).
   deploy:
     runs-on: ubuntu-latest
@@ -68,7 +87,7 @@ jobs:
       - run: docker build -f deploy/Dockerfile -t exchange-demo .
       - name: The image's programs run, and answer with their usage
         run: |
-          for program in gateway bots; do
+          for program in gateway bots mirror; do
             out=$(docker run --rm --entrypoint "$program" exchange-demo --help 2>&1 || true)
             echo "$out" | grep -q usage
           done

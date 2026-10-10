@@ -1,6 +1,7 @@
 # Only the sources go into the image's build.
 target
 fuzz/target
+mirror/target
 fuzz/corpus
 fuzz/artifacts
 compare/target

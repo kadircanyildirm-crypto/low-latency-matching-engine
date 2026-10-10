@@ -1918,6 +1918,10 @@ function setMarket(message) {
     link.rel = "noopener noreferrer";
     link.textContent = market.source;
     sub.replaceChildren("Real orders and trades, mirrored live from ", link, " · paper money");
+    $("about-lede").textContent = `Every order you place here goes through a working exchange: it is numbered, `
+      + `written to a journal, matched, and settled in your paper account. The other orders on the book are `
+      + `real: the ${market.symbol} orders resting on ${market.source}, placed here as they are there, `
+      + `and its trades sent again as they happen. Nothing on this page involves real funds.`;
   } else sub.textContent = "Paper market · traded by bots and you";
   if (changed) $("qty").value = market.lot_decimals > 0 ? "0.1" : "10";
   schedule("book", "trades", "chart", "ticker", "wallet", "orders", "ticket", "leaders");

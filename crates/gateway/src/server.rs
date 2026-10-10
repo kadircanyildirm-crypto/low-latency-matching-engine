@@ -274,6 +274,11 @@ impl<C: Core> Server<C> {
         let mut exchange = exchange;
         exchange.set_epoch(unix_millis() / 1_000);
         let started = Instant::now();
+        // Commands per second count from where the exchange starts, not from zero.
+        let stats = Stats {
+            seq: exchange.last_seq(),
+            ..Stats::default()
+        };
         Ok(Server {
             exchange,
             core,
@@ -293,7 +298,7 @@ impl<C: Core> Server<C> {
             ready: Vec::new(),
             scratch: vec![0; READ_CHUNK].into_boxed_slice(),
             started,
-            stats: Stats::default(),
+            stats,
             last_tick: 0,
             last_show: 0,
             shown_queues: String::new(),
@@ -947,4 +952,31 @@ fn flush(connection: &mut Connection) -> io::Result<()> {
     }
     connection.output.drain(..written);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use engine::sim::SimStorage;
+    use engine::{Discard, Engine, EngineConfig};
+    use orderbook::BookConfig;
+
+    use super::*;
+    use crate::Timing;
+
+    /// An exchange recovered after a million commands has not taken them in its first
+    /// second.
+    #[test]
+    fn commands_per_second_count_from_where_the_exchange_starts() {
+        let config = EngineConfig::new(BookConfig::new(1, 1_000, 64));
+        let (engine, _) =
+            Engine::open_with(SimStorage::new(), Path::new("data"), config, &mut Discard).unwrap();
+        let exchange = Exchange::new(engine.book(), 1_000_000, &[], Timing::default()).unwrap();
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Server::bind(exchange, engine, addr, ServerConfig::default()).unwrap();
+        server.publish_stats(1_000_000_000);
+        let stats = server.recent_stats.back().copied().unwrap();
+        assert_eq!(stats.commands_per_second, 0);
+    }
 }

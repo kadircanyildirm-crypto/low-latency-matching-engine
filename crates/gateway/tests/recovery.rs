@@ -1,7 +1,7 @@
 //! The exchange across crashes: paper money and every open order's account and client
 //! reference come back from the newest checkpoint and the journal after it, exactly as they
-//! were; a damaged checkpoint falls back to the one before, and one that disagrees with the
-//! book is refused.
+//! were, or from the whole journal before the first checkpoint; a damaged checkpoint falls
+//! back to the one before, and one that disagrees with the book is refused.
 
 use std::path::Path;
 
@@ -64,14 +64,15 @@ fn open(storage: &SimStorage) -> (Engine<SimStorage>, Exchange, recovery::Recove
     .unwrap()
 }
 
-/// Trades for `steps`, saving a checkpoint now and then; returns the exchange's exact state
-/// at the end, and the sequence number of the last checkpoint saved.
+/// Trades for `steps`, saving a checkpoint now and then if `checkpoints`; returns the
+/// exchange's exact state at the end, and the sequence number of the last checkpoint saved.
 fn trade(
     storage: &SimStorage,
     engine: &mut Engine<SimStorage>,
     exchange: &mut Exchange,
     seed: u64,
     steps: u64,
+    checkpoints: bool,
 ) -> (Checkpoint, Option<u64>) {
     let mut rng = SplitMix64::new(seed);
     for session in 0..4 {
@@ -110,7 +111,7 @@ fn trade(
         exchange.receive(session, message, 1, &mut Nobody);
         if rng.below(3) == 0 {
             exchange.flush(engine, &mut Nobody).unwrap();
-            if rng.below(8) == 0 {
+            if rng.below(8) == 0 && checkpoints {
                 let checkpoint = exchange.checkpoint().expect("nothing is in flight");
                 recovery::save(&mut storage.clone(), Path::new(DIR), &checkpoint).unwrap();
                 saved = Some(checkpoint.seq);
@@ -128,7 +129,7 @@ fn the_exchange_comes_back_from_a_crash() {
         let storage = SimStorage::new();
         let (mut engine, mut exchange, recovered) = open(&storage);
         assert_eq!(recovered.checkpoint, None);
-        let (state, saved) = trade(&storage, &mut engine, &mut exchange, seed, 400);
+        let (state, saved) = trade(&storage, &mut engine, &mut exchange, seed, 400, true);
         let mut rng = SplitMix64::new(seed);
         let model = if seed % 2 == 0 {
             CrashModel::InOrder
@@ -137,14 +138,29 @@ fn the_exchange_comes_back_from_a_crash() {
         };
         let crashed = storage.crash(&mut rng, model);
         drop((engine, exchange));
-        let (engine, exchange, recovered) = open(&crashed);
+        let opened = recovery::open(
+            crashed,
+            Path::new(DIR),
+            config(),
+            &accounts(),
+            Timing::default(),
+        );
+        let (engine, exchange, recovered) = match opened {
+            Ok(opened) => opened,
+            // With no checkpoint, the whole journal is needed, and snapshots may have taken
+            // its start: opening refuses rather than guess.
+            Err(RecoveryError::Engine(engine::Error::MissingJournal { .. })) if saved.is_none() => {
+                continue;
+            }
+            Err(error) => panic!("seed {seed}: {error}"),
+        };
         assert_eq!(recovered.checkpoint, saved, "seed {seed}");
         // Every command was synced before its events were delivered.
         assert_eq!(engine.last_seq(), state.seq, "seed {seed}");
-        let Some(from) = saved else {
-            continue;
-        };
-        recovered_from_checkpoints += 1;
+        let from = saved.unwrap_or(0);
+        if saved.is_some() {
+            recovered_from_checkpoints += 1;
+        }
         assert_eq!(recovered.replayed, state.seq - from);
         let mut expected = state.clone();
         // The orders placed after the checkpoint have lost their client references.
@@ -161,17 +177,45 @@ fn the_exchange_comes_back_from_a_crash() {
     assert!(recovered_from_checkpoints > 30);
 }
 
+/// A crash before the first checkpoint loses no money: the exchange comes back from the
+/// whole journal, not from the book alone, which would give every account its starting
+/// money back.
+#[test]
+fn a_crash_before_the_first_checkpoint_loses_no_money() {
+    let storage = SimStorage::new();
+    let (mut engine, mut exchange, _) = open(&storage);
+    let (state, saved) = trade(&storage, &mut engine, &mut exchange, 11, 60, false);
+    assert_eq!(saved, None);
+    let untouched = Funds {
+        cash: 50_000,
+        position: 300,
+    };
+    assert!(
+        state
+            .wallets
+            .iter()
+            .any(|w| (w.cash, w.position) != (untouched.cash, untouched.position)),
+        "nothing traded"
+    );
+    drop((engine, exchange));
+    let (engine, exchange, recovered) = open(&storage);
+    assert_eq!(recovered.checkpoint, None);
+    assert_eq!(recovered.replayed, state.seq);
+    assert_eq!(engine.last_seq(), state.seq);
+    assert_eq!(exchange.checkpoint().unwrap().wallets, state.wallets);
+}
+
 #[test]
 fn a_damaged_checkpoint_falls_back_to_the_one_before() {
     let storage = SimStorage::new();
     let (mut engine, mut exchange, _) = open(&storage);
-    let (_, _) = trade(&storage, &mut engine, &mut exchange, 7, 50);
+    let (_, _) = trade(&storage, &mut engine, &mut exchange, 7, 50, true);
     let first = exchange.checkpoint().unwrap();
     recovery::save(&mut storage.clone(), Path::new(DIR), &first).unwrap();
     for session in 0..4 {
         exchange.detach(session);
     }
-    let (state, _) = trade(&storage, &mut engine, &mut exchange, 8, 50);
+    let (state, _) = trade(&storage, &mut engine, &mut exchange, 8, 50, true);
     recovery::save(&mut storage.clone(), Path::new(DIR), &state).unwrap();
     drop((engine, exchange));
     // Two checkpoints are kept: the newest, and the one before.
@@ -203,7 +247,7 @@ fn a_damaged_checkpoint_falls_back_to_the_one_before() {
 fn a_checkpoint_that_disagrees_with_the_book_is_refused() {
     let storage = SimStorage::new();
     let (mut engine, mut exchange, _) = open(&storage);
-    let (mut state, _) = trade(&storage, &mut engine, &mut exchange, 9, 80);
+    let (mut state, _) = trade(&storage, &mut engine, &mut exchange, 9, 80, true);
     drop((engine, exchange));
     // An order the book never had.
     state.orders.push(gateway::exchange::SavedOrder {

@@ -7,6 +7,11 @@
 //! ([`engine::Output::resume_after`]). It then checks that the orders it knows are exactly
 //! those on the recovered book.
 //!
+//! Before the first checkpoint, or if none reads, the exchange is rebuilt from the whole
+//! journal, from the first command: never from the book alone, which would give every paper
+//! account its starting money back. If the journal no longer reaches back that far, opening
+//! fails rather than guess.
+//!
 //! A checkpoint is written to a temporary file, synced, renamed into place and the
 //! directory synced, so a crash leaves the old one or the new one, never half of one; the
 //! one before it is kept too. The journal must still reach back to the checkpoint: it is
@@ -18,7 +23,7 @@ use std::path::Path;
 
 use engine::storage::{Storage, StorageFile};
 use engine::{Engine, EngineConfig, Output, Seq};
-use orderbook::{Command, Event};
+use orderbook::{Command, Event, OrderBook};
 
 use crate::accounts::Account;
 use crate::exchange::{Checkpoint, Exchange, SetupError, Timing};
@@ -145,7 +150,7 @@ pub struct Recovered {
 }
 
 /// Opens the engine in `dir` and the exchange in front of it, for `accounts`: from the
-/// newest checkpoint and the journal after it if there is one, from the book alone if not.
+/// newest checkpoint and the journal after it, or from the whole journal if there is none.
 pub fn open<S: Storage>(
     mut storage: S,
     dir: &Path,
@@ -158,25 +163,19 @@ pub fn open<S: Storage>(
             storage.remove(&dir.join(name)).map_err(RecoveryError::Io)?;
         }
     }
-    let Some(checkpoint) = latest(&mut storage, dir).map_err(RecoveryError::Io)? else {
-        let (engine, _) = Engine::open_with(storage, dir, config, &mut engine::Discard)
-            .map_err(RecoveryError::Engine)?;
-        let exchange = Exchange::new(engine.book(), engine.last_seq(), accounts, timing)
-            .map_err(RecoveryError::Setup)?;
-        let recovered = Recovered {
-            checkpoint: None,
-            replayed: 0,
-        };
-        return Ok((engine, exchange, recovered));
-    };
+    let checkpoint = latest(&mut storage, dir).map_err(RecoveryError::Io)?;
     let mut replay = Replay {
-        after: checkpoint.seq,
+        after: checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.seq),
         records: Vec::new(),
     };
     let (engine, _) =
         Engine::open_with(storage, dir, config, &mut replay).map_err(RecoveryError::Engine)?;
-    let mut exchange = Exchange::restore(&checkpoint, &config.book, accounts, timing)
-        .map_err(RecoveryError::Setup)?;
+    let mut exchange = match &checkpoint {
+        Some(checkpoint) => Exchange::restore(checkpoint, &config.book, accounts, timing),
+        // The exchange before the first command, which the whole journal follows.
+        None => Exchange::new(&OrderBook::new(config.book), 0, accounts, timing),
+    }
+    .map_err(RecoveryError::Setup)?;
     let mut replayed = 0;
     for (seq, record) in replay.records {
         match record {
@@ -198,7 +197,7 @@ pub fn open<S: Storage>(
         .finish(engine.book())
         .map_err(RecoveryError::Inconsistent)?;
     let recovered = Recovered {
-        checkpoint: Some(checkpoint.seq),
+        checkpoint: checkpoint.map(|checkpoint| checkpoint.seq),
         replayed,
     };
     Ok((engine, exchange, recovered))

@@ -227,7 +227,7 @@ fn run() -> Result<(), String> {
                 "its checkpoint at {seq} and {} commands after it",
                 recovered.replayed
             ),
-            None => "the book alone".to_owned(),
+            None => format!("the whole journal, {} commands", recovered.replayed),
         }
     );
     let setup = Setup {

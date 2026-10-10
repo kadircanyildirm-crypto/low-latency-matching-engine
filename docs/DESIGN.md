@@ -1309,6 +1309,12 @@ otherwise. The journal must reach back to the checkpoint, which is why checkpoin
 most every `--snapshot-every` commands: retention keeps the journal after the oldest kept
 snapshot.
 
+Before the first checkpoint, or if none reads, the exchange starts from where it stood
+before the first command, and the engine replays the whole journal to it. It used to start
+from the book alone, which keeps the orders but gives every paper account its starting
+money back: a crash in the first ten thousand commands erased every trade's settlement. If
+the journal no longer reaches back to the first command, opening fails rather than guess.
+
 ### Bots and the page
 
 Bots are ordinary clients of the binary protocol with accounts of their own, watching the

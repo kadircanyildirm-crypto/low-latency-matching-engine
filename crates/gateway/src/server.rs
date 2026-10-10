@@ -27,7 +27,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use protocol::{LogoutReason, Outbound, decode_inbound, encode_outbound};
 
-use crate::exchange::{Exchange, Mailbox, SessionId};
+use crate::exchange::{Exchange, Logged, Mailbox, SessionId};
 use crate::recovery;
 use crate::web::json::{self, WebIn};
 use crate::web::{self, Guests, http, ws};
@@ -141,6 +141,18 @@ const READ_CHUNK: usize = 64 << 10;
 /// otherwise keep the loop reading it, and its commands would fill one huge batch.
 const READ_BUDGET: usize = 16;
 
+/// How often subscribed browsers are shown the queues and the engine log, in nanoseconds.
+const SHOW_EVERY: u64 = 200_000_000;
+
+/// Levels of each side shown order by order.
+const QUEUE_LEVELS: usize = 10;
+
+/// Commands of the engine log shown each time at most: the latest.
+const LOG_SHOWN: usize = 12;
+
+/// Paper accounts on the leaderboard.
+const LEADERS: usize = 10;
+
 /// What a connection speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -231,6 +243,12 @@ pub struct Server<C: Core> {
     started: Instant,
     stats: Stats,
     last_tick: u64,
+    /// When browsers were last shown the queues and the engine log.
+    last_show: u64,
+    /// The queues as last shown.
+    shown_queues: String,
+    /// Scratch space for the engine log.
+    logged: Vec<Logged>,
 }
 
 impl<C: Core> Server<C> {
@@ -270,6 +288,9 @@ impl<C: Core> Server<C> {
             started,
             stats: Stats::default(),
             last_tick: 0,
+            last_show: 0,
+            shown_queues: String::new(),
+            logged: Vec::new(),
         })
     }
 
@@ -412,6 +433,10 @@ impl<C: Core> Server<C> {
             self.publish_stats(now);
         }
         self.exchange.publish(&mut self.wires);
+        if now.saturating_sub(self.last_show) >= SHOW_EVERY {
+            self.last_show = now;
+            self.show();
+        }
         if now.saturating_sub(self.last_tick) >= self.config.tick.as_nanos() as u64 {
             self.last_tick = now;
             self.exchange.tick(now, &mut self.wires);
@@ -622,11 +647,13 @@ impl<C: Core> Server<C> {
             Some(inbound) => {
                 self.exchange
                     .receive(session, inbound, now, &mut self.wires);
-                // A browser's chart starts from the last hour.
+                // A browser's chart starts from the last hour, and its queues from now.
                 if message == WebIn::Subscribe && self.exchange.is_subscribed(session) {
                     let history =
                         json::history(crate::candles::INTERVAL, self.exchange.candles().iter());
                     self.send_web(session, &history);
+                    let queues = json::queues(self.exchange.depth(), QUEUE_LEVELS);
+                    self.send_web(session, &queues);
                 }
             }
             None => {
@@ -657,7 +684,12 @@ impl<C: Core> Server<C> {
             .flatten()
             .filter(|c| !matches!(c.kind, Kind::Http { .. }))
             .count();
+        let mut turn_buckets = [0; json::TURN_BUCKETS];
+        for &turn in &turns {
+            turn_buckets[json::turn_bucket(turn)] += 1;
+        }
         let stats = json::Stats {
+            turn_buckets,
             commands_per_second: (commands as f64 / seconds.max(1e-9)).round() as u64,
             turn_p50_ns: at(0.5).unwrap_or(0),
             turn_p99_ns: at(0.99).unwrap_or(0),
@@ -678,6 +710,68 @@ impl<C: Core> Server<C> {
             seq: self.exchange.last_seq(),
             turns,
         };
+        self.publish_leaders();
+    }
+
+    /// Shows subscribed browsers the most profitable paper accounts, and each logged-in
+    /// browser whose account traded its own place.
+    fn publish_leaders(&mut self) {
+        let standings = self.exchange.standings();
+        if standings.is_empty() {
+            return;
+        }
+        let shown = standings.len().min(LEADERS);
+        let text = json::leaders(&standings[..shown], standings.len());
+        self.send_watchers(&text);
+        for session in 0..self.wires.slots.len() {
+            let Some(account) = self.exchange.account_of(session) else {
+                continue;
+            };
+            if !self.watches(session) {
+                continue;
+            }
+            if let Some(at) = standings.iter().position(|s| s.account == account) {
+                self.send_web(session, &json::rank(at + 1, standings.len()));
+            }
+        }
+    }
+
+    /// Shows subscribed browsers the queues, if they changed, and the commands the engine
+    /// has sequenced since the last time, the latest of them.
+    fn show(&mut self) {
+        let idle = !self.exchange.has_batch() && !self.core.busy();
+        self.logged.clear();
+        self.exchange.take_log(idle, &mut self.logged);
+        if !(0..self.wires.slots.len()).any(|session| self.watches(session)) {
+            return;
+        }
+        let queues = json::queues(self.exchange.depth(), QUEUE_LEVELS);
+        if queues != self.shown_queues {
+            self.send_watchers(&queues);
+            self.shown_queues = queues;
+        }
+        if !self.logged.is_empty() {
+            let skipped = self.logged.len().saturating_sub(LOG_SHOWN);
+            let text = json::log(skipped, &self.logged[skipped..]);
+            self.send_watchers(&text);
+        }
+    }
+
+    /// Whether `session` is a browser that subscribed to the market data.
+    fn watches(&self, session: SessionId) -> bool {
+        self.wires.slots[session]
+            .as_ref()
+            .is_some_and(|c| matches!(c.kind, Kind::WebSocket { .. }) && !c.closing)
+            && self.exchange.is_subscribed(session)
+    }
+
+    /// Sends `text` to every browser that subscribed to the market data.
+    fn send_watchers(&mut self, text: &str) {
+        for session in 0..self.wires.slots.len() {
+            if self.watches(session) {
+                self.send_web(session, text);
+            }
+        }
     }
 
     /// Creates an account for the browser on `session`: one per connection.

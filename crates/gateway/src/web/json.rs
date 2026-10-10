@@ -7,12 +7,20 @@
 //!
 //! Exchange to client: the binary protocol's messages under snake-case names
 //! (`login_accepted`, `login_rejected`, `heartbeat`, `logout`, `reject`, `report`, `book`,
-//! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error` (`message`). Codes
-//! such as reasons and sides are snake-case strings. Tokens are 16 hexadecimal digits.
+//! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error`
+//! (`message`). A subscribed browser also gets `history` (the last hour as candles),
+//! `queues` (the best levels order by order), `log` (the commands the engine sequenced, with
+//! what came of them), `leaders` (the most profitable paper accounts) and `rank` (its own
+//! place among them); every browser gets `stats`. Codes such as reasons and sides are
+//! snake-case strings. Tokens are 16 hexadecimal digits.
 
 use std::fmt::Debug;
 
-use orderbook::{Side, TimeInForce};
+use marketdata::Depth;
+use orderbook::{Command, Side, TimeInForce};
+use serde_json::{Value, json};
+
+use crate::exchange::{Logged, Standing};
 use protocol::{Inbound, NewOrder, OrderKind, Outbound, ReportKind, VERSION};
 use serde::{Deserialize, Serialize};
 
@@ -451,6 +459,136 @@ pub struct Stats {
     /// The server's clock, in milliseconds since the Unix epoch, so a browser can place
     /// trades in the candles it has from the server.
     pub time: u64,
+    /// How many of those turns took how long: the first bucket counts turns under a
+    /// microsecond, bucket `i` from 1 to 16 those from 2^(i-1) up to 2^i microseconds, and
+    /// the last the turns of 65.536 ms or more.
+    pub turn_buckets: [u64; TURN_BUCKETS],
+}
+
+/// Buckets of [`Stats::turn_buckets`].
+pub const TURN_BUCKETS: usize = 18;
+
+/// The bucket of [`Stats::turn_buckets`] a turn of `ns` nanoseconds falls in.
+pub fn turn_bucket(ns: u64) -> usize {
+    let micros = ns / 1_000;
+    let doublings = (u64::BITS - micros.leading_zeros()) as usize;
+    doublings.min(TURN_BUCKETS - 1)
+}
+
+/// Orders shown at most at a level of [`queues`]; those behind them come summed.
+pub const QUEUE_SHOWN: usize = 24;
+
+/// The JSON for the best `levels` levels of each side, order by order: `buy` and `sell`,
+/// best first, each level `[price, [id, qty, id, qty, ...]]` with its orders in the order
+/// they trade and the quantity they show. Past [`QUEUE_SHOWN`] orders, the others come as
+/// one entry with id 0 and their total.
+pub fn queues(depth: &Depth, levels: usize) -> String {
+    let half = |side| -> Vec<Value> {
+        depth
+            .levels(side)
+            .take(levels)
+            .map(|(price, _)| {
+                let mut flat = Vec::new();
+                let (mut behind, mut rest) = (0, 0);
+                for entry in depth.queue(side, price) {
+                    if flat.len() < 2 * QUEUE_SHOWN {
+                        flat.extend([entry.id, entry.visible]);
+                    } else {
+                        behind += 1;
+                        rest += entry.visible;
+                    }
+                }
+                if behind > 0 {
+                    flat.extend([0, rest]);
+                }
+                json!([price, flat])
+            })
+            .collect()
+    };
+    json!({"type": "queues", "buy": half(Side::Buy), "sell": half(Side::Sell)}).to_string()
+}
+
+/// The JSON for commands of the engine log, oldest first, after `skipped` older ones that
+/// are not shown. Each has its `seq`, `cmd` and fields, whether a visitor sent it
+/// (`paper`), and what came of it: `trades` and `traded`, `rested`, `cancelled` and
+/// `cancelled_qty`, `rejected`, each only if there is something to say.
+pub fn log(skipped: usize, entries: &[Logged]) -> String {
+    let entries: Vec<Value> = entries.iter().map(logged).collect();
+    json!({"type": "log", "skipped": skipped, "entries": entries}).to_string()
+}
+
+fn logged(logged: &Logged) -> Value {
+    let mut entry = match logged.command {
+        Command::Limit {
+            owner,
+            side,
+            price,
+            qty,
+            tif,
+            display,
+            ..
+        } => {
+            let mut entry = json!({"cmd": "limit", "owner": owner, "side": name(side),
+                "price": price, "qty": qty, "tif": name(tif)});
+            if let Some(display) = display {
+                entry["display"] = json!(display);
+            }
+            entry
+        }
+        Command::Market {
+            owner, side, qty, ..
+        } => json!({"cmd": "market", "owner": owner, "side": name(side), "qty": qty}),
+        Command::Stop {
+            owner,
+            side,
+            trigger,
+            limit,
+            qty,
+            ..
+        } => json!({"cmd": "stop", "owner": owner, "side": name(side), "trigger": trigger,
+            "price": limit, "qty": qty}),
+        Command::Cancel { id, owner } => json!({"cmd": "cancel", "owner": owner, "id": id}),
+        Command::Modify {
+            id,
+            owner,
+            price,
+            qty,
+        } => json!({"cmd": "modify", "owner": owner, "id": id, "price": price, "qty": qty}),
+        Command::CancelAll { owner } => json!({"cmd": "cancel_all", "owner": owner}),
+        Command::SetPhase { phase } => json!({"cmd": "set_phase", "phase": name(phase)}),
+    };
+    entry["seq"] = json!(logged.seq);
+    entry["paper"] = json!(logged.paper);
+    let outcome = logged.outcome;
+    if outcome.trades > 0 {
+        entry["trades"] = json!(outcome.trades);
+        entry["traded"] = json!(outcome.traded);
+    }
+    if outcome.rested > 0 {
+        entry["rested"] = json!(outcome.rested);
+    }
+    if outcome.cancelled > 0 {
+        entry["cancelled"] = json!(outcome.cancelled);
+        entry["cancelled_qty"] = json!(outcome.cancelled_qty);
+    }
+    if let Some(reason) = outcome.rejected {
+        entry["rejected"] = json!(name(reason));
+    }
+    entry
+}
+
+/// The JSON for the best of `standings`, out of `total` paper accounts that have traded.
+pub fn leaders(standings: &[Standing], total: usize) -> String {
+    let leaders: Vec<Value> = standings
+        .iter()
+        .map(|s| json!({"account": s.account, "value": s.value, "profit": s.profit}))
+        .collect();
+    json!({"type": "leaders", "total": total, "leaders": leaders}).to_string()
+}
+
+/// The JSON telling a browser its account's place among `of` paper accounts that traded.
+pub fn rank(rank: usize, of: usize) -> String {
+    json!({"type": "rank", "rank": rank, "of": of}).to_string()
 }
 
 /// The JSON for `stats`, with `"type": "stats"`.
@@ -668,13 +806,23 @@ mod tests {
             sessions: 7,
             orders: 8,
             time: 9,
+            turn_buckets: [1; TURN_BUCKETS],
         }))
         .unwrap();
         assert_eq!(
             stats,
             serde_json::json!({"type": "stats", "commands_per_second": 3, "turn_p50_ns": 4,
-                "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8, "time": 9})
+                "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8, "time": 9,
+                "turn_buckets": vec![1; TURN_BUCKETS]})
         );
+        let buckets = [
+            0, 999, 1_000, 1_999, 2_000, 3_999, 4_000, 65_535_999, 65_536_000,
+        ];
+        assert_eq!(
+            buckets.map(turn_bucket),
+            [0, 0, 1, 1, 2, 2, 3, 16, TURN_BUCKETS - 1]
+        );
+        assert_eq!(turn_bucket(u64::MAX), TURN_BUCKETS - 1);
         let mut candles = crate::candles::Candles::default();
         candles.record(1_000, 100, 2);
         let history: serde_json::Value =
@@ -683,6 +831,157 @@ mod tests {
             history,
             serde_json::json!({"type": "history", "interval": 5,
                 "candles": [{"t": 1000, "o": 100, "h": 100, "l": 100, "c": 100, "v": 2}]})
+        );
+    }
+
+    #[test]
+    fn what_a_browser_is_shown_of_the_engine() {
+        use crate::exchange::{Logged, Outcome, Standing};
+        use orderbook::{Event, Phase};
+        let parse = |text: String| serde_json::from_str::<Value>(&text).unwrap();
+        // Two orders at 100 and one at 101 to buy, and more than are shown at 105 to sell.
+        let mut depth = Depth::new();
+        let rest = |id, side, price, qty| Event::Rested {
+            id,
+            side,
+            price,
+            qty,
+            visible: qty,
+        };
+        for event in [
+            rest(1, Side::Buy, 100, 5),
+            rest(2, Side::Buy, 101, 3),
+            rest(3, Side::Buy, 100, 7),
+        ] {
+            depth.apply(&event);
+        }
+        for id in 0..QUEUE_SHOWN as u64 + 2 {
+            depth.apply(&rest(10 + id, Side::Sell, 105, 1 + id));
+        }
+        let mut sell: Vec<u64> = (0..QUEUE_SHOWN as u64)
+            .flat_map(|id| [10 + id, 1 + id])
+            .collect();
+        let behind = (QUEUE_SHOWN as u64 + 1) + (QUEUE_SHOWN as u64 + 2);
+        sell.extend([0, behind]);
+        assert_eq!(
+            parse(queues(&depth, 10)),
+            json!({"type": "queues", "buy": [[101, [2, 3]], [100, [1, 5, 3, 7]]],
+                "sell": [[105, sell]]})
+        );
+        assert_eq!(
+            parse(queues(&depth, 1)),
+            json!({"type": "queues", "buy": [[101, [2, 3]]], "sell": [[105, sell]]})
+        );
+
+        let entry = |seq, command, outcome| Logged {
+            seq,
+            command,
+            paper: seq % 2 == 0,
+            outcome,
+        };
+        let entries = [
+            entry(
+                7,
+                Command::Limit {
+                    id: 7,
+                    owner: 3,
+                    side: Side::Sell,
+                    price: 105,
+                    qty: 10,
+                    tif: TimeInForce::PostOnly,
+                    display: Some(2),
+                },
+                Outcome {
+                    rested: 10,
+                    ..Outcome::default()
+                },
+            ),
+            entry(
+                8,
+                Command::Market {
+                    id: 8,
+                    owner: 4,
+                    side: Side::Buy,
+                    qty: 4,
+                },
+                Outcome {
+                    trades: 2,
+                    traded: 3,
+                    cancelled: 1,
+                    cancelled_qty: 1,
+                    ..Outcome::default()
+                },
+            ),
+            entry(
+                9,
+                Command::Stop {
+                    id: 9,
+                    owner: 3,
+                    side: Side::Sell,
+                    trigger: 90,
+                    limit: None,
+                    qty: 1,
+                },
+                Outcome::default(),
+            ),
+            entry(
+                10,
+                Command::Cancel { id: 1, owner: 4 },
+                Outcome {
+                    rejected: Some(RejectReason::UnknownOrder),
+                    ..Outcome::default()
+                },
+            ),
+            entry(
+                11,
+                Command::Modify {
+                    id: 7,
+                    owner: 3,
+                    price: 104,
+                    qty: 6,
+                },
+                Outcome::default(),
+            ),
+            entry(12, Command::CancelAll { owner: 3 }, Outcome::default()),
+            entry(
+                13,
+                Command::SetPhase {
+                    phase: Phase::Halted,
+                },
+                Outcome::default(),
+            ),
+        ];
+        assert_eq!(
+            parse(log(4, &entries)),
+            json!({"type": "log", "skipped": 4, "entries": [
+                {"seq": 7, "paper": false, "cmd": "limit", "owner": 3, "side": "sell",
+                    "price": 105, "qty": 10, "tif": "post_only", "display": 2, "rested": 10},
+                {"seq": 8, "paper": true, "cmd": "market", "owner": 4, "side": "buy", "qty": 4,
+                    "trades": 2, "traded": 3, "cancelled": 1, "cancelled_qty": 1},
+                {"seq": 9, "paper": false, "cmd": "stop", "owner": 3, "side": "sell",
+                    "trigger": 90, "price": null, "qty": 1},
+                {"seq": 10, "paper": true, "cmd": "cancel", "owner": 4, "id": 1,
+                    "rejected": "unknown_order"},
+                {"seq": 11, "paper": false, "cmd": "modify", "owner": 3, "id": 7,
+                    "price": 104, "qty": 6},
+                {"seq": 12, "paper": true, "cmd": "cancel_all", "owner": 3},
+                {"seq": 13, "paper": false, "cmd": "set_phase", "phase": "halted"},
+            ]})
+        );
+
+        let standing = Standing {
+            account: 101,
+            value: 500,
+            profit: -20,
+        };
+        assert_eq!(
+            parse(leaders(&[standing], 3)),
+            json!({"type": "leaders", "total": 3,
+                "leaders": [{"account": 101, "value": 500, "profit": -20}]})
+        );
+        assert_eq!(
+            parse(rank(2, 3)),
+            json!({"type": "rank", "rank": 2, "of": 3})
         );
     }
 }

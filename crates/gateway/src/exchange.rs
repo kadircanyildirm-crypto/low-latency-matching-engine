@@ -21,7 +21,7 @@ use std::fmt;
 use engine::storage::Storage;
 use engine::{Engine, Error, Output, Seq};
 use marketdata::Depth;
-use orderbook::{Command, Event, OrderBook, OrderId, Price, Qty, Side};
+use orderbook::{Command, Event, OrderBook, OrderId, Price, Qty, RejectReason, Side};
 use protocol::{
     Inbound, LevelUpdate, LoginError, LogoutReason, NewOrder, OrderKind, Outbound, RejectCode,
     Report, ReportKind, TradeTick, VERSION,
@@ -221,6 +221,69 @@ struct InFlight {
 /// Marks commands the exchange issues itself, such as the mass cancel on a disconnect.
 const SYSTEM: SessionId = SessionId::MAX;
 
+/// Commands the engine log keeps until they are taken; older ones are dropped.
+const LOG_KEPT: usize = 256;
+
+/// A command as the engine log shows it, with what came of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Logged {
+    /// Its sequence number.
+    pub seq: Seq,
+    /// The command.
+    pub command: Command,
+    /// Whether the account it acts for trades paper money: a visitor's, not a bot's.
+    pub paper: bool,
+    /// What came of it.
+    pub outcome: Outcome,
+}
+
+/// What came of a command, from its events: those of the stops it triggered included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Trades.
+    pub trades: u32,
+    /// The quantity traded.
+    pub traded: Qty,
+    /// The quantity of the order it placed that rests on the book.
+    pub rested: Qty,
+    /// Orders cancelled, and the open quantity they took off the book.
+    pub cancelled: u32,
+    /// See `cancelled`.
+    pub cancelled_qty: Qty,
+    /// Why the command was refused, if it was.
+    pub rejected: Option<RejectReason>,
+}
+
+impl Outcome {
+    /// Takes in one event of the command `seq`.
+    fn add(&mut self, seq: Seq, event: &Event) {
+        match *event {
+            Event::Trade { qty, .. } => {
+                self.trades += 1;
+                self.traded += qty;
+            }
+            Event::Rested { id, qty, .. } if id == seq => self.rested = qty,
+            Event::Cancelled { qty, .. } => {
+                self.cancelled += 1;
+                self.cancelled_qty += qty;
+            }
+            Event::Rejected { reason, .. } => self.rejected = Some(reason),
+            _ => {}
+        }
+    }
+}
+
+/// A paper-trading account's standing, at the last trade price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+    /// The account.
+    pub account: u32,
+    /// Its cash plus its position at the last trade price.
+    pub value: i64,
+    /// Its value less what it started with, both at the last trade price.
+    pub profit: i64,
+}
+
 /// The gateway's logic.
 pub struct Exchange {
     timing: Timing,
@@ -252,6 +315,10 @@ pub struct Exchange {
     updates: Vec<LevelUpdate>,
     /// Accounts whose wallets changed since the last publication.
     changed_wallets: Vec<u32>,
+    /// The commands numbered and not yet taken from the engine log, in sequence order.
+    log: VecDeque<Logged>,
+    /// The price of the last trade delivered.
+    last_price: Option<Price>,
 }
 
 impl Exchange {
@@ -322,6 +389,8 @@ impl Exchange {
             published: last_seq,
             updates: Vec::new(),
             changed_wallets: Vec::new(),
+            log: VecDeque::new(),
+            last_price: None,
         })
     }
 
@@ -827,6 +896,72 @@ impl Exchange {
             owner,
             places,
         });
+        let paper = self
+            .accounts
+            .get(owner as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|state| state.wallet.is_some());
+        if self.log.len() == LOG_KEPT {
+            self.log.pop_front();
+        }
+        self.log.push_back(Logged {
+            seq: self.last_seq,
+            command,
+            paper,
+            outcome: Outcome::default(),
+        });
+    }
+
+    /// Takes from the engine log, into `into`, the commands whose events have all been
+    /// delivered, in sequence order. A command's events have all come once a later
+    /// command's arrive; `idle` says that every command handed over has had all its events
+    /// delivered, as when the engine has nothing left to send back. The log keeps the last
+    /// few hundred commands not taken.
+    pub fn take_log(&mut self, idle: bool, into: &mut Vec<Logged>) {
+        while let Some(logged) = self.log.front() {
+            let done = logged.seq < self.delivered || (idle && logged.seq == self.delivered);
+            if !done {
+                break;
+            }
+            into.extend(self.log.pop_front());
+        }
+    }
+
+    /// The account logged in on `session`.
+    pub fn account_of(&self, session: SessionId) -> Option<u32> {
+        self.sessions.get(session)?.as_ref()?.account
+    }
+
+    /// The paper-trading accounts that have traded, valued at the last trade price, the
+    /// most profitable first and, for equal profits, the lowest account. Empty before the
+    /// first trade.
+    pub fn standings(&self) -> Vec<Standing> {
+        let Some(mark) = self.last_price else {
+            return Vec::new();
+        };
+        let worth = |cash: i64, position: i64| {
+            let value = i128::from(cash) + i128::from(position) * i128::from(mark);
+            i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
+        };
+        let mut standings: Vec<Standing> = self
+            .accounts
+            .iter()
+            .flatten()
+            .filter_map(|state| {
+                let (wallet, funds) = (state.wallet?, state.account.funds?);
+                if (wallet.cash, wallet.position) == (funds.cash, funds.position) {
+                    return None;
+                }
+                let value = worth(wallet.cash, wallet.position);
+                Some(Standing {
+                    account: state.account.id,
+                    value,
+                    profit: value.saturating_sub(worth(funds.cash, funds.position)),
+                })
+            })
+            .collect();
+        standings.sort_unstable_by_key(|s| (std::cmp::Reverse(s.profit), s.account));
+        standings
     }
 
     /// A connection has closed. A logged-in account's orders are cancelled: a client that
@@ -1183,6 +1318,9 @@ impl Exchange {
         let command = self.command(seq);
         self.depth.apply(&event);
         self.delivered = seq;
+        if let Ok(at) = self.log.binary_search_by_key(&seq, |logged| logged.seq) {
+            self.log[at].outcome.add(seq, &event);
+        }
         if let Event::Trade {
             trade_id,
             taker_side,
@@ -1200,6 +1338,7 @@ impl Exchange {
             });
             let time = self.epoch + self.now / 1_000_000_000;
             self.candles.record(time, price, qty);
+            self.last_price = Some(price);
         }
         match event {
             Event::Accepted { id } => self.tell_owner(seq, id, ReportKind::Accepted, mail),

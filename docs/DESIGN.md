@@ -1290,7 +1290,20 @@ and a browser that subscribes is sent them after the book. The trades after that
 market data, and the server's clock, sent with the statistics, places them in the right
 candle. The candles are not saved: after a restart they start again. Every second the
 server tells it the commands per second, how long the turns that handed commands to the
-engine took, the sessions and resting orders, and its clock.
+engine took, as percentiles and as counts in buckets that double from a microsecond, the
+sessions and resting orders, and its clock.
+
+A subscribed browser is also shown the engine at work. Five times a second it gets the
+best ten levels of each side order by order, with each order's id and the quantity it
+shows in queue priority, when they changed since the last time; and the commands the
+engine sequenced since then, the latest twelve, each with what came of it: trades and
+the quantity traded, what rested, what was cancelled, why it was refused. A command is
+told once all its events have come, which is once a later command's arrive or when the
+engine has nothing left to send back; the exchange keeps the last 256 commands not yet
+told, so a server with no browser does not grow. Every second it gets the paper accounts
+that traded, ranked by what they made with both what they hold and what they started
+with valued at the last trade price, and its own place among them. Order ids and
+account numbers are all a browser learns of other traders, as on a market-by-order feed.
 
 ### Deployment
 
@@ -1303,9 +1316,10 @@ outside, and the exchange's directory is a volume. CI builds the image on every 
 | Test | What it shows |
 |---|---|
 | `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
-| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles after each subscription, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
+| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles after each subscription, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
 | `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |
-| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. |
+| `crates/gateway/src/web/json.rs` | The queues of the best levels, order by order, with those past the first 24 summed; every command kind in the engine log with each part of its outcome; the leaderboard, a browser's rank, and which bucket a turn of any length falls in. |
+| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. The engine log tells each command once, in sequence, only after all its events came, with its trades, what rested, a refusal, and what a mass cancel took off; paper accounts that traded are ranked by profit at the last trade price. |
 | `crates/gateway/tests/recovery.rs` | 40 random runs with checkpoints now and then and a power failure, in order and out of order, on the simulated disk: the exchange comes back exactly, only the client references of orders placed after the checkpoint lost. A damaged newest checkpoint falls back to the one before; one that contradicts the book is refused. |
 | `crates/engine/tests/operations.rs` | Commands reach an output before their events, live and on replay from where it stands. |
 | `crates/gateway/tests/server.rs` | Bots make a market within a second: both sides quoted, trades. |

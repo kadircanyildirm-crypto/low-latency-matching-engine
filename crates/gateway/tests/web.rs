@@ -352,6 +352,37 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let opened = candle["t"].as_u64().unwrap();
     assert!(unix_seconds().abs_diff(opened) <= 10, "{opened}");
     assert_eq!(opened % 5, 0);
+    // What is left of the order shows in its queue, under its id.
+    let queues = browser.expect("queues");
+    assert_eq!(queues["sell"], json!([[105, [id, 1]]]), "{queues}");
+    assert_eq!(queues["buy"], json!([]));
+    // The engine log tells the order and the bot's trade against it, in sequence.
+    let mut logged = Vec::new();
+    while logged.len() < 2 {
+        let log = browser.expect("log");
+        logged.extend(log["entries"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        logged[0],
+        json!({"seq": id, "paper": true, "cmd": "limit", "owner": 10, "side": "sell",
+            "price": 105, "qty": 3, "tif": "gtc", "rested": 3})
+    );
+    assert_eq!(
+        logged[1],
+        json!({"seq": id + 1, "paper": false, "cmd": "limit", "owner": 1, "side": "buy",
+            "price": 105, "qty": 2, "tif": "ioc", "trades": 1, "traded": 2})
+    );
+    // The account sold 2 at 105, its only trade: it leads, with nothing made yet.
+    let leaders = browser.expect("leaders");
+    assert_eq!(
+        leaders,
+        json!({"type": "leaders", "total": 1,
+            "leaders": [{"account": 10, "value": 100_000 + 100 * 105, "profit": 0}]})
+    );
+    assert_eq!(
+        browser.expect("rank"),
+        json!({"type": "rank", "rank": 1, "of": 1})
+    );
 
     // The browser cancels the rest, and leaves.
     browser.send(json!({"type": "cancel", "id": id}));
@@ -402,6 +433,8 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert!(stats["turn_max_ns"].as_u64().unwrap() >= stats["turn_p50_ns"].as_u64().unwrap());
     let time = stats["time"].as_u64().unwrap() / 1_000;
     assert!(unix_seconds().abs_diff(time) <= 10, "{stats}");
+    let buckets = stats["turn_buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 18, "{stats}");
 
     // A second guest gets the next id, and the third finds none left.
     let mut second = Browser::connect(gateway.web);

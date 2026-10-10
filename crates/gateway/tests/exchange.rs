@@ -1497,3 +1497,131 @@ fn trades_make_candles_at_their_time() {
     };
     assert_eq!(candles, [candle]);
 }
+
+/// The engine log has every command in sequence, with what came of it, once all its events
+/// have come; it says whether a visitor or a bot sent it.
+#[test]
+fn the_engine_log_tells_what_came_of_each_command() {
+    use gateway::exchange::Outcome;
+    let mut exchange = exchange(&[paper(1, 100_000, 100), account(2)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    logged_in(&mut exchange, 1, 2, &mut mail);
+    // The visitor offers 5 at 105; the bot takes 3 and cancels an order that is not there.
+    exchange.receive(0, limit(1, Side::Sell, 105, 5), 0, &mut mail);
+    let ioc = Inbound::NewOrder(NewOrder {
+        client_ref: 1,
+        side: Side::Buy,
+        qty: 3,
+        kind: OrderKind::Limit {
+            price: 106,
+            tif: TimeInForce::Ioc,
+            display: None,
+        },
+    });
+    exchange.receive(1, ioc, 0, &mut mail);
+    exchange.receive(1, Inbound::Cancel { order_id: 99 }, 0, &mut mail);
+    let mut logged = Vec::new();
+    // Nothing is told before its events come.
+    exchange.take_log(true, &mut logged);
+    assert!(logged.is_empty());
+    exchange.flush(&mut mail).unwrap();
+    // The last command could still have events to come, unless the engine is idle.
+    exchange.take_log(false, &mut logged);
+    assert_eq!(logged.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 2]);
+    exchange.take_log(true, &mut logged);
+    let outcomes: Vec<(u64, bool, Outcome)> =
+        logged.iter().map(|l| (l.seq, l.paper, l.outcome)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            (
+                1,
+                true,
+                Outcome {
+                    rested: 5,
+                    ..Outcome::default()
+                }
+            ),
+            (
+                2,
+                false,
+                Outcome {
+                    trades: 1,
+                    traded: 3,
+                    ..Outcome::default()
+                }
+            ),
+            (
+                3,
+                false,
+                Outcome {
+                    rejected: Some(RejectReason::UnknownOrder),
+                    ..Outcome::default()
+                }
+            ),
+        ]
+    );
+    assert!(matches!(
+        logged[0].command,
+        Command::Limit { price: 105, .. }
+    ));
+    // Taken once.
+    logged.clear();
+    exchange.take_log(true, &mut logged);
+    assert!(logged.is_empty());
+    // A mass cancel counts what it took off.
+    exchange.receive(0, Inbound::MassCancel, 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    exchange.take_log(true, &mut logged);
+    assert_eq!(
+        logged[0].outcome,
+        Outcome {
+            cancelled: 1,
+            cancelled_qty: 2,
+            ..Outcome::default()
+        }
+    );
+}
+
+/// Paper accounts that traded are ranked by what they made, valued at the last trade.
+#[test]
+fn paper_accounts_are_ranked_by_profit() {
+    let mut exchange = exchange(&[
+        paper(1, 100_000, 100),
+        paper(2, 100_000, 100),
+        paper(3, 100_000, 100),
+    ]);
+    let mut mail = Mail::default();
+    for (session, account) in [(0, 1), (1, 2), (2, 3)] {
+        logged_in(&mut exchange, session, account, &mut mail);
+    }
+    assert!(exchange.standings().is_empty(), "nothing traded yet");
+    // Account 1 sells 10 to account 2 at 100, then account 2 sells 1 to account 1 at 110.
+    exchange.receive(0, limit(1, Side::Sell, 100, 10), 0, &mut mail);
+    exchange.receive(1, limit(1, Side::Buy, 100, 10), 0, &mut mail);
+    exchange.receive(1, limit(2, Side::Sell, 110, 1), 0, &mut mail);
+    exchange.receive(0, limit(2, Side::Buy, 110, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let standings = exchange.standings();
+    // At 110, account 2 bought 10 for 1,000 and sold 1 for 110: 9 more lots, 890 less cash.
+    let start = 100_000 + 100 * 110;
+    assert_eq!(
+        standings,
+        [
+            gateway::exchange::Standing {
+                account: 2,
+                value: start - 890 + 9 * 110,
+                profit: 100,
+            },
+            gateway::exchange::Standing {
+                account: 1,
+                value: start + 890 - 9 * 110,
+                profit: -100,
+            },
+        ],
+        "account 3 never traded"
+    );
+    assert_eq!(exchange.account_of(1), Some(2));
+    assert_eq!(exchange.account_of(7), None);
+}

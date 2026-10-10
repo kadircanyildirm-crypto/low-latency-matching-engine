@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# Nothing here writes to the repository: whatever an action or a build script does, the
+# token can only read.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,6 +24,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
@@ -27,6 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -46,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -65,6 +76,8 @@ jobs:
         working-directory: mirror
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -80,6 +93,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - run: sh deploy/make-accounts.sh
       - run: docker compose -f deploy/compose.yaml config --quiet
         env:
@@ -97,6 +112,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
@@ -108,13 +125,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
       - name: Run the tests with coverage instrumentation
         run: >
           cargo llvm-cov --workspace --locked --branch
@@ -142,6 +161,8 @@ jobs:
       FUZZ_FLAGS: --sanitizer none --debug-assertions --target x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
@@ -150,7 +171,7 @@ jobs:
           workspaces: fuzz
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
       - uses: actions/cache@v5
@@ -193,6 +214,8 @@ jobs:
             harnesses: --harness owners::proofs
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: model-checking/kani-github-action@v1.1
         with:
           kani-version: '0.68.0'

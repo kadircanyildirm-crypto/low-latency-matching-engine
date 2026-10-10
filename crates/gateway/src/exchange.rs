@@ -941,7 +941,7 @@ impl Exchange {
         };
         let worth = |cash: i64, position: i64| {
             let value = i128::from(cash) + i128::from(position) * i128::from(mark);
-            i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
+            value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         };
         let mut standings: Vec<Standing> = self
             .accounts

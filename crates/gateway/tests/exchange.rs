@@ -1625,3 +1625,27 @@ fn paper_accounts_are_ranked_by_profit() {
     assert_eq!(exchange.account_of(1), Some(2));
     assert_eq!(exchange.account_of(7), None);
 }
+
+/// The engine log keeps the last 256 commands nobody took, so a gateway without browsers
+/// does not grow.
+#[test]
+fn the_engine_log_keeps_only_the_latest_commands() {
+    let mut exchange = exchange(&[account(1)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    for id in 0..300 {
+        exchange.receive(
+            0,
+            Inbound::Cancel {
+                order_id: 1_000 + id,
+            },
+            0,
+            &mut mail,
+        );
+    }
+    exchange.flush(&mut mail).unwrap();
+    let mut logged = Vec::new();
+    exchange.take_log(true, &mut logged);
+    let seqs: Vec<u64> = logged.iter().map(|l| l.seq).collect();
+    assert_eq!(seqs, (45..=300).collect::<Vec<_>>());
+}

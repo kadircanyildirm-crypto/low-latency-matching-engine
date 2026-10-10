@@ -29,6 +29,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::Account;
+use crate::candles::Candles;
 use crate::wallet::Wallet;
 
 /// A connection's handle, chosen by the network layer.
@@ -237,6 +238,10 @@ pub struct Exchange {
     now: u64,
     /// The book's depth, kept from the events.
     depth: Depth,
+    /// The last hour of trades, for charts.
+    candles: Candles,
+    /// Seconds since the Unix epoch when the clock passed to the exchange read zero.
+    epoch: u64,
     /// Trades delivered and not yet published.
     trades: Vec<TradeTick>,
     /// The sequence number of the last command whose events were delivered, and of the
@@ -310,6 +315,8 @@ impl Exchange {
             last_seq,
             now: 0,
             depth: Depth::new(),
+            candles: Candles::default(),
+            epoch: 0,
             trades: Vec::new(),
             delivered: last_seq,
             published: last_seq,
@@ -960,6 +967,23 @@ impl Exchange {
         }
     }
 
+    /// Sets what the clock passed to the exchange reads in wall-clock time: `epoch` seconds
+    /// since the Unix epoch when it reads zero. Only the candles use it.
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    /// The last hour of trades, as candles.
+    pub fn candles(&self) -> &Candles {
+        &self.candles
+    }
+
+    /// Whether `session` is logged in and told the market data.
+    pub fn is_subscribed(&self, session: SessionId) -> bool {
+        let state = self.sessions.get(session).and_then(Option::as_ref);
+        state.is_some_and(|state| state.subscribed)
+    }
+
     /// The book's depth, as the delivered events left it.
     pub fn depth(&self) -> &Depth {
         &self.depth
@@ -1174,6 +1198,8 @@ impl Exchange {
                 price,
                 qty,
             });
+            let time = self.epoch + self.now / 1_000_000_000;
+            self.candles.record(time, price, qty);
         }
         match event {
             Event::Accepted { id } => self.tell_owner(seq, id, ReportKind::Accepted, mail),

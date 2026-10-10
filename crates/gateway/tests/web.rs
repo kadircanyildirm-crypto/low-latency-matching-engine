@@ -224,6 +224,12 @@ impl Browser {
     }
 }
 
+/// The wall clock, in seconds since the Unix epoch.
+fn unix_seconds() -> u64 {
+    let now = std::time::SystemTime::now();
+    now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
 #[test]
 fn the_page_is_served_and_nothing_else() {
     let dir = TempDir::new("page");
@@ -271,6 +277,12 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert_eq!(browser.expect("login_accepted")["account"], 10);
     browser.send(json!({"type": "subscribe"}));
     assert_eq!(browser.expect("book")["levels"], 0);
+    // Nothing has traded yet.
+    let history = browser.expect("history");
+    assert_eq!(
+        (history["interval"].clone(), history["candles"].clone()),
+        (json!(5), json!([]))
+    );
     browser.send(json!({"type": "order", "ref": 1, "side": "sell", "qty": 3, "price": 105}));
     let accepted = browser.expect("report");
     assert_eq!(
@@ -311,6 +323,30 @@ fn a_browser_registers_trades_and_watches_the_market() {
     );
     assert_eq!(browser.expect("level")["qty"], 1);
     assert!(matches!(bot.receive().unwrap(), Outbound::Report(_)));
+    // A chart opened now starts from the trade, at the time it happened.
+    browser.send(json!({"type": "subscribe"}));
+    let candles = browser.expect("history")["candles"].clone();
+    let candle = &candles[0];
+    assert_eq!(candles.as_array().unwrap().len(), 1, "{candles}");
+    assert_eq!(
+        [
+            &candle["o"],
+            &candle["h"],
+            &candle["l"],
+            &candle["c"],
+            &candle["v"]
+        ],
+        [
+            &json!(105),
+            &json!(105),
+            &json!(105),
+            &json!(105),
+            &json!(2)
+        ]
+    );
+    let opened = candle["t"].as_u64().unwrap();
+    assert!(unix_seconds().abs_diff(opened) <= 10, "{opened}");
+    assert_eq!(opened % 5, 0);
 
     // The browser cancels the rest, and leaves.
     browser.send(json!({"type": "cancel", "id": id}));
@@ -340,6 +376,17 @@ fn a_browser_registers_trades_and_watches_the_market() {
     );
     drop(back);
 
+    // A browser that subscribes before logging in is logged out, with no chart.
+    let mut early = Browser::connect(gateway.web);
+    early.send(json!({"type": "subscribe"}));
+    loop {
+        let message = early.receive();
+        assert_ne!(message["type"], "history");
+        if message["type"] == "closed" {
+            break;
+        }
+    }
+
     // Garbage ends a session with an error first.
     let mut other = Browser::connect(gateway.web);
     other.send(json!({"type": "nonsense"}));
@@ -348,6 +395,8 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let stats = Browser::connect(gateway.web).expect("stats");
     assert!(stats["sessions"].as_u64().unwrap() >= 1, "{stats}");
     assert!(stats["turn_max_ns"].as_u64().unwrap() >= stats["turn_p50_ns"].as_u64().unwrap());
+    let time = stats["time"].as_u64().unwrap() / 1_000;
+    assert!(unix_seconds().abs_diff(time) <= 10, "{stats}");
 
     // A second guest gets the next id, and the third finds none left.
     let mut second = Browser::connect(gateway.web);

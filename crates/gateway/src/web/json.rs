@@ -448,6 +448,9 @@ pub struct Stats {
     pub sessions: u64,
     /// Orders resting on the book.
     pub orders: u64,
+    /// The server's clock, in milliseconds since the Unix epoch, so a browser can place
+    /// trades in the candles it has from the server.
+    pub time: u64,
 }
 
 /// The JSON for `stats`, with `"type": "stats"`.
@@ -455,6 +458,15 @@ pub fn stats(stats: &Stats) -> String {
     let mut value = serde_json::to_value(stats).expect("statistics serialise");
     value["type"] = serde_json::Value::from("stats");
     value.to_string()
+}
+
+/// The JSON for the last hour of trades, as candles of `interval` seconds.
+pub fn history<'a>(
+    interval: u64,
+    candles: impl Iterator<Item = &'a crate::candles::Candle>,
+) -> String {
+    let candles: Vec<_> = candles.collect();
+    serde_json::json!({"type": "history", "interval": interval, "candles": candles}).to_string()
 }
 
 /// The JSON telling a browser its new account.
@@ -655,12 +667,22 @@ mod tests {
             turn_max_ns: 6,
             sessions: 7,
             orders: 8,
+            time: 9,
         }))
         .unwrap();
         assert_eq!(
             stats,
             serde_json::json!({"type": "stats", "commands_per_second": 3, "turn_p50_ns": 4,
-                "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8})
+                "turn_p99_ns": 5, "turn_max_ns": 6, "sessions": 7, "orders": 8, "time": 9})
+        );
+        let mut candles = crate::candles::Candles::default();
+        candles.record(1_000, 100, 2);
+        let history: serde_json::Value =
+            serde_json::from_str(&super::history(5, candles.iter())).unwrap();
+        assert_eq!(
+            history,
+            serde_json::json!({"type": "history", "interval": 5,
+                "candles": [{"t": 1000, "o": 100, "h": 100, "l": 100, "c": 100, "v": 2}]})
         );
     }
 }

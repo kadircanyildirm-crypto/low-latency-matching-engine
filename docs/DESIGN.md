@@ -1278,9 +1278,13 @@ followers trade with the recent move. They reconnect when the gateway restarts.
 
 The page has no dependencies and no build step. It keeps the account in local storage,
 reconnects with backoff, sends heartbeats so it is not logged out as idle, and draws the
-book and tape at most once a frame. Every second the server tells it the commands per
-second, how long the turns that handed commands to the engine took, and the sessions and
-resting orders.
+book and tape at most once a frame. Its chart opens on the last hour, not empty: the
+exchange keeps the trades it delivers as five-second candles, an hour of them in memory,
+and a browser that subscribes is sent them after the book. The trades after that come as
+market data, and the server's clock, sent with the statistics, places them in the right
+candle. The candles are not saved: after a restart they start again. Every second the
+server tells it the commands per second, how long the turns that handed commands to the
+engine took, the sessions and resting orders, and its clock.
 
 ### Deployment
 
@@ -1293,8 +1297,9 @@ outside, and the exchange's directory is a volume. CI builds the image on every 
 | Test | What it shows |
 |---|---|
 | `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
-| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; statistics every second; a guest's money and orders, with their references, across a stop and restart. |
-| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. |
+| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles after each subscription, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
+| `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |
+| `crates/gateway/tests/exchange.rs` | Holds, refunds, refusals and release on disconnect for a paper account; and four paper accounts trading only with each other through random flows: money and lots in total never change, each wallet equals what its fills say, none holds more than it owns, and each holds exactly what its orders on the book need. Dropping settlement fails it. Trades go into candles at the wall-clock time the exchange's clock stands for, and only a logged-in session that subscribed counts as subscribed. |
 | `crates/gateway/tests/recovery.rs` | 40 random runs with checkpoints now and then and a power failure, in order and out of order, on the simulated disk: the exchange comes back exactly, only the client references of orders placed after the checkpoint lost. A damaged newest checkpoint falls back to the one before; one that contradicts the book is refused. |
 | `crates/engine/tests/operations.rs` | Commands reach an output before their events, live and on replay from where it stands. |
 | `crates/gateway/tests/server.rs` | Bots make a market within a second: both sides quoted, trades. |

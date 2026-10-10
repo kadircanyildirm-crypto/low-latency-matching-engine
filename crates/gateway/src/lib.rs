@@ -3,6 +3,7 @@
 //!
 //! - [`accounts`]: who may log in, and their limits.
 //! - [`bots`]: market makers, noise traders and trend followers for a demo market.
+//! - [`candles`]: the last hour of trades as candles, for charts.
 //! - [`client`]: a blocking client, for tests and tools.
 //! - [`exchange`]: the logic, without sockets: sessions, pre-trade risk, order ids, and the
 //!   routing of the book's events to the sessions they concern.
@@ -17,6 +18,7 @@
 
 pub mod accounts;
 pub mod bots;
+pub mod candles;
 pub mod client;
 pub mod exchange;
 pub mod load;

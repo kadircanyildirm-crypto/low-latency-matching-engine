@@ -19,7 +19,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use engine::storage::{FsStorage, Storage};
 use engine::{Engine, Seq};
@@ -245,6 +245,10 @@ impl<C: Core> Server<C> {
         let mut listener = TcpListener::bind(addr)?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
+        // The server's clock reads zero now; the candles want wall-clock time.
+        let mut exchange = exchange;
+        exchange.set_epoch(unix_millis() / 1_000);
+        let started = Instant::now();
         Ok(Server {
             exchange,
             core,
@@ -263,7 +267,7 @@ impl<C: Core> Server<C> {
             unread: Vec::new(),
             ready: Vec::new(),
             scratch: vec![0; READ_CHUNK].into_boxed_slice(),
-            started: Instant::now(),
+            started,
             stats: Stats::default(),
             last_tick: 0,
         })
@@ -615,9 +619,16 @@ impl<C: Core> Server<C> {
             }
         };
         match message.inbound() {
-            Some(inbound) => self
-                .exchange
-                .receive(session, inbound, now, &mut self.wires),
+            Some(inbound) => {
+                self.exchange
+                    .receive(session, inbound, now, &mut self.wires);
+                // A browser's chart starts from the last hour.
+                if message == WebIn::Subscribe && self.exchange.is_subscribed(session) {
+                    let history =
+                        json::history(crate::candles::INTERVAL, self.exchange.candles().iter());
+                    self.send_web(session, &history);
+                }
+            }
             None => {
                 self.send_web(session, &json::error("a token is 16 hexadecimal digits"));
                 let reason = LogoutReason::ProtocolError;
@@ -653,6 +664,7 @@ impl<C: Core> Server<C> {
             turn_max_ns: turns.last().copied().unwrap_or(0),
             sessions: sessions as u64,
             orders: self.exchange.depth().order_count() as u64,
+            time: unix_millis(),
         };
         let text = json::stats(&stats);
         for connection in self.wires.slots.iter_mut().flatten() {
@@ -793,6 +805,14 @@ impl<C: Core> Server<C> {
         }
         self.unread.clear();
     }
+}
+
+/// The wall clock, in milliseconds since the Unix epoch.
+fn unix_millis() -> u64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What the server measures for its statistics, since `since`.

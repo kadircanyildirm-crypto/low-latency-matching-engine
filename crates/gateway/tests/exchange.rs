@@ -7,6 +7,7 @@ use std::path::Path;
 
 use engine::sim::SimStorage;
 use engine::{Discard, Engine, EngineConfig};
+use gateway::candles::Candle;
 use gateway::{Account, Exchange, Mailbox, SessionId, SetupError, Timing};
 use orderbook::{
     BookConfig, CancelReason, Command, OrderBook, Phase, RejectReason, Side, TimeInForce,
@@ -1467,4 +1468,32 @@ fn orders_in_flight_are_not_told_on_login() {
     assert!(matches!(kinds[1], ReportKind::Rested { .. }));
     // The disconnect cancels it.
     assert!(matches!(kinds[2], ReportKind::Cancelled { .. }));
+}
+
+/// Trades go into candles at the wall-clock time the exchange's clock stands for, and only
+/// a logged-in session that asked is told the market data.
+#[test]
+fn trades_make_candles_at_their_time() {
+    let mut exchange = exchange(&[account(1), account(2)]);
+    let mut mail = Mail::default();
+    exchange.set_epoch(1_000_000);
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    logged_in(&mut exchange, 1, 2, &mut mail);
+    assert!(!exchange.is_subscribed(0));
+    exchange.receive(0, Inbound::Subscribe, 0, &mut mail);
+    assert!(exchange.is_subscribed(0));
+    assert!(!exchange.is_subscribed(1) && !exchange.is_subscribed(7));
+    exchange.receive(0, limit(1, Side::Sell, 105, 3), 100 * SECOND, &mut mail);
+    exchange.receive(1, limit(1, Side::Buy, 105, 2), 107 * SECOND + 1, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let candles: Vec<Candle> = exchange.candles().iter().copied().collect();
+    let candle = Candle {
+        t: 1_000_105,
+        o: 105,
+        h: 105,
+        l: 105,
+        c: 105,
+        v: 2,
+    };
+    assert_eq!(candles, [candle]);
 }

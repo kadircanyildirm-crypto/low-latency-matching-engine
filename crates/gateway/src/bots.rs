@@ -138,8 +138,9 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                 let last = market.trades.back().map_or(0, |&p| (p - fair) / 4);
                 fair += step + pull + last;
                 client.queue(&Inbound::MassCancel);
-                for level in 0..5 {
-                    let qty = 5 + rng.below(45);
+                for level in 0..10_i64 {
+                    // Further from the price, more size, as on a real book.
+                    let qty = 5 + rng.below(45) + 8 * level.unsigned_abs();
                     let gap = 1 + level * 2;
                     client.queue(&order(Side::Buy, fair - gap, qty, TimeInForce::Gtc));
                     client.queue(&order(Side::Sell, fair + gap, qty, TimeInForce::Gtc));

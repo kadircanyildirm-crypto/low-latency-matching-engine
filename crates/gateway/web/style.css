@@ -991,11 +991,11 @@ html { scroll-behavior: smooth; }
 }
 .log-row { height: 24px; padding: 0 8px; border-radius: 4px; white-space: nowrap; }
 .log-row > span { overflow: hidden; text-overflow: ellipsis; }
-.log-row.enter { animation: log-in 0.7s ease-out; }
+/* New rows come every fifth of a second: a brief, faint mark, or the top would never settle. */
+.log-row.enter { animation: log-in 0.35s ease-out; }
 @keyframes log-in {
-  from { transform: translateY(-4px); background: var(--accent-soft); }
-  25% { transform: none; }
-  to { background: transparent; }
+  from { transform: translateY(-3px); background: var(--hover); }
+  to { transform: none; background: transparent; }
 }
 .log-row.mine, .log-row.mine.enter { background: var(--accent-soft); animation: none; }
 .log-seq { color: var(--muted); }

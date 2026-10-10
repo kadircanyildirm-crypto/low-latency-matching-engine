@@ -1,6 +1,20 @@
 # HTTPS with a certificate from Let's Encrypt, for the domain in $DOMAIN. WebSocket
-# upgrades pass through as they are.
+# upgrades pass through as they are. Caddy names the browser's address in
+# X-Forwarded-For, replacing whatever the browser sent: it trusts no proxy before it.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
 {$DOMAIN} {
 	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
 	reverse_proxy exchange:8080
 }

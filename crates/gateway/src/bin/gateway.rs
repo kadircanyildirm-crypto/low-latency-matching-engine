@@ -6,7 +6,7 @@
 //! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
 //! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>] [--symbol ETH/USD]
 //! [--price-decimals 2] [--lot-decimals 6] [--source <name>] [--source-url <url>]
-//! [--trust-forwarded-for false] [--paper-collar 10]`
+//! [--trust-forwarded-for false] [--paper-collar 10] [--guest-orders 50]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
@@ -15,7 +15,8 @@
 //! WebSocket. Visitors may create accounts with ids from `--guest-ids`, which are saved to
 //! the `--guests` file (`<dir>/guests.txt` by default) and loaded from it on the next start.
 //! They trade paper money: `--guest-cash` (in price ticks times lots) and
-//! `--guest-position` (in lots) to start with, at limit prices within `--paper-collar`
+//! `--guest-position` (in lots) to start with, with at most `--guest-orders` open each, at
+//! limit prices within `--paper-collar`
 //! percent of the market's price, the last trade an account without funds took part in
 //! (0 for no limit). `--public-url`, where the page is published
 //! such as `https://demo.example.com`, gives its link preview the image's full address.
@@ -62,7 +63,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
 [--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
-[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>] [--trust-forwarded-for true|false] [--paper-collar <percent>]";
+[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>] [--trust-forwarded-for true|false] [--paper-collar <percent>] [--guest-orders <n>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -181,6 +182,7 @@ fn run() -> Result<(), String> {
         position: parse(take("guest-position"), "1000", "guest-position")?,
     };
     let collar: u32 = parse(take("paper-collar"), "10", "paper-collar")?;
+    let guest_orders: u32 = parse(take("guest-orders"), "50", "guest-orders")?;
     if let Some(name) = args.keys().next() {
         return Err(format!("unknown flag --{name}\n{USAGE}"));
     }
@@ -192,7 +194,7 @@ fn run() -> Result<(), String> {
     let guests = Guests {
         file: Some(guests_file),
         ids: guest_ids,
-        max_open_orders: 50,
+        max_open_orders: guest_orders,
         messages_per_second: 20,
         funds: Some(funds),
     };

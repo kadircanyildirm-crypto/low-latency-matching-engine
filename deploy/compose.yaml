@@ -7,11 +7,29 @@
 # Only Caddy is reachable from outside, on ports 80 and 443; the binary protocol's port
 # stays on the compose network, for the mirror. deploy/bots.txt holds the accounts the
 # mirror uses, its first two: make it with deploy/make-accounts.sh before the first start.
+# Every container: logs that rotate, no privileges it does not need, and a cap on its
+# processes; the exchange and the mirror write nothing but the exchange's volume.
+x-hardened: &hardened
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "3"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 256
+  restart: unless-stopped
+
 services:
   exchange:
+    <<: *hardened
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    read_only: true
+    mem_limit: 640m
     command:
       - --dir
       - /data
@@ -23,6 +41,19 @@ services:
       - 0.0.0.0:8080
       - --max-orders
       - "200000"
+      # Guests' ids run up to 8,192, never handed out twice; with 20 open orders each they
+      # fill at most 162,000 of the book's 200,000 places, leaving the mirror its own.
+      - --max-owners
+      - "8192"
+      - --guest-orders
+      - "20"
+      # Browsers may take all the sessions but 64, which the mirror's port keeps.
+      - --max-sessions
+      - "512"
+      # Every connection comes through Caddy, which names the browser's address in
+      # X-Forwarded-For; port 8080 is reachable from nothing else.
+      - --trust-forwarded-for
+      - "true"
       # ETH/USD as Bitstamp quotes it: prices in cents, quantities in millionths of an
       # ether, prices from $500 to $10,000.
       - --symbol
@@ -51,22 +82,28 @@ services:
     volumes:
       - exchange-data:/data
       - ./bots.txt:/etc/exchange/bots.txt:ro
-    restart: unless-stopped
 
   mirror:
+    <<: *hardened
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    read_only: true
+    mem_limit: 128m
     entrypoint: ["mirror"]
     command: ["--accounts", "/etc/exchange/bots.txt", "--connect", "exchange:9000"]
     volumes:
       - ./bots.txt:/etc/exchange/bots.txt:ro
     depends_on:
       - exchange
-    restart: unless-stopped
 
   caddy:
-    image: caddy:2.8.4
+    <<: *hardened
+    # Pinned to a release more than two weeks old.
+    image: caddy:2.11.4
+    mem_limit: 192m
+    cap_add:
+      - NET_BIND_SERVICE
     ports:
       - "80:80"
       - "443:443"
@@ -75,10 +112,11 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
+      - caddy-config:/config
     depends_on:
       - exchange
-    restart: unless-stopped
 
 volumes:
   exchange-data:
   caddy-data:
+  caddy-config:

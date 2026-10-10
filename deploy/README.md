@@ -41,12 +41,22 @@ LinkedIn and others show the image's full address; without it the preview has no
   the server, and the market carries on where it stopped. The containers restart by
   themselves.
 - **Logs.** `docker compose -f deploy/compose.yaml logs -f exchange`.
-- **Upgrades.** `git pull`, then the same `up -d --build`. A release that raises the
+- **Upgrades.** `git pull`, then `docker compose -f deploy/compose.yaml build --pull`, which
+  also brings the base images' security fixes, and the same `up -d`. A release that raises the
   matching rules version (`orderbook::RULES_VERSION`) cannot replay the old journal, and
   the exchange refuses to start on it; for a paper market, starting over is simplest:
   `docker compose -f deploy/compose.yaml down` and `docker volume rm deploy_exchange-data`.
 - **What is exposed.** Only Caddy's ports 80 and 443. The binary protocol's port, 9000,
-  stays on the compose network for the mirror.
+  stays on the compose network for the mirror, and the web port, 8080, for Caddy: the
+  exchange takes a browser's address from the `X-Forwarded-For` header Caddy adds, which it
+  could not trust if anything else reached that port.
+- **Limits.** Each container's logs rotate (three files of 10 MB), its memory is capped
+  (640 MB for the exchange, less for the others), it has no capabilities beyond binding
+  Caddy's ports, and the exchange's and the mirror's file systems are read-only but for
+  the exchange's volume. A browser's address may hold 32 WebSockets and create 5 paper
+  accounts, then one more every ten minutes; the mirror always finds a session free; and
+  paper orders stay within 10% of the market's price. Pages of other sites may not open
+  WebSockets here, nor frame the page.
 - **The venue.** `docker compose -f deploy/compose.yaml logs -f mirror` shows the
   connection to Bitstamp. If it drops or goes quiet for half a minute, the mirror cancels
   its orders and connects again, waiting longer each time, up to half a minute.

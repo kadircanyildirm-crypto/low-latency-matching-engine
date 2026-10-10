@@ -3,6 +3,8 @@
 # published outside the compose network, but the tokens should still not be guessable.
 set -eu
 out="$(dirname "$0")/bots.txt"
+# Readable by the containers' user, writable by no one else.
+umask 022
 {
   echo "# The bots' accounts: id token max-open-orders messages-per-second."
   for id in 1 2 3 4 5 6 7 8 9 10 11 12; do

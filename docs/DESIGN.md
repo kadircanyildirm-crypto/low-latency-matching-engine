@@ -990,7 +990,11 @@ One thread runs a `mio` event loop over non-blocking sockets. Each round:
    the events.
 5. Send heartbeats and log out idle sessions.
 6. Write each connection's replies, as far as its socket takes them. A connection with more
-   than 4 MiB of replies unwritten is dropped as a slow consumer.
+   than 4 MiB of replies unwritten is dropped as a slow consumer. The limit holds for every
+   reply, the exchange's and the server's own (a browser's chart history, pongs, the
+   statistics): once a connection passes it, nothing more is queued for it, and what it
+   sends after that is not read. Otherwise a client that sends cheap requests for large
+   replies, and reads none of them, would have the server queue gigabytes in one round.
 
 Reports go out only after the batch is journaled, so under `Always` a client never hears of
 an order the journal could lose. Everything the clients sent in one round shares one
@@ -1325,6 +1329,9 @@ in a batch, applying a command with the routing of its events, and the book's ow
 the commands it measured. A pipeline's two threads add their counts to shared counters
 before they say how far they got, so whoever sees the work done sees it counted.
 
+What a browser is told besides the book, below, goes with its first subscribe only:
+subscribing again sends the book again, and nothing more.
+
 A browser that subscribes is first told what is traded: the symbol, its base and quote,
 how many decimals a price and a quantity have, and the venue a mirrored market's orders
 come from. The engine knows only integer ticks and lots; the gateway's `--symbol`,
@@ -1404,7 +1411,7 @@ outside, and the exchange's directory is a volume. CI builds the image on every 
 | Test | What it shows |
 |---|---|
 | `crates/gateway/src/web/*` | The handshake's accept key against the RFC's example; every refusal of the HTTP parser and frame decoder; frames of every length class and every prefix of them; the JSON in both directions for every message. |
-| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles after each subscription, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
+| `crates/gateway/tests/web.rs` | Over real sockets: the page and nothing else; a browser that registers, logs in, subscribes, places an order, sees a binary client trade against it, cancels, keeps its orders across a reconnect, and finds the guest ids running out; the last hour as candles for a browser that subscribes, the trade in its own at the time it happened, and none for a browser that subscribes before logging in; its order in its queue under its id, the engine log's entries for it and for the trade against it, and its place at the top of the leaderboard; statistics every second, with the server's clock; a guest's money and orders, with their references, across a stop and restart. |
 | `mirror/src/*` | Decimals read exactly, and every malformed or too-fine one refused; Bitstamp's book, trade and reconnect messages; the mirror placing the venue's orders in order, nothing twice while on its way, cancels before changes before new orders, a shrink that keeps the order's place, a refused modify tried again, a filled order placed again, a refused one forgotten. |
 | `mirror/tests/exchange.rs` | The mirror against a real exchange over real sockets: after each of three venue books, the exchange's book holds the venue's orders at the followed prices, level by level; trades sent again trade at the venue's price; and a modify that raced a fill is put right. |
 | `crates/gateway/src/candles.rs` | Trades fall into their five-second interval, one after a clock that went back into the newest, and only the last hour is kept. |

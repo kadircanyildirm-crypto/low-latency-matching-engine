@@ -194,10 +194,35 @@ struct Connection {
     closed_at: Option<u64>,
 }
 
+impl Connection {
+    /// Marks the connection slow once its unread replies pass `max_output`: it is dropped
+    /// at the next write, and nothing more is queued for it or read from it.
+    fn limit_output(&mut self, max_output: usize) {
+        if self.output.len() > max_output {
+            self.slow = true;
+        }
+    }
+}
+
 /// The connections, as the exchange's [`Mailbox`].
 struct Wires {
     slots: Vec<Option<Connection>>,
     max_output: usize,
+}
+
+impl Wires {
+    /// Sends a browser a message of the server's own, such as the chart's history, with
+    /// the same limit as the exchange's messages.
+    fn send_text(&mut self, session: SessionId, text: &str) {
+        let Some(connection) = self.slots.get_mut(session).and_then(Option::as_mut) else {
+            return;
+        };
+        if connection.slow || connection.dead {
+            return;
+        }
+        ws::encode_text(text, &mut connection.output);
+        connection.limit_output(self.max_output);
+    }
 }
 
 impl Mailbox for Wires {
@@ -215,9 +240,7 @@ impl Mailbox for Wires {
             }
             Kind::Http { .. } => return,
         }
-        if connection.output.len() > self.max_output {
-            connection.slow = true;
-        }
+        connection.limit_output(self.max_output);
     }
 
     fn close(&mut self, session: SessionId) {
@@ -582,9 +605,9 @@ impl<C: Core> Server<C> {
                     return false;
                 }
             };
-            if connection.closing {
-                // A session being logged out is not listened to; reading on notices when
-                // the peer is gone.
+            if connection.closing || connection.slow {
+                // A session being logged out, or one that does not read its replies, is
+                // not listened to; reading on notices when the peer is gone.
                 continue;
             }
             let mut input = std::mem::take(&mut connection.input);
@@ -601,12 +624,15 @@ impl<C: Core> Server<C> {
     /// speaks, and returns how many bytes they took. Bytes that cannot be read end the
     /// session, and count as taken.
     fn consume(&mut self, session: SessionId, input: &[u8], now: u64) -> usize {
+        let max_output = self.wires.max_output;
         let mut at = 0;
         while at < input.len() {
             let Some(connection) = self.wires.slots[session].as_mut() else {
                 return input.len();
             };
-            if connection.closing {
+            // A client that does not read its replies is not answered any more: what it
+            // sends after them could otherwise make the server queue without end.
+            if connection.closing || connection.slow || connection.dead {
                 return input.len();
             }
             let rest = &input[at..];
@@ -668,6 +694,7 @@ impl<C: Core> Server<C> {
                             ws::Frame::Text(text) => self.web_message(session, &text, now),
                             ws::Frame::Ping(payload) => {
                                 ws::encode_pong(&payload, &mut connection.output);
+                                connection.limit_output(max_output);
                             }
                             ws::Frame::Pong => {}
                             // The browser is leaving: what it had is cancelled as it goes.
@@ -701,15 +728,18 @@ impl<C: Core> Server<C> {
         };
         match message.inbound() {
             Some(inbound) => {
+                // What a browser is told besides the book goes with its first subscribe
+                // only: subscribing again sends the book again, and nothing more.
+                let first = message == WebIn::Subscribe && !self.exchange.is_subscribed(session);
                 // A browser learns what is traded before the book, so it shows it rightly.
-                if message == WebIn::Subscribe && self.exchange.account_of(session).is_some() {
+                if first && self.exchange.account_of(session).is_some() {
                     let market = json::market(&self.market);
                     self.send_web(session, &market);
                 }
                 self.exchange
                     .receive(session, inbound, now, &mut self.wires);
                 // A browser's chart starts from the last hour, and its queues from now.
-                if message == WebIn::Subscribe && self.exchange.is_subscribed(session) {
+                if first && self.exchange.is_subscribed(session) {
                     let history =
                         json::history(crate::candles::INTERVAL, self.exchange.candles().iter());
                     self.send_web(session, &history);
@@ -777,9 +807,12 @@ impl<C: Core> Server<C> {
         }
         self.recent_stats.push_back(stats);
         let text = json::stats(&stats);
-        for connection in self.wires.slots.iter_mut().flatten() {
-            if matches!(connection.kind, Kind::WebSocket { .. }) && !connection.closing {
-                ws::encode_text(&text, &mut connection.output);
+        for session in 0..self.wires.slots.len() {
+            let browser = self.wires.slots[session]
+                .as_ref()
+                .is_some_and(|c| matches!(c.kind, Kind::WebSocket { .. }) && !c.closing);
+            if browser {
+                self.wires.send_text(session, &text);
             }
         }
         turns.clear();
@@ -876,9 +909,7 @@ impl<C: Core> Server<C> {
 
     /// Sends a browser a message the exchange does not know of.
     fn send_web(&mut self, session: SessionId, text: &str) {
-        if let Some(connection) = self.wires.slots[session].as_mut() {
-            ws::encode_text(text, &mut connection.output);
-        }
+        self.wires.send_text(session, text);
     }
 
     /// Writes the replies, and drops the connections that are done.
@@ -1037,5 +1068,77 @@ mod tests {
         server.publish_stats(1_000_000_000);
         let stats = server.recent_stats.back().copied().unwrap();
         assert_eq!(stats.commands_per_second, 0);
+    }
+
+    /// A browser that sends subscribes or pings without pause and reads nothing: the
+    /// replies queued for it stay within the limit, whatever it sends, and the rest of what
+    /// it sends is not even looked at.
+    #[test]
+    fn a_flooding_browser_is_cut_off_at_its_output_limit() {
+        use std::io::Write as _;
+
+        let config = EngineConfig::new(BookConfig::new(1, 1_000, 64));
+        let (engine, _) =
+            Engine::open_with(SimStorage::new(), Path::new("data"), config, &mut Discard).unwrap();
+        let account = crate::Account {
+            id: 1,
+            token: 0x65,
+            max_open_orders: 10,
+            messages_per_second: 100,
+            funds: None,
+        };
+        let exchange = Exchange::new(engine.book(), 0, &[account], Timing::default()).unwrap();
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let max_output = 16 << 10;
+        let config = ServerConfig {
+            max_output,
+            ..ServerConfig::default()
+        };
+        let mut server = Server::bind(exchange, engine, addr, config).unwrap();
+        server.serve_web(addr, None).unwrap();
+        let web = server.web_addr().unwrap().unwrap();
+
+        for flood in [
+            br#"{"type":"subscribe"}"#.as_slice(),
+            [7; 125].as_slice(), // a ping's longest payload
+        ] {
+            let mut browser = std::net::TcpStream::connect(web).unwrap();
+            let mut sent = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+                Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                .to_vec();
+            let login = br#"{"type":"login","account":1,"token":"0000000000000065"}"#;
+            ws::encode_client(true, login, [1, 2, 3, 4], &mut sent);
+            let text = flood.starts_with(b"{");
+            for _ in 0..4_000 {
+                ws::encode_client(text, flood, [1, 2, 3, 4], &mut sent);
+            }
+            browser.write_all(&sent).unwrap();
+
+            let now = server.now();
+            let mut session = None;
+            for _ in 0..200 {
+                server.accept(now, true);
+                session = server.wires.slots.iter().position(Option::is_some);
+                if session.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let session = session.expect("the browser's connection");
+            // Everything sent reaches the server's socket, then the server reads it all.
+            std::thread::sleep(Duration::from_millis(300));
+            while server.read(session, now) {}
+            let connection = server.wires.slots[session].as_ref().unwrap();
+            assert!(connection.slow, "the browser should be cut off");
+            // At most one message over the limit: the book is empty, and every message
+            // here is small.
+            assert!(
+                connection.output.len() < max_output + 4_096,
+                "{} bytes queued",
+                connection.output.len()
+            );
+            server.drop_connection(session);
+        }
     }
 }

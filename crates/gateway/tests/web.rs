@@ -348,9 +348,14 @@ fn a_browser_registers_trades_and_watches_the_market() {
     );
     assert_eq!(browser.expect("level")["qty"], 1);
     assert!(matches!(bot.receive().unwrap(), Outbound::Report(_)));
-    // A chart opened now starts from the trade, at the time it happened.
-    browser.send(json!({"type": "subscribe"}));
-    let candles = browser.expect("history")["candles"].clone();
+    // A chart opened now, by another guest, starts from the trade, at the time it happened.
+    let mut viewer = Browser::connect(gateway.web);
+    viewer.send(json!({"type": "register"}));
+    let registered = viewer.expect("registered");
+    assert_eq!(registered["account"], 11);
+    viewer.send(json!({"type": "login", "account": 11, "token": registered["token"]}));
+    viewer.send(json!({"type": "subscribe"}));
+    let candles = viewer.expect("history")["candles"].clone();
     let candle = &candles[0];
     assert_eq!(candles.as_array().unwrap().len(), 1, "{candles}");
     assert_eq!(
@@ -373,7 +378,7 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert!(unix_seconds().abs_diff(opened) <= 10, "{opened}");
     assert_eq!(opened % 5, 0);
     // What is left of the order shows in its queue, under its id.
-    let queues = browser.expect("queues");
+    let queues = viewer.expect("queues");
     assert_eq!(queues["sell"], json!([[105, [id, 1]]]), "{queues}");
     assert_eq!(queues["buy"], json!([]));
     // The engine log tells the order and the bot's trade against it, in sequence.
@@ -456,10 +461,7 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let buckets = stats["turn_buckets"].as_array().unwrap();
     assert_eq!(buckets.len(), 18, "{stats}");
 
-    // A second guest gets the next id, and the third finds none left.
-    let mut second = Browser::connect(gateway.web);
-    second.send(json!({"type": "register"}));
-    assert_eq!(second.expect("registered")["account"], 11);
+    // The viewer took the last guest id: the next guest finds none left.
     let mut third = Browser::connect(gateway.web);
     third.send(json!({"type": "register"}));
     assert_eq!(third.expect("error")["message"], "no accounts are left");

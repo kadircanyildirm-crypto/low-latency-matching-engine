@@ -1,0 +1,26 @@
+[package]
+name = "mirror"
+version = "0.1.0"
+description = "Mirrors a real venue's order book and trades into the exchange, order by order."
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+gateway = { path = "../crates/gateway" }
+orderbook = { path = "../crates/orderbook" }
+protocol = { path = "../crates/protocol" }
+# TLS without a C toolchain beyond what `ring` needs, and no other crypto provider.
+# Pinned to releases more than two weeks old.
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0.151"
+tungstenite = { version = "=0.30.0", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+engine = { path = "../crates/engine" }
+
+# A workspace of its own, so that the engine's workspace never compiles a TLS stack, and
+# `ring` names only the engine's ring buffer there: rustls brings a crate of that name.
+[workspace]
+members = ["."]

@@ -29,10 +29,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use engine::storage::FsStorage;
 use engine::{EngineConfig, SyncPolicy};
 use gateway::web::Guests;
+use gateway::web::json::Started;
 use gateway::{
     Account, Core, Exchange, Funds, Pipeline, PipelineConfig, Server, ServerConfig, Timing,
     accounts, recovery,
@@ -168,6 +170,7 @@ fn run() -> Result<(), String> {
         snapshot_every: (snapshot_every > 0).then_some(snapshot_every),
         ..EngineConfig::new(book)
     };
+    let opening = Instant::now();
     let (engine, exchange, recovered) = recovery::open(
         FsStorage,
         Path::new(&dir),
@@ -176,6 +179,16 @@ fn run() -> Result<(), String> {
         Timing::default(),
     )
     .map_err(|e| format!("opening {dir}: {e}"))?;
+    let started = Started {
+        started: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64),
+        recovered: engine.last_seq(),
+        snapshot: engine.last_snapshot(),
+        orders: engine.book().order_count() as u64,
+        recovery_ms: opening.elapsed().as_millis() as u64,
+        digest: engine.book().digest(),
+    };
     eprintln!(
         "gateway: recovered {dir} up to command {}, {} orders on the book; the exchange from {}",
         engine.last_seq(),
@@ -188,11 +201,16 @@ fn run() -> Result<(), String> {
             None => "the book alone".to_owned(),
         }
     );
-    let checkpoints = (
-        PathBuf::from(&dir),
-        checkpoint_every,
-        recovered.checkpoint.unwrap_or(0),
-    );
+    let setup = Setup {
+        accounts: accounts.len(),
+        web,
+        checkpoints: (
+            PathBuf::from(&dir),
+            checkpoint_every,
+            recovered.checkpoint.unwrap_or(0),
+        ),
+        started,
+    };
     if let Some(&core) = cores.first() {
         let found = core_affinity::get_core_ids()
             .unwrap_or_default()
@@ -210,26 +228,19 @@ fn run() -> Result<(), String> {
             ..PipelineConfig::default()
         };
         let pipeline = Pipeline::start(engine, config).map_err(|e| e.to_string())?;
-        serve(
-            exchange,
-            pipeline,
-            listen,
-            server,
-            accounts.len(),
-            web,
-            checkpoints,
-        )
+        serve(exchange, pipeline, listen, server, setup)
     } else {
-        serve(
-            exchange,
-            engine,
-            listen,
-            server,
-            accounts.len(),
-            web,
-            checkpoints,
-        )
+        serve(exchange, engine, listen, server, setup)
     }
+}
+
+/// What a server is set up with, beyond its exchange and engine.
+struct Setup {
+    accounts: usize,
+    web: Option<(SocketAddr, Guests)>,
+    /// The directory, how many commands apart, and the sequence number of the last one.
+    checkpoints: (PathBuf, u64, u64),
+    started: Started,
 }
 
 /// The accounts in `path`, with ids below `max_owners`.
@@ -245,13 +256,18 @@ fn serve<C: Core>(
     core: C,
     listen: SocketAddr,
     config: ServerConfig,
-    accounts: usize,
-    web: Option<(SocketAddr, Guests)>,
-    (dir, every, since): (PathBuf, u64, u64),
+    setup: Setup,
 ) -> Result<(), String> {
+    let Setup {
+        accounts,
+        web,
+        checkpoints: (dir, every, since),
+        started,
+    } = setup;
     let mut server =
         Server::bind(exchange, core, listen, config).map_err(|e| format!("{listen}: {e}"))?;
     server.checkpoint_to(dir, every, since);
+    server.set_started(started);
     eprintln!(
         "gateway: {accounts} accounts, listening on {}",
         server.local_addr().map_err(|e| e.to_string())?

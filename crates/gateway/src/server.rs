@@ -263,6 +263,8 @@ pub struct Server<C: Core> {
     logged: Vec<Logged>,
     /// The statistics of the last seconds, oldest first.
     recent_stats: VecDeque<json::Stats>,
+    /// How the server started, if it was told.
+    start: Option<json::Started>,
 }
 
 impl<C: Core> Server<C> {
@@ -314,7 +316,14 @@ impl<C: Core> Server<C> {
             shown_queues: String::new(),
             logged: Vec::new(),
             recent_stats: VecDeque::with_capacity(STATS_KEPT),
+            start: None,
         })
+    }
+
+    /// Tells browsers that subscribe how the server started: what it recovered, and how
+    /// long that took.
+    pub fn set_started(&mut self, start: json::Started) {
+        self.start = Some(start);
     }
 
     /// The address the server listens on, with the port the system chose if `addr` asked
@@ -677,6 +686,9 @@ impl<C: Core> Server<C> {
                     self.send_web(session, &history);
                     let stats = json::stats_history(self.recent_stats.iter());
                     self.send_web(session, &stats);
+                    if let Some(start) = self.start {
+                        self.send_web(session, &json::started(&start));
+                    }
                     let queues = json::queues(self.exchange.depth(), QUEUE_LEVELS);
                     self.send_web(session, &queues);
                 }

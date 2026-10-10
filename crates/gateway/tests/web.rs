@@ -13,6 +13,7 @@ use std::time::Duration;
 use engine::EngineConfig;
 use engine::storage::FsStorage;
 use gateway::client::Client;
+use gateway::web::json::Started;
 use gateway::web::{Guests, ws};
 use gateway::{Account, Funds, Server, ServerConfig, Timing, recovery};
 use orderbook::{BookConfig, Side, TimeInForce};
@@ -78,7 +79,14 @@ impl Gateway {
             )
             .unwrap();
             let addr = "127.0.0.1:0".parse().unwrap();
+            let started = Started {
+                recovered: engine.last_seq(),
+                orders: engine.book().order_count() as u64,
+                digest: engine.book().digest(),
+                ..Started::default()
+            };
             let mut server = Server::bind(exchange, engine, addr, ServerConfig::default()).unwrap();
+            server.set_started(started);
             server.checkpoint_to(data, 1_000, recovered.checkpoint.unwrap_or(0));
             let guests = Guests {
                 file: Some(guests_file),
@@ -285,6 +293,13 @@ fn a_browser_registers_trades_and_watches_the_market() {
     // Nothing has traded yet.
     let history = browser.expect("history");
     assert!(browser.expect("stats_history")["stats"].is_array());
+    // A new exchange: nothing recovered, an empty book.
+    let started = browser.expect("started");
+    assert_eq!(
+        (started["recovered"].clone(), started["orders"].clone()),
+        (json!(0), json!(0))
+    );
+    assert_eq!(started["digest"].as_str().unwrap().len(), 16, "{started}");
     assert_eq!(
         (history["interval"].clone(), history["candles"].clone()),
         (json!(5), json!([]))

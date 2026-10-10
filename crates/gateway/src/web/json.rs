@@ -9,7 +9,8 @@
 //! (`login_accepted`, `login_rejected`, `heartbeat`, `logout`, `reject`, `report`, `book`,
 //! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error`
 //! (`message`). A subscribed browser also gets `history` (the last hour as candles),
-//! `stats_history` (the statistics of the last two minutes), `queues` (the best levels
+//! `started` (how the server recovered when it started), `stats_history` (the statistics of
+//! the last two minutes), `queues` (the best levels
 //! order by order), `log` (the commands the engine sequenced, with
 //! what came of them), `leaders` (the most profitable paper accounts) and `rank` (its own
 //! place among them); every browser gets `stats`. Codes such as reasons and sides are
@@ -480,6 +481,36 @@ pub struct Stats {
     pub matched: u64,
 }
 
+/// How the server started: what it recovered, and how long that took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Started {
+    /// When it started, in milliseconds since the Unix epoch.
+    pub started: u64,
+    /// The sequence number of the last command it recovered.
+    pub recovered: u64,
+    /// The snapshot recovery started from: the commands after it were replayed from the
+    /// journal. Zero for none.
+    pub snapshot: u64,
+    /// The orders back on the book.
+    pub orders: u64,
+    /// How long opening the engine and the exchange took, in milliseconds.
+    pub recovery_ms: u64,
+    /// The book's state digest after recovery.
+    #[serde(serialize_with = "hex")]
+    pub digest: u64,
+}
+
+fn hex<S: serde::Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("{value:016x}"))
+}
+
+/// The JSON for `started`.
+pub fn started(started: &Started) -> String {
+    let mut value = serde_json::to_value(started).expect("a start serialises");
+    value["type"] = Value::from("started");
+    value.to_string()
+}
+
 /// The JSON for the statistics of the last seconds, oldest first, as `stats_history`.
 pub fn stats_history<'a>(stats: impl Iterator<Item = &'a Stats>) -> String {
     let stats: Vec<&Stats> = stats.collect();
@@ -859,6 +890,19 @@ mod tests {
         assert_eq!(history["type"], "stats_history");
         assert_eq!(history["stats"].as_array().unwrap().len(), 2);
         assert_eq!(history["stats"][1]["commands_per_second"], 1);
+        let start = Started {
+            started: 1,
+            recovered: 2,
+            snapshot: 3,
+            orders: 4,
+            recovery_ms: 5,
+            digest: 0xab,
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&started(&start)).unwrap(),
+            json!({"type": "started", "started": 1, "recovered": 2, "snapshot": 3,
+                "orders": 4, "recovery_ms": 5, "digest": "00000000000000ab"})
+        );
         let mut candles = crate::candles::Candles::default();
         candles.record(1_000, 100, 2);
         let history: serde_json::Value =

@@ -1312,7 +1312,11 @@ the commands it measured. A pipeline's two threads add their counts to shared co
 before they say how far they got, so whoever sees the work done sees it counted.
 
 A subscribed browser is also shown the engine at work. It gets the statistics of the last
-two minutes when it subscribes, so its charts of them start full. Five times a second it gets the
+two minutes when it subscribes, so its charts of them start full, and how the server
+started: the sequence number it recovered to, the snapshot it started from (the commands
+after it replayed from the journal), the orders back on the book, how long opening the
+engine and the exchange took, and the book's state digest after it: what the journal and
+recovery are for, on show. Five times a second it gets the
 best ten levels of each side order by order, with each order's id and the quantity it
 shows in queue priority, when they changed since the last time; and the commands the
 engine sequenced since then, the latest twelve, each with what came of it: trades and

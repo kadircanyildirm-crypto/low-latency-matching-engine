@@ -1,13 +1,36 @@
 "use strict";
 
-// Prices are integer ticks of one cent; cash is ticks times lots.
+// What is traded, as the server describes it. Prices are integer ticks of
+// 10^-price_decimals of the quote currency, quantities integer lots of 10^-lot_decimals of
+// the base asset, and cash is ticks times lots.
+const market = {
+  symbol: "DEMO/USD",
+  base: "DEMO",
+  quote: "USD",
+  price_decimals: 2,
+  lot_decimals: 0,
+  source: null,
+  source_url: null,
+};
 const dollars = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const whole = new Intl.NumberFormat("en-US");
-const money = (ticks) => dollars.format(ticks / 100);
-const price = (ticks) => (ticks / 100).toFixed(2);
+const money = (units) => dollars.format(units / 10 ** (market.price_decimals + market.lot_decimals));
+const price = (ticks) => (ticks / 10 ** market.price_decimals).toFixed(market.price_decimals);
 const count = (n) => whole.format(n);
-// A price typed in dollars, with a decimal point or comma, in ticks.
-const ticksOf = (text) => Math.round(Number(String(text).trim().replace(",", ".")) * 100);
+// A quantity, with at most four decimals.
+const size = (lots) => {
+  const decimals = Math.min(market.lot_decimals, 4);
+  return (lots / 10 ** market.lot_decimals).toLocaleString("en-US", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+};
+// A number typed with a decimal point or comma, in units of 10^-decimals.
+const scaled = (text, decimals) => Math.round(Number(String(text).trim().replace(",", ".")) * 10 ** decimals);
+const ticksOf = (text) => scaled(text, market.price_decimals);
+const lotsOf = (text) => scaled(text, market.lot_decimals);
+// A quantity as it is typed into a field.
+const plain = (lots) => String(lots / 10 ** market.lot_decimals);
 const $ = (id) => document.getElementById(id);
 const two = (n) => String(n).padStart(2, "0");
 const timeOf = (ms) => {
@@ -222,6 +245,9 @@ function receive(message) {
     case "log":
       engineLog(message);
       break;
+    case "market":
+      setMarket(message);
+      break;
     case "started":
       state.started = message;
       renderStarted();
@@ -311,7 +337,7 @@ function report(message) {
       if (known && known.tif !== "ioc") remember(message.id, null);
       // The rest of an immediate order is cancelled as a matter of course.
       if (known && known.tif !== "ioc") {
-        toast("Order cancelled", `${sideName(known.side)} ${count(known.leaves)} DEMO at ${price(known.price)}`);
+        toast("Order cancelled", `${sideName(known.side)} ${size(known.leaves)} ${market.base} at ${price(known.price)}`);
       }
       break;
     case "rejected":
@@ -357,7 +383,7 @@ function filled(message) {
     for (const [id, fill] of pendingFills) {
       const average = price(Math.round(fill.value / fill.qty));
       const verb = fill.side === "buy" ? "Bought" : "Sold";
-      toast(`${verb} ${count(fill.qty)} DEMO`, `at ${average} on average · order #${id}`, fill.side);
+      toast(`${verb} ${size(fill.qty)} ${market.base}`, `at ${average} on average · order #${id}`, fill.side);
     }
     pendingFills.clear();
     fillTimer = null;
@@ -435,8 +461,8 @@ function show(slot, level, total, max, mine) {
   const changed = slot.price === at && slot.size !== qty;
   slot.at.textContent = price(at);
   slot.at.className = mine ? "price mine" : "price";
-  slot.qty.textContent = count(qty);
-  slot.total.textContent = count(total);
+  slot.qty.textContent = size(qty);
+  slot.total.textContent = size(total);
   slot.bar.style.width = `${(100 * total) / max}%`;
   slot.row.title = `${orders} order${orders === 1 ? "" : "s"} at ${price(at)}`;
   if (slot.price === null) slot.row.className = "level";
@@ -541,7 +567,7 @@ function showQueue(slot, level, scale, mine) {
   const fresh = slot.queuePrice === null;
   slot.queuePrice = at;
   const wanted = [];
-  let size = 0;
+  let total = 0;
   let yours = false;
   for (const order of orders) {
     const key = order.id || "more";
@@ -556,10 +582,10 @@ function showQueue(slot, level, scale, mine) {
     block.className = `blk${order.id === 0 ? " more" : ""}${isMine ? " mine" : ""}${added && !fresh ? " new" : ""}`;
     block.style.width = `${Math.max(3, Math.round(order.qty * scale))}px`;
     block.title = order.id === 0
-      ? `${count(order.qty)} DEMO more, behind`
-      : `Order #${count(order.id)}: ${count(order.qty)} DEMO${isMine ? ", yours" : ""}`;
+      ? `${size(order.qty)} ${market.base} more, behind`
+      : `Order #${count(order.id)}: ${size(order.qty)} ${market.base}${isMine ? ", yours" : ""}`;
     wanted.push(block);
-    size += order.qty;
+    total += order.qty;
   }
   const keep = new Set(wanted);
   for (const [key, block] of slot.blockMap) {
@@ -577,9 +603,9 @@ function showQueue(slot, level, scale, mine) {
   slot.at.textContent = price(at);
   slot.at.className = yours ? "price mine" : "price";
   slot.row.className = "level";
-  slot.row.title = `${orders.length} order${orders.length === 1 ? "" : "s"}, ${count(size)} DEMO at ${price(at)}: the first in line trades first`;
+  slot.row.title = `${orders.length} order${orders.length === 1 ? "" : "s"}, ${size(total)} ${market.base} at ${price(at)}: the first in line trades first`;
   slot.price = at;
-  slot.size = size;
+  slot.size = total;
 }
 
 function renderQueues() {
@@ -637,22 +663,22 @@ function commandOf(entry) {
   const sideOf = () => span(entry.side === "buy" ? "BUY" : "SELL", entry.side);
   switch (entry.cmd) {
     case "limit":
-      parts.push(sideOf(), ` ${count(entry.qty)} @ ${price(entry.price)}`);
+      parts.push(sideOf(), ` ${size(entry.qty)} @ ${price(entry.price)}`);
       if (TIFS[entry.tif]) parts.push(span(TIFS[entry.tif], "log-tag"));
-      if (entry.display) parts.push(span(`ICEBERG ${count(entry.display)}`, "log-tag"));
+      if (entry.display) parts.push(span(`ICEBERG ${size(entry.display)}`, "log-tag"));
       break;
     case "market":
-      parts.push(sideOf(), ` ${count(entry.qty)} `, span("MARKET", "log-tag"));
+      parts.push(sideOf(), ` ${size(entry.qty)} `, span("MARKET", "log-tag"));
       break;
     case "stop":
-      parts.push(span("STOP ", "verb"), sideOf(), ` ${count(entry.qty)} @ ${price(entry.trigger)}`);
+      parts.push(span("STOP ", "verb"), sideOf(), ` ${size(entry.qty)} @ ${price(entry.trigger)}`);
       if (entry.price !== null) parts.push(` limit ${price(entry.price)}`);
       break;
     case "cancel":
       parts.push(span("CANCEL", "verb"), ` #${count(entry.id)}`);
       break;
     case "modify":
-      parts.push(span("MODIFY", "verb"), ` #${count(entry.id)} → ${count(entry.qty)} @ ${price(entry.price)}`);
+      parts.push(span("MODIFY", "verb"), ` #${count(entry.id)} → ${size(entry.qty)} @ ${price(entry.price)}`);
       break;
     case "cancel_all":
       parts.push(span("CANCEL ALL", "verb"));
@@ -670,12 +696,12 @@ function commandOf(entry) {
 function outcomeOf(entry) {
   if (entry.rejected) return [`refused: ${entry.rejected.replaceAll("_", " ")}`, "refused"];
   const parts = [];
-  if (entry.trades) parts.push(`${entry.trades} fill${entry.trades === 1 ? "" : "s"} · ${count(entry.traded)}`);
-  if (entry.rested) parts.push(`rests ${count(entry.rested)}`);
+  if (entry.trades) parts.push(`${entry.trades} fill${entry.trades === 1 ? "" : "s"} · ${size(entry.traded)}`);
+  if (entry.rested) parts.push(`rests ${size(entry.rested)}`);
   if (entry.cancelled) {
     parts.push(entry.cmd === "cancel_all"
       ? `${count(entry.cancelled)} cancelled`
-      : `${count(entry.cancelled_qty)} cancelled`);
+      : `${size(entry.cancelled_qty)} cancelled`);
   }
   if (!parts.length) {
     parts.push({ stop: "waits for its trigger", cancel_all: "none open" }[entry.cmd] || "done");
@@ -914,7 +940,7 @@ function renderTrades() {
       const row = document.createElement("div");
       row.className = trade.shown ? `trade-row ${trade.side}` : `trade-row ${trade.side} fresh`;
       trade.shown = true;
-      for (const text of [price(trade.price), count(trade.qty), timeOf(trade.time)]) {
+      for (const text of [price(trade.price), size(trade.qty), timeOf(trade.time)]) {
         const cell = document.createElement("span");
         cell.textContent = text;
         row.append(cell);
@@ -950,7 +976,7 @@ function renderTicker() {
   element.className = change >= 0 ? "up" : "down";
   $("high").textContent = price(high);
   $("low").textContent = price(low);
-  $("volume").textContent = `${count(volume)} DEMO`;
+  $("volume").textContent = `${size(volume)} ${market.base}`;
 }
 
 // ---------- Chart ----------
@@ -1231,7 +1257,7 @@ function drawChart() {
     context.lineTo(plotWidth, row);
     context.stroke();
     context.setLineDash([]);
-    const label = `${order.side === "buy" ? "BUY" : "SELL"} ${count(order.leaves)} @ ${price(order.price)}`;
+    const label = `${order.side === "buy" ? "BUY" : "SELL"} ${size(order.leaves)} @ ${price(order.price)}`;
     const labelWidth = context.measureText(label).width + 12;
     box(context, 6, row - 9, labelWidth, 18, color.accent);
     context.fillStyle = color.bg;
@@ -1351,7 +1377,7 @@ function drawDepth(context, width, height) {
     context.lineTo(plotWidth, row);
     context.stroke();
     context.fillStyle = color.muted;
-    context.fillText(count(qty), plotWidth + 8, row);
+    context.fillText(size(qty), plotWidth + 8, row);
   }
   const priceStep = niceStep((high - low) / 6);
   context.textAlign = "center";
@@ -1447,7 +1473,7 @@ function drawDepth(context, width, height) {
       context.fillStyle = buying ? color.buy : color.sell;
       context.fill();
     }
-    const lines = [`${price(at)} USD`, `${count(total)} DEMO`, money(value)];
+    const lines = [`${price(at)} ${market.quote}`, `${size(total)} ${market.base}`, money(value)];
     context.font = `600 11px ${color.font}`;
     const boxWidth = Math.max(...lines.map((line) => context.measureText(line).width)) + 16;
     const left = hover.x + boxWidth + 14 > plotWidth ? hover.x - boxWidth - 10 : hover.x + 10;
@@ -1472,9 +1498,9 @@ function drawDepth(context, width, height) {
     element.append(b);
     parts.push(element);
   };
-  parts.push(span("DEMO/USD · depth"));
-  item("Bids", `${count(bidSteps[bidSteps.length - 1][1])} DEMO`, "up");
-  item("Asks", `${count(askSteps[askSteps.length - 1][1])} DEMO`, "down");
+  parts.push(span(`${market.symbol} · depth`));
+  item("Bids", `${size(bidSteps[bidSteps.length - 1][1])} ${market.base}`, "up");
+  item("Asks", `${size(askSteps[askSteps.length - 1][1])} ${market.base}`, "down");
   item("Mid", price(Math.round(mid)));
   item("Spread", price(asks[0][0] - bids[0][0]));
   if (shownAt) item(shownAt.buying ? "Sell into" : "Buy up to", price(shownAt.at));
@@ -1492,7 +1518,7 @@ function legend(candle, ma) {
     parts.push(span);
   };
   const name = document.createElement("span");
-  name.textContent = `DEMO/USD · ${chart.interval < 60 ? `${chart.interval}s` : "1m"}`;
+  name.textContent = `${market.symbol} · ${chart.interval < 60 ? `${chart.interval}s` : "1m"}`;
   parts.push(name);
   if (candle) {
     const tone = candle.c >= candle.o ? "up" : "down";
@@ -1502,7 +1528,7 @@ function legend(candle, ma) {
     item("C", price(candle.c), tone);
     const change = ((candle.c - candle.o) / candle.o) * 100;
     item("", `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`, tone);
-    item("V", count(candle.v));
+    item("V", size(candle.v));
     const mean = ma.get(candle.t);
     if (mean !== undefined) {
       const span = document.createElement("span");
@@ -1555,8 +1581,8 @@ function renderWallet() {
   if (!wallet) return;
   $("cash").textContent = money(wallet.cash - wallet.cash_held);
   $("cash-held").textContent = money(wallet.cash_held);
-  $("position").textContent = `${count(wallet.position - wallet.position_held)} DEMO`;
-  $("position-held").textContent = `${count(wallet.position_held)} DEMO`;
+  $("position").textContent = `${size(wallet.position - wallet.position_held)} ${market.base}`;
+  $("position-held").textContent = `${size(wallet.position_held)} ${market.base}`;
   const mark = state.last ?? midPrice();
   if (mark === null) return;
   const shares = wallet.position * mark;
@@ -1632,7 +1658,7 @@ function renderOrders() {
         cell(order.time ? timeOf(order.time) : "—", "left muted"),
         sideCell(order.side),
         cell(price(order.price)),
-        cell(order.qty ? `${count(order.leaves)} / ${count(order.qty)}` : count(order.leaves)),
+        cell(order.qty ? `${size(order.leaves)} / ${size(order.qty)}` : size(order.leaves)),
         cell(progress),
         cell(queueCell(order)),
         cell(`#${order.id}`, "muted"),
@@ -1648,7 +1674,7 @@ function renderOrders() {
         cell(timeOf(fill.time), "left muted"),
         sideCell(fill.side),
         cell(price(fill.price)),
-        cell(count(fill.qty)),
+        cell(size(fill.qty)),
         cell(money(fill.price * fill.qty)),
       );
       return row;
@@ -1666,8 +1692,8 @@ function queueCell(order) {
   }
   if (spot.place === 1) return span("Next in line", "next-badge");
   const element = span("", "queue-spot");
-  element.append(bold(`#${spot.place}`), ` · ${count(spot.ahead)} ahead`);
-  element.title = `${spot.place - 1} order${spot.place === 2 ? "" : "s"} with ${count(spot.ahead)} DEMO trade before yours`;
+  element.append(bold(`#${spot.place}`), ` · ${size(spot.ahead)} ahead`);
+  element.title = `${spot.place - 1} order${spot.place === 2 ? "" : "s"} with ${size(spot.ahead)} ${market.base} trade before yours`;
   return element;
 }
 
@@ -1719,8 +1745,8 @@ function updateTicket() {
   const available = free();
   $("available").textContent = available === null
     ? "—"
-    : state.side === "buy" ? money(available) : `${count(available)} DEMO`;
-  const qty = Math.floor(Number($("qty").value));
+    : state.side === "buy" ? money(available) : `${size(available)} ${market.base}`;
+  const qty = lotsOf($("qty").value);
   const buying = state.side === "buy";
   let value = null;
   let hold = null;
@@ -1746,8 +1772,8 @@ function updateTicket() {
   button.className = `submit ${state.side}`;
   button.disabled = !state.connected || short;
   if (!state.connected) button.textContent = "Connecting…";
-  else if (short) button.textContent = buying ? "Not enough cash" : "Not enough DEMO";
-  else button.textContent = `${sideName(state.side)} DEMO`;
+  else if (short) button.textContent = buying ? "Not enough cash" : `Not enough ${market.base}`;
+  else button.textContent = `${sideName(state.side)} ${market.base}`;
 }
 
 function setSide(side) {
@@ -1807,7 +1833,7 @@ function useShare(share) {
       qty = Math.floor(budget / at);
     }
   }
-  $("qty").value = Math.max(0, qty);
+  $("qty").value = plain(Math.max(0, qty));
   notice("");
   updateTicket();
 }
@@ -1820,7 +1846,7 @@ function place(ticks, qty, tif) {
 }
 
 function submit() {
-  const qty = Math.floor(Number($("qty").value));
+  const qty = lotsOf($("qty").value);
   if (!(qty > 0)) {
     notice("Enter an amount", true);
     return;
@@ -1874,6 +1900,27 @@ function stages(message) {
   $("st-sync").textContent = duration(message.sync_ns);
   $("st-apply").textContent = duration(apply);
   $("st-batch").textContent = `(${count(message.batch_commands)} command${message.batch_commands === 1 ? "" : "s"} a turn)`;
+}
+
+// What is traded: names, decimals, and where its orders come from.
+function setMarket(message) {
+  const changed = message.lot_decimals !== market.lot_decimals || message.symbol !== market.symbol;
+  for (const key of Object.keys(market)) market[key] = message[key] ?? null;
+  for (const element of document.querySelectorAll(".m-base")) element.textContent = market.base;
+  for (const element of document.querySelectorAll(".m-quote")) element.textContent = market.quote;
+  $("symbol-mark").textContent = market.base.charAt(0);
+  document.title = `${market.symbol} · Matching Engine · Live Exchange Demo`;
+  const sub = $("symbol-sub");
+  if (market.source) {
+    const link = document.createElement("a");
+    link.href = market.source_url || "#";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = market.source;
+    sub.replaceChildren("Real orders and trades, mirrored live from ", link, " · paper money");
+  } else sub.textContent = "Paper market · traded by bots and you";
+  if (changed) $("qty").value = market.lot_decimals > 0 ? "0.1" : "10";
+  schedule("book", "trades", "chart", "ticker", "wallet", "orders", "ticket", "leaders");
 }
 
 // What the server recovered when it started.

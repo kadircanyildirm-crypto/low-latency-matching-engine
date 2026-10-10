@@ -74,10 +74,10 @@
 
 <section class="ticker" aria-label="Market summary">
   <div class="symbol">
-    <span class="symbol-mark" aria-hidden="true">D</span>
+    <span id="symbol-mark" class="symbol-mark" aria-hidden="true">D</span>
     <div>
-      <div class="symbol-name">DEMO<span class="quote"> / USD</span></div>
-      <div class="symbol-sub">Paper market · traded by bots and you</div>
+      <div class="symbol-name"><span class="m-base">DEMO</span><span class="quote"> / <span class="m-quote">USD</span></span></div>
+      <div id="symbol-sub" class="symbol-sub">Paper market · traded by bots and you</div>
     </div>
   </div>
   <div class="ticker-price">
@@ -171,7 +171,7 @@
           <button class="seg" type="button" data-book="orders" aria-pressed="false" title="Every order in its queue, first in line on the left">Orders</button>
         </div>
       </div>
-      <div class="book-head"><span>Price (USD)</span><span class="by-level">Size</span><span class="by-level">Total</span><span class="by-order">Queue: first in line on the left</span></div>
+      <div class="book-head"><span>Price (<span class="m-quote">USD</span>)</span><span class="by-level">Size</span><span class="by-level">Total</span><span class="by-order">Queue: first in line on the left</span></div>
       <div id="asks" class="levels asks"></div>
       <div class="book-mid">
         <span id="mid-last" class="mid-last">—</span>
@@ -187,7 +187,7 @@
 
     <section class="panel tape-panel" aria-label="Recent trades">
       <div class="panel-head"><h2>Recent trades</h2></div>
-      <div class="tape-head"><span>Price (USD)</span><span>Size</span><span>Time</span></div>
+      <div class="tape-head"><span>Price (<span class="m-quote">USD</span>)</span><span>Size</span><span>Time</span></div>
       <div id="trades" class="rows"></div>
     </section>
   </div>
@@ -209,17 +209,17 @@
       <label id="price-field" class="field">
         <span class="field-label">Price</span>
         <input id="price" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
-        <span class="unit">USD</span>
+        <span class="unit m-quote">USD</span>
       </label>
       <div id="market-field" class="field static" hidden>
         <span class="field-label">Price</span>
         <span class="static-value">Best available</span>
-        <span class="unit">USD</span>
+        <span class="unit m-quote">USD</span>
       </div>
       <label class="field">
         <span class="field-label">Amount</span>
-        <input id="qty" type="number" step="1" min="1" value="10" inputmode="numeric" autocomplete="off">
-        <span class="unit">DEMO</span>
+        <input id="qty" type="text" value="10" inputmode="decimal" autocomplete="off" spellcheck="false">
+        <span class="unit m-base">DEMO</span>
       </label>
       <div class="percent" role="group" aria-label="Share of what is available">
         <button type="button" data-share="0.25">25%</button>
@@ -239,7 +239,7 @@
         <span id="total-label">Order value</span>
         <b id="total">—</b>
       </div>
-      <button id="submit" class="submit buy" type="button">Buy DEMO</button>
+      <button id="submit" class="submit buy" type="button">Buy</button>
       <p id="notice" class="notice" role="status"></p>
     </section>
 
@@ -256,13 +256,13 @@
       <div class="alloc" aria-hidden="true"><i id="alloc-cash"></i></div>
       <div class="alloc-legend" aria-hidden="true">
         <span><i class="swatch cash"></i>Cash</span>
-        <span><i class="swatch shares"></i>DEMO</span>
+        <span><i class="swatch shares"></i><span class="m-base">DEMO</span></span>
       </div>
       <dl class="balances">
         <div><dt>Cash available</dt><dd id="cash">—</dd></div>
         <div><dt>Cash in orders</dt><dd id="cash-held">—</dd></div>
-        <div><dt>DEMO available</dt><dd id="position">—</dd></div>
-        <div><dt>DEMO in orders</dt><dd id="position-held">—</dd></div>
+        <div><dt><span class="m-base">DEMO</span> available</dt><dd id="position">—</dd></div>
+        <div><dt><span class="m-base">DEMO</span> in orders</dt><dd id="position-held">—</dd></div>
       </dl>
     </section>
   </div>

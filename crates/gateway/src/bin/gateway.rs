@@ -4,7 +4,8 @@
 //! [--min-price 1] [--max-price 100000] [--max-orders 1000000] [--max-owners 1024]
 //! [--snapshot-every 1000000] [--max-sessions 1024] [--engine thread|pipeline]
 //! [--wait spin|backoff] [--cores network,writer,matcher] [--web <addr>]
-//! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>]`
+//! [--guests <file>] [--guest-ids 100..1024] [--public-url <url>] [--symbol ETH/USD]
+//! [--price-decimals 2] [--lot-decimals 6] [--source <name>] [--source-url <url>]`
 //!
 //! `--engine pipeline` runs the journal and the book on threads of their own, waiting as
 //! `--wait` says; `--cores` pins the three threads to those logical cores.
@@ -15,6 +16,10 @@
 //! They trade paper money: `--guest-cash` (in price ticks times lots) and
 //! `--guest-position` (in lots) to start with. `--public-url`, where the page is published
 //! such as `https://demo.example.com`, gives its link preview the image's full address.
+//! `--symbol`, `--price-decimals` and `--lot-decimals` tell browsers what is traded: a price
+//! is an integer number of ticks of `10^-price-decimals` of the quote currency, a quantity
+//! of lots of `10^-lot-decimals` of the base asset (DEMO/USD, 2 and 0 by default); and
+//! `--source`, with `--source-url`, names the venue a mirrored market's orders come from.
 //!
 //! The exchange's own state, paper money above all, is checkpointed in the data directory
 //! every `--checkpoint-every` commands (10,000 by default, and at most `--snapshot-every`),
@@ -35,7 +40,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use engine::storage::FsStorage;
 use engine::{EngineConfig, SyncPolicy};
 use gateway::web::Guests;
-use gateway::web::json::Started;
+use gateway::web::json::{Market, Started};
 use gateway::{
     Account, Core, Exchange, Funds, Pipeline, PipelineConfig, Server, ServerConfig, Timing,
     accounts, recovery,
@@ -48,7 +53,7 @@ const USAGE: &str = "usage: gateway --dir <dir> --accounts <file> [--listen <add
 [--max-owners <n>] [--snapshot-every <n>] [--max-sessions <n>] [--engine thread|pipeline] \
 [--wait spin|backoff] [--cores <network>,<writer>,<matcher>] [--web <addr>] \
 [--guests <file>] [--guest-ids <from>..<to>] [--guest-cash <n>] [--guest-position <n>] \
-[--checkpoint-every <n>] [--public-url <url>]";
+[--checkpoint-every <n>] [--public-url <url>] [--symbol <base/quote>] [--price-decimals <n>] [--lot-decimals <n>] [--source <name>] [--source-url <url>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -94,6 +99,19 @@ fn run() -> Result<(), String> {
     let checkpoint_every: u64 = parse(take("checkpoint-every"), "10000", "checkpoint-every")?;
     // An empty one, as compose passes when none is set, is none.
     let public_url = take("public-url").filter(|url| !url.is_empty());
+    let symbol = take("symbol").unwrap_or_else(|| "DEMO/USD".to_owned());
+    let (base, quote) = symbol
+        .split_once('/')
+        .ok_or_else(|| format!("--symbol must be base/quote, such as ETH/USD, not {symbol}"))?;
+    let market = Market {
+        base: base.to_owned(),
+        quote: quote.to_owned(),
+        price_decimals: parse(take("price-decimals"), "2", "price-decimals")?,
+        lot_decimals: parse(take("lot-decimals"), "0", "lot-decimals")?,
+        source: take("source").filter(|name| !name.is_empty()),
+        source_url: take("source-url").filter(|url| !url.is_empty()),
+        symbol: symbol.clone(),
+    };
     if checkpoint_every == 0 || snapshot_every > 0 && checkpoint_every > snapshot_every {
         return Err(
             "--checkpoint-every must be at least one, and at most --snapshot-every: the journal \
@@ -214,6 +232,7 @@ fn run() -> Result<(), String> {
         ),
         started,
         public_url,
+        market,
     };
     if let Some(&core) = cores.first() {
         let found = core_affinity::get_core_ids()
@@ -246,6 +265,7 @@ struct Setup {
     checkpoints: (PathBuf, u64, u64),
     started: Started,
     public_url: Option<String>,
+    market: Market,
 }
 
 /// The accounts in `path`, with ids below `max_owners`.
@@ -269,11 +289,13 @@ fn serve<C: Core>(
         checkpoints: (dir, every, since),
         started,
         public_url,
+        market,
     } = setup;
     let mut server =
         Server::bind(exchange, core, listen, config).map_err(|e| format!("{listen}: {e}"))?;
     server.checkpoint_to(dir, every, since);
     server.set_started(started);
+    server.set_market(market);
     if let Some(url) = public_url {
         server.set_public_url(&url);
     }

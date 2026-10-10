@@ -1325,6 +1325,12 @@ in a batch, applying a command with the routing of its events, and the book's ow
 the commands it measured. A pipeline's two threads add their counts to shared counters
 before they say how far they got, so whoever sees the work done sees it counted.
 
+A browser that subscribes is first told what is traded: the symbol, its base and quote,
+how many decimals a price and a quantity have, and the venue a mirrored market's orders
+come from. The engine knows only integer ticks and lots; the gateway's `--symbol`,
+`--price-decimals` and `--lot-decimals` say what they stand for, so the same page shows the
+bots' DEMO/USD in whole lots and cents, or ETH/USD in millionths of an ether.
+
 A subscribed browser is also shown the engine at work. It gets the statistics of the last
 two minutes when it subscribes, so its charts of them start full, and how the server
 started: the sequence number it recovered to, the snapshot it started from (the commands

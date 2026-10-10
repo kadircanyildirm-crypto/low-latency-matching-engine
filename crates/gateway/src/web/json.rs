@@ -9,7 +9,9 @@
 //! (`login_accepted`, `login_rejected`, `heartbeat`, `logout`, `reject`, `report`, `book`,
 //! `level`, `trade`, `balance`), plus `registered` (`account`, `token`) and `error`
 //! (`message`). A subscribed browser also gets `history` (the last hour as candles),
-//! `started` (how the server recovered when it started), `stats_history` (the statistics of
+//! `market` (what is traded: its names, the decimals of its prices and quantities, and where
+//! its orders come from), `started` (how the server recovered when it started),
+//! `stats_history` (the statistics of
 //! the last two minutes), `queues` (the best levels
 //! order by order), `log` (the commands the engine sequenced, with
 //! what came of them), `leaders` (the most profitable paper accounts) and `rank` (its own
@@ -481,6 +483,50 @@ pub struct Stats {
     pub matched: u64,
 }
 
+/// What is traded, as a browser is told when it subscribes: prices are integer ticks of
+/// `10^-price_decimals` of the quote currency, quantities integer lots of
+/// `10^-lot_decimals` of the base asset, and cash is ticks times lots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Market {
+    /// Such as `ETH/USD`.
+    pub symbol: String,
+    /// Such as `ETH`.
+    pub base: String,
+    /// Such as `USD`.
+    pub quote: String,
+    /// The decimals of a price.
+    pub price_decimals: u32,
+    /// The decimals of a quantity.
+    pub lot_decimals: u32,
+    /// Where the market's orders come from, if it mirrors another venue: its name, for
+    /// attribution.
+    pub source: Option<String>,
+    /// See `source`: where to find it.
+    pub source_url: Option<String>,
+}
+
+impl Default for Market {
+    /// The bots' demo market: whole lots of DEMO, priced in cents.
+    fn default() -> Market {
+        Market {
+            symbol: "DEMO/USD".to_owned(),
+            base: "DEMO".to_owned(),
+            quote: "USD".to_owned(),
+            price_decimals: 2,
+            lot_decimals: 0,
+            source: None,
+            source_url: None,
+        }
+    }
+}
+
+/// The JSON for `market`.
+pub fn market(market: &Market) -> String {
+    let mut value = serde_json::to_value(market).expect("a market serialises");
+    value["type"] = Value::from("market");
+    value.to_string()
+}
+
 /// How the server started: what it recovered, and how long that took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Started {
@@ -890,6 +936,11 @@ mod tests {
         assert_eq!(history["type"], "stats_history");
         assert_eq!(history["stats"].as_array().unwrap().len(), 2);
         assert_eq!(history["stats"][1]["commands_per_second"], 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&market(&Market::default())).unwrap(),
+            json!({"type": "market", "symbol": "DEMO/USD", "base": "DEMO", "quote": "USD",
+                "price_decimals": 2, "lot_decimals": 0, "source": null, "source_url": null})
+        );
         let start = Started {
             started: 1,
             recovered: 2,

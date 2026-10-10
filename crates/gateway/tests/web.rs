@@ -292,6 +292,7 @@ fn a_browser_registers_trades_and_watches_the_market() {
     browser.send(json!({"type": "login", "account": 10, "token": token}));
     assert_eq!(browser.expect("login_accepted")["account"], 10);
     browser.send(json!({"type": "subscribe"}));
+    assert_eq!(browser.expect("market")["symbol"], "DEMO/USD");
     assert_eq!(browser.expect("book")["levels"], 0);
     // Nothing has traded yet.
     let history = browser.expect("history");

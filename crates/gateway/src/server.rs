@@ -267,6 +267,8 @@ pub struct Server<C: Core> {
     start: Option<json::Started>,
     /// The page, with its link preview pointing where it is published, if that is known.
     index: Option<Vec<u8>>,
+    /// What is traded, as browsers are told.
+    market: json::Market,
 }
 
 impl<C: Core> Server<C> {
@@ -320,6 +322,7 @@ impl<C: Core> Server<C> {
             recent_stats: VecDeque::with_capacity(STATS_KEPT),
             start: None,
             index: None,
+            market: json::Market::default(),
         })
     }
 
@@ -327,6 +330,12 @@ impl<C: Core> Server<C> {
     /// long that took.
     pub fn set_started(&mut self, start: json::Started) {
         self.start = Some(start);
+    }
+
+    /// Tells browsers what is traded: its names, the decimals of its prices and quantities,
+    /// and where its orders come from. The bots' DEMO/USD market by default.
+    pub fn set_market(&mut self, market: json::Market) {
+        self.market = market;
     }
 
     /// Tells the page where it is published, such as `https://demo.example.com`, so its
@@ -692,6 +701,11 @@ impl<C: Core> Server<C> {
         };
         match message.inbound() {
             Some(inbound) => {
+                // A browser learns what is traded before the book, so it shows it rightly.
+                if message == WebIn::Subscribe && self.exchange.account_of(session).is_some() {
+                    let market = json::market(&self.market);
+                    self.send_web(session, &market);
+                }
                 self.exchange
                     .receive(session, inbound, now, &mut self.wires);
                 // A browser's chart starts from the last hour, and its queues from now.

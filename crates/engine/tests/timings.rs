@@ -46,8 +46,48 @@ fn measuring_changes_nothing_and_counts_what_it_measured() {
     assert_eq!(timings.commands, 5_000);
     assert_eq!(timings.matched, 5_000 / MATCH_SAMPLE);
     assert!(timings.apply_ns >= timings.match_ns, "{timings:?}");
+    // Real durations: more than a nanosecond for each thing timed.
+    assert!(timings.write_ns > timings.batches, "{timings:?}");
+    assert!(timings.sync_ns > timings.batches, "{timings:?}");
+    assert!(timings.apply_ns > timings.commands, "{timings:?}");
+    assert!(timings.match_ns > timings.matched, "{timings:?}");
     // Taken once.
     assert_eq!(engine.take_timings(), Timings::default());
+}
+
+/// Timings add up field by field, as a pipeline's two halves add theirs.
+#[test]
+fn timings_add_up() {
+    let mut sum = Timings {
+        batches: 1,
+        write_ns: 2,
+        sync_ns: 3,
+        commands: 4,
+        apply_ns: 5,
+        matched: 6,
+        match_ns: 7,
+    };
+    sum.add(Timings {
+        batches: 10,
+        write_ns: 20,
+        sync_ns: 30,
+        commands: 40,
+        apply_ns: 50,
+        matched: 60,
+        match_ns: 70,
+    });
+    assert_eq!(
+        sum,
+        Timings {
+            batches: 11,
+            write_ns: 22,
+            sync_ns: 33,
+            commands: 44,
+            apply_ns: 55,
+            matched: 66,
+            match_ns: 77,
+        }
+    );
 }
 
 /// A measured command with more events than are reserved for it hands them all on, in

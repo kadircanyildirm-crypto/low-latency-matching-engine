@@ -3,103 +3,298 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Matching Engine · Live Demo</title>
+<title>Matching Engine · Live Exchange Demo</title>
+<meta name="description" content="A live exchange running on a Rust matching engine: price-time priority, a write-ahead journal with crash recovery, and a lock-free pipeline. Trade with paper money against bots.">
+<meta name="theme-color" content="#0d1117">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Low-Latency Matching Engine · Live Demo">
+<meta property="og:description" content="Trade with paper money on a live exchange built on a Rust matching engine.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>
-  <div class="brand">
-    <strong>Low-Latency Matching Engine</strong>
-    <span class="muted">live demo · paper money only</span>
-  </div>
-  <div class="status">
-    <span id="phase" class="pill" hidden></span>
-    <span id="connection" class="pill off">connecting</span>
-    <span id="account" class="muted"></span>
+<header class="topbar">
+  <a class="brand" href="/" aria-label="Matching Engine, live demo">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <rect width="32" height="32" rx="7" class="logo-bg"/>
+      <path d="M9 12.5v13" class="logo-sell logo-wick"/>
+      <rect x="6.5" y="15" width="5" height="8" rx="1" class="logo-sell"/>
+      <path d="M16 8.5v13" class="logo-buy logo-wick"/>
+      <rect x="13.5" y="11" width="5" height="8" rx="1" class="logo-buy"/>
+      <path d="M23 5v12.5" class="logo-buy logo-wick"/>
+      <rect x="20.5" y="7" width="5" height="8" rx="1" class="logo-buy"/>
+    </svg>
+    <span class="brand-name">Matching Engine</span>
+    <span class="brand-tag">Live demo</span>
+  </a>
+  <nav class="nav" aria-label="About this demo">
+    <button id="about-open" class="nav-link" type="button">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v4M8 4.75v.01"/></svg>
+      <span>How it works</span>
+    </button>
+    <a class="nav-link" href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true" class="filled"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span>Source code</span>
+    </a>
+  </nav>
+  <div class="top-status">
+    <span class="paper-badge" title="Every account here holds paper money. Nothing you do on this page moves real funds.">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 13.5 3.5v4.2c0 3.2-2.3 5.8-5.5 6.8-3.2-1-5.5-3.6-5.5-6.8V3.5z"/><path d="m5.75 8 1.6 1.6 3-3.2"/></svg>
+      Paper money
+    </span>
+    <span id="connection" class="conn" data-state="connecting" role="status">
+      <i class="dot" aria-hidden="true"></i><span id="connection-text">Connecting</span>
+    </span>
+    <span id="account" class="account-chip" hidden></span>
   </div>
 </header>
 
-<main>
-  <section class="panel book" aria-label="Order book">
-    <h2>Order book</h2>
-    <div class="book-head"><span>Price</span><span>Size</span><span>Orders</span></div>
-    <div id="asks" class="levels asks"></div>
-    <div id="spread" class="spread">—</div>
-    <div id="bids" class="levels bids"></div>
-  </section>
-
-  <section class="panel chart" aria-label="Price chart">
-    <div class="chart-head">
-      <h2>Last price <span id="last" class="big">—</span></h2>
-      <span id="change" class="muted"></span>
+<section class="ticker" aria-label="Market summary">
+  <div class="symbol">
+    <span class="symbol-mark" aria-hidden="true">D</span>
+    <div>
+      <div class="symbol-name">DEMO<span class="quote"> / USD</span></div>
+      <div class="symbol-sub">Paper market · traded by bots and you</div>
     </div>
-    <canvas id="canvas" width="800" height="320"></canvas>
-  </section>
-
-  <section class="panel tape" aria-label="Trades">
-    <h2>Trades</h2>
-    <div class="tape-head"><span>Time</span><span>Price</span><span>Size</span></div>
-    <div id="trades" class="rows"></div>
-  </section>
-
-  <section class="panel ticket" aria-label="Place an order">
-    <h2>Trade</h2>
-    <div class="sides" role="group" aria-label="Side">
-      <button id="buy-side" class="side buy active" type="button">Buy</button>
-      <button id="sell-side" class="side sell" type="button">Sell</button>
-    </div>
-    <label>Price <input id="price" type="number" step="0.01" min="0.01" inputmode="decimal"></label>
-    <label>Quantity <input id="qty" type="number" step="1" min="1" value="10" inputmode="numeric"></label>
-    <label>Time in force
-      <select id="tif">
-        <option value="gtc">Good till cancelled</option>
-        <option value="ioc">Immediate or cancel</option>
-        <option value="post_only">Post only</option>
-      </select>
-    </label>
-    <button id="submit" class="submit buy" type="button">Buy</button>
-    <button id="now" class="secondary" type="button">Buy now at the best price</button>
-    <p id="notice" class="notice" role="status"></p>
-  </section>
-
-  <section class="panel wallet" aria-label="Your account">
-    <h2>Your paper account</h2>
-    <dl>
-      <dt>Cash</dt><dd id="cash">—</dd>
-      <dt>Shares</dt><dd id="position">—</dd>
-      <dt>Held for orders</dt><dd id="held">—</dd>
-      <dt>Value at last price</dt><dd id="value">—</dd>
-      <dt>Profit since you opened this page</dt><dd id="pnl">—</dd>
-    </dl>
-  </section>
-
-  <section class="panel orders" aria-label="Your orders">
-    <h2>Your open orders <button id="cancel-all" class="link" type="button">cancel all</button></h2>
-    <table>
-      <thead><tr><th>Id</th><th>Side</th><th>Price</th><th>Open</th><th></th></tr></thead>
-      <tbody id="open-orders"></tbody>
-    </table>
-    <h2>Your trades</h2>
-    <table>
-      <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Size</th></tr></thead>
-      <tbody id="fills"></tbody>
-    </table>
-  </section>
-</main>
-
-<section class="panel stats" aria-label="How the exchange is doing">
-  <span><b id="cps">—</b> commands/s</span>
-  <span>engine turn p50 <b id="p50">—</b></span>
-  <span>p99 <b id="p99">—</b></span>
-  <span>max <b id="max">—</b></span>
-  <span><b id="sessions">—</b> sessions</span>
-  <span><b id="resting">—</b> orders on the book</span>
+  </div>
+  <div class="ticker-price">
+    <span id="last" class="last">—</span>
+    <span id="last-direction" class="direction" aria-hidden="true"></span>
+  </div>
+  <dl class="ticker-stats">
+    <div><dt>Change</dt><dd id="change">—</dd></div>
+    <div><dt>High</dt><dd id="high">—</dd></div>
+    <div><dt>Low</dt><dd id="low">—</dd></div>
+    <div><dt>Volume</dt><dd id="volume">—</dd></div>
+    <div><dt>Spread</dt><dd id="spread-top">—</dd></div>
+    <div><dt>Market</dt><dd id="phase" class="phase">Open</dd></div>
+  </dl>
+  <span class="ticker-window">Last hour</span>
 </section>
 
-<footer class="muted">
-  A Rust exchange matching engine: price-time priority, a write-ahead journal with crash
-  recovery, a lock-free pipeline. The other traders are bots. Prices in dollars and cents.
+<main class="terminal">
+  <div class="col col-main">
+    <section class="panel chart-panel" aria-label="Price chart">
+      <div class="panel-head">
+        <div class="segmented" role="group" aria-label="Candle length">
+          <button class="seg active" type="button" data-interval="5" aria-pressed="true">5s</button>
+          <button class="seg" type="button" data-interval="15" aria-pressed="false">15s</button>
+          <button class="seg" type="button" data-interval="60" aria-pressed="false">1m</button>
+        </div>
+        <div class="segmented" role="group" aria-label="Chart style">
+          <button class="seg active" type="button" data-style="candles" aria-pressed="true">Candles</button>
+          <button class="seg" type="button" data-style="line" aria-pressed="false">Line</button>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <div id="legend" class="legend" aria-hidden="true"></div>
+        <canvas id="canvas" aria-label="Candlestick chart of the last hour of trades" role="img"></canvas>
+        <div id="chart-empty" class="chart-empty">
+          <span class="spinner" aria-hidden="true"></span>
+          Waiting for the first trade
+        </div>
+      </div>
+    </section>
+
+    <section class="panel orders-panel" aria-label="Your orders and trades">
+      <div class="panel-head">
+        <div class="tabs" role="tablist">
+          <button id="tab-open" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="open-view">
+            Open orders <span id="open-count" class="count">0</span>
+          </button>
+          <button id="tab-fills" class="tab" type="button" role="tab" aria-selected="false" aria-controls="fills-view">
+            Your trades <span id="fill-count" class="count">0</span>
+          </button>
+        </div>
+        <button id="cancel-all" class="ghost" type="button" hidden>Cancel all</button>
+      </div>
+      <div id="open-view" class="table-view" role="tabpanel" aria-labelledby="tab-open">
+        <table>
+          <thead><tr><th class="left">Placed</th><th class="left">Side</th><th>Price</th><th>Amount</th><th>Filled</th><th>Order</th><th><span class="sr-only">Cancel</span></th></tr></thead>
+          <tbody id="open-orders"></tbody>
+        </table>
+        <div id="open-empty" class="empty">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3.5" width="16" height="17" rx="2.5"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></svg>
+          <b>No open orders</b>
+          <span>Click a price in the order book to set one up.</span>
+        </div>
+      </div>
+      <div id="fills-view" class="table-view" role="tabpanel" aria-labelledby="tab-fills" hidden>
+        <table>
+          <thead><tr><th class="left">Time</th><th class="left">Side</th><th>Price</th><th>Amount</th><th>Total</th></tr></thead>
+          <tbody id="fills"></tbody>
+        </table>
+        <div id="fills-empty" class="empty">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16.5 9 11l3.5 3.5L20 7"/><path d="M15 7h5v5"/></svg>
+          <b>No trades yet</b>
+          <span>Your fills appear here as they happen.</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="col col-market">
+    <section class="panel book-panel" aria-label="Order book">
+      <div class="panel-head">
+        <h2>Order book</h2>
+        <span class="hint">Click a price to trade it</span>
+      </div>
+      <div class="book-head"><span>Price (USD)</span><span>Size</span><span>Total</span></div>
+      <div id="asks" class="levels asks"></div>
+      <div class="book-mid">
+        <span id="mid-last" class="mid-last">—</span>
+        <span id="spread" class="spread">—</span>
+      </div>
+      <div id="bids" class="levels bids"></div>
+      <div class="book-balance" aria-label="Share of the book's size on each side">
+        <span id="bid-share" class="bid-share">B —</span>
+        <div class="balance-bar"><i id="bid-bar"></i></div>
+        <span id="ask-share" class="ask-share">— S</span>
+      </div>
+    </section>
+
+    <section class="panel tape-panel" aria-label="Recent trades">
+      <div class="panel-head"><h2>Recent trades</h2></div>
+      <div class="tape-head"><span>Price (USD)</span><span>Size</span><span>Time</span></div>
+      <div id="trades" class="rows"></div>
+    </section>
+  </div>
+
+  <div class="col col-trade">
+    <section class="panel ticket" aria-label="Place an order">
+      <div class="sides" role="group" aria-label="Side">
+        <button id="buy-side" class="side buy active" type="button" aria-pressed="true">Buy</button>
+        <button id="sell-side" class="side sell" type="button" aria-pressed="false">Sell</button>
+      </div>
+      <div class="segmented wide" role="group" aria-label="Order type">
+        <button id="type-limit" class="seg active" type="button" aria-pressed="true">Limit</button>
+        <button id="type-market" class="seg" type="button" aria-pressed="false">Market</button>
+      </div>
+      <div class="available">
+        <span>Available</span>
+        <b id="available">—</b>
+      </div>
+      <label id="price-field" class="field">
+        <span class="field-label">Price</span>
+        <input id="price" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
+        <span class="unit">USD</span>
+      </label>
+      <div id="market-field" class="field static" hidden>
+        <span class="field-label">Price</span>
+        <span class="static-value">Best available</span>
+        <span class="unit">USD</span>
+      </div>
+      <label class="field">
+        <span class="field-label">Amount</span>
+        <input id="qty" type="number" step="1" min="1" value="10" inputmode="numeric" autocomplete="off">
+        <span class="unit">DEMO</span>
+      </label>
+      <div class="percent" role="group" aria-label="Share of what is available">
+        <button type="button" data-share="0.25">25%</button>
+        <button type="button" data-share="0.5">50%</button>
+        <button type="button" data-share="0.75">75%</button>
+        <button type="button" data-share="1">Max</button>
+      </div>
+      <label id="tif-field" class="field select">
+        <span class="field-label">Time in force</span>
+        <select id="tif">
+          <option value="gtc">Good till cancelled</option>
+          <option value="ioc">Immediate or cancel</option>
+          <option value="post_only">Post only</option>
+        </select>
+      </label>
+      <div class="summary">
+        <span id="total-label">Order value</span>
+        <b id="total">—</b>
+      </div>
+      <button id="submit" class="submit buy" type="button">Buy DEMO</button>
+      <p id="notice" class="notice" role="status"></p>
+    </section>
+
+    <section class="panel wallet" aria-label="Your paper account">
+      <div class="panel-head">
+        <h2>Paper account</h2>
+        <span id="account-id" class="hint"></span>
+      </div>
+      <div class="equity">
+        <span class="equity-label">Total value</span>
+        <span id="value" class="equity-value">—</span>
+        <span id="pnl" class="pnl">—</span>
+      </div>
+      <div class="alloc" aria-hidden="true"><i id="alloc-cash"></i></div>
+      <div class="alloc-legend" aria-hidden="true">
+        <span><i class="swatch cash"></i>Cash</span>
+        <span><i class="swatch shares"></i>DEMO</span>
+      </div>
+      <dl class="balances">
+        <div><dt>Cash available</dt><dd id="cash">—</dd></div>
+        <div><dt>Cash in orders</dt><dd id="cash-held">—</dd></div>
+        <div><dt>DEMO available</dt><dd id="position">—</dd></div>
+        <div><dt>DEMO in orders</dt><dd id="position-held">—</dd></div>
+      </dl>
+    </section>
+  </div>
+</main>
+
+<footer class="statusbar">
+  <div class="engine-stats" aria-label="How the exchange is doing">
+    <span class="engine-state"><i class="dot" aria-hidden="true"></i><span id="engine-text">Engine</span></span>
+    <span title="Commands the exchange numbered in the last second"><b id="cps">—</b> cmd/s</span>
+    <span title="How long a turn of the server took, from reading commands to sending replies, journal sync included">turn p50 <b id="p50">—</b></span>
+    <span title="99th percentile turn">p99 <b id="p99">—</b></span>
+    <span title="Slowest turn in the last second">max <b id="max">—</b></span>
+    <span><b id="sessions">—</b> sessions</span>
+    <span><b id="resting">—</b> resting orders</span>
+  </div>
+  <div class="status-right">
+    <span class="hide-small">Rust · price-time priority · journaled</span>
+    <span id="clock" class="clock">—</span>
+  </div>
 </footer>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<dialog id="about" class="about" aria-labelledby="about-title">
+  <form method="dialog" class="about-inner">
+    <button class="close" value="close" aria-label="Close">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+    </button>
+    <span class="eyebrow">Live demo · paper money</span>
+    <h2 id="about-title">A real matching engine. Pretend money.</h2>
+    <p>
+      Every order you place here goes through a working exchange: it is numbered, written
+      to a journal, matched against the bots' orders, and settled in your paper account.
+      Nothing on this page involves real funds.
+    </p>
+    <ul class="features">
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h11M4 12h16M4 17h8"/></svg>
+        <div><b>Price-time priority</b><span>Best price first, then first come, first served. Limit, immediate-or-cancel and post-only orders here; the engine also does icebergs, stops and auctions.</span></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg>
+        <div><b>Nothing confirmed that could be lost</b><span>Commands are journaled and synced to disk before anyone hears about them.</span></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.35-5.65M20 4v4.5h-4.5"/></svg>
+        <div><b>Crash recovery</b><span>After a restart, checkpoints and the journal bring back every balance and every open order.</span></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3 5 13.5h6L10 21l8-10.5h-6z"/></svg>
+        <div><b>Built for low latency</b><span>One deterministic matching thread that allocates nothing while it trades, and an optional pipeline of threads joined by lock-free rings.</span></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19.5 6v5.5c0 4.5-3.2 8.2-7.5 9.5-4.3-1.3-7.5-5-7.5-9.5V6z"/><path d="m8.75 12 2.25 2.25 4.25-4.5"/></svg>
+        <div><b>Checked, not just tested</b><span>Property tests against a reference model, fuzzing, Miri, loom, Kani proofs and mutation testing in CI.</span></div>
+      </li>
+    </ul>
+    <div class="about-foot">
+      <a class="ghost" href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine" target="_blank" rel="noopener noreferrer">Read the source</a>
+      <button class="primary" value="start">Start trading</button>
+    </div>
+  </form>
+</dialog>
+
 <script src="/app.js"></script>
 </body>
 </html>

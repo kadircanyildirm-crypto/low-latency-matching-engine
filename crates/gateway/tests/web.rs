@@ -240,6 +240,11 @@ fn the_page_is_served_and_nothing_else() {
     assert!(page.contains("<!doctype html>"));
     let script = http(gateway.web, b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(script.contains("text/javascript"));
+    let icon = http(gateway.web, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        icon.contains("image/svg+xml") && icon.contains("<svg"),
+        "{icon}"
+    );
     assert!(http(gateway.web, b"GET /secret HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
     assert!(http(gateway.web, b"POST / HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 400"));
     // The binary listener does not speak HTTP: it logs the connection out.

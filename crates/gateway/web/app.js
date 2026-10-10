@@ -1,36 +1,86 @@
 "use strict";
 
 // Prices are integer ticks of one cent; cash is ticks times lots.
-const money = (ticks) => (ticks / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
+const dollars = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const whole = new Intl.NumberFormat("en-US");
+const money = (ticks) => dollars.format(ticks / 100);
 const price = (ticks) => (ticks / 100).toFixed(2);
-const clock = () => new Date().toLocaleTimeString("en-GB");
+const count = (n) => whole.format(n);
+// A price typed in dollars, with a decimal point or comma, in ticks.
+const ticksOf = (text) => Math.round(Number(String(text).trim().replace(",", ".")) * 100);
 const $ = (id) => document.getElementById(id);
+const two = (n) => String(n).padStart(2, "0");
+const timeOf = (ms) => {
+  const at = new Date(ms);
+  return `${two(at.getHours())}:${two(at.getMinutes())}:${two(at.getSeconds())}`;
+};
+
+// Levels shown on each side of the book.
+const DEPTH = 10;
+// The server's candles, in seconds, and how far back it keeps them.
+const INTERVAL = 5;
+const KEPT = 3_600;
 
 const state = {
   socket: null,
+  connected: false,
   account: null,
   side: "buy",
-  bids: new Map(),
+  type: "limit",
+  bids: new Map(), // price -> {qty, orders}
   asks: new Map(),
   trades: [],
   last: null,
-  first: null,
+  direction: 0,
   wallet: null,
-  start: null,
-  requests: new Map(), // client ref -> {side, price, qty}
-  orders: new Map(), // order id -> {id, side, price, leaves}
+  baseline: null, // what the account started with: profit is measured from it
+  requests: new Map(), // client ref -> the order as sent
+  orders: new Map(), // order id -> {id, side, price, qty, leaves, time, tif}
   fills: [],
   nextRef: Date.now() % 1_000_000_000,
   retry: 500,
+  offset: 0, // the server's clock minus ours, in milliseconds
+  statsAt: 0,
 };
 
-function credentials() {
+const now = () => Date.now() + state.offset;
+
+// ---------- Storage that may not be there ----------
+
+function load(key) {
   try {
-    return JSON.parse(localStorage.getItem("exchange-account") || "null");
+    return JSON.parse(localStorage.getItem(key) || "null");
   } catch {
     return null;
   }
 }
+
+function save(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // A private window: the account lasts as long as the page.
+  }
+}
+
+// ---------- Drawing, at most once a frame ----------
+
+const dirty = new Set();
+let framePending = false;
+function schedule(...parts) {
+  for (const part of parts) dirty.add(part);
+  if (framePending) return;
+  framePending = true;
+  requestAnimationFrame(() => {
+    framePending = false;
+    const parts = [...dirty];
+    dirty.clear();
+    for (const part of parts) renderers[part]();
+  });
+}
+
+// ---------- Connection ----------
 
 function send(message) {
   if (state.socket && state.socket.readyState === WebSocket.OPEN) {
@@ -38,10 +88,11 @@ function send(message) {
   }
 }
 
-function notice(text, error = false) {
-  const element = $("notice");
-  element.textContent = text;
-  element.className = error ? "notice error" : "notice";
+function setConnection(kind, text) {
+  $("connection").dataset.state = kind;
+  $("connection-text").textContent = text;
+  state.connected = kind === "live";
+  schedule("ticket");
 }
 
 function connect() {
@@ -50,86 +101,112 @@ function connect() {
   state.socket = socket;
   socket.onopen = () => {
     state.retry = 500;
-    $("connection").textContent = "connected";
-    $("connection").className = "pill on";
-    const saved = credentials();
-    if (saved) {
-      send({ type: "login", account: saved.account, token: saved.token });
-    } else {
-      send({ type: "register" });
-    }
+    setConnection("connecting", "Signing in");
+    const saved = load("exchange-account");
+    if (saved) send({ type: "login", account: saved.account, token: saved.token });
+    else send({ type: "register" });
   };
   socket.onmessage = (event) => receive(JSON.parse(event.data));
   socket.onclose = () => {
-    $("connection").textContent = "reconnecting";
-    $("connection").className = "pill off";
+    setConnection("down", state.elsewhere ? "Open in another tab" : "Reconnecting");
     state.orders.clear();
-    renderOrders();
+    state.requests.clear();
+    schedule("orders", "book");
     setTimeout(connect, state.retry);
     state.retry = Math.min(state.retry * 2, 10_000);
   };
 }
 
+const REASONS = {
+  too_many_orders: "You have as many open orders as a paper account may.",
+  throttled: "Too many messages at once. Slow down a little.",
+  unavailable: "The exchange is not taking orders right now.",
+  insufficient_funds: "Your paper account does not cover this order.",
+  not_allowed: "Paper accounts place limit orders and cancel them.",
+  price_out_of_range: "That price is outside the allowed range.",
+  price_outside_protection: "That price is too far from the market.",
+  price_outside_band: "That price is too far from the last trade.",
+  post_only_would_cross: "A post-only order would have traded at once.",
+  invalid_quantity: "That amount is not allowed.",
+  unknown_order: "That order is no longer open.",
+  book_full: "The order book is full.",
+  trading_halted: "Trading is halted.",
+  auction_call: "Only limit orders are taken during the auction call.",
+  market_closed: "The market is closed.",
+  already_logged_in: "This account is open in another tab.",
+};
+const reason = (code) => {
+  const text = REASONS[code] || code.replaceAll("_", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
 function receive(message) {
   switch (message.type) {
     case "registered":
-      localStorage.setItem(
-        "exchange-account",
-        JSON.stringify({ account: message.account, token: message.token }),
-      );
+      save("exchange-account", { account: message.account, token: message.token });
       send({ type: "login", account: message.account, token: message.token });
       break;
     case "login_accepted":
       state.account = message.account;
-      $("account").textContent = `account #${message.account}`;
+      state.elsewhere = false;
+      setConnection("live", "Live");
+      $("account").hidden = false;
+      $("account").replaceChildren("Account", bold(`#${message.account}`));
+      $("account-id").textContent = `#${message.account}`;
       send({ type: "subscribe" });
       break;
     case "login_rejected":
       // An account the exchange no longer knows, or one open in another tab.
+      // The other tab may be closing: this one keeps trying, and says so once.
       if (message.reason === "bad_credentials") {
-        localStorage.removeItem("exchange-account");
+        save("exchange-account", null);
         send({ type: "register" });
+      } else if (message.reason === "already_logged_in") {
+        if (!state.elsewhere) toast("Open in another tab", "This tab takes over when that one closes.", "error");
+        state.elsewhere = true;
       } else {
-        notice(`Login refused: ${message.reason.replaceAll("_", " ")}`, true);
+        toast("Could not sign in", reason(message.reason), "error");
       }
       break;
     case "book":
       state.bids.clear();
       state.asks.clear();
+      schedule("book");
       break;
     case "level": {
       const side = message.side === "buy" ? state.bids : state.asks;
       if (message.orders === 0) side.delete(message.price);
       else side.set(message.price, { qty: message.qty, orders: message.orders });
-      scheduleBook();
+      schedule("book", "ticket");
       break;
     }
+    case "history":
+      chart.base = message.candles.map((candle) => ({ ...candle }));
+      if (state.last === null && chart.base.length) state.last = chart.base[chart.base.length - 1].c;
+      schedule("chart", "ticker", "wallet");
+      break;
     case "trade":
-      state.trades.unshift({ time: clock(), price: message.price, qty: message.qty, side: message.side });
-      state.trades.length = Math.min(state.trades.length, 60);
-      state.last = message.price;
-      if (state.first === null) state.first = message.price;
-      pushPoint(message.price);
-      scheduleTrades();
-      renderWallet();
+      trade(message);
       break;
     case "report":
       report(message);
       break;
     case "balance":
-      state.wallet = message;
-      if (state.start === null) state.start = message;
-      renderWallet();
+      balance(message);
       break;
-    case "reject":
+    case "reject": {
+      const request = state.requests.get(message.ref);
       state.requests.delete(message.ref);
-      notice(`Refused: ${message.reason.replaceAll("_", " ")}`, true);
+      toast(request ? `${sideName(request.side)} order refused` : "Refused", reason(message.reason), "error");
       break;
+    }
     case "logout":
-      notice(`Logged out: ${message.reason.replaceAll("_", " ")}`, true);
+      if (message.reason !== "requested") toast("Signed out", reason(message.reason), "error");
       break;
     case "error":
-      notice(message.message, true);
+      if (message.message === "no accounts are left") {
+        toast("The demo is full", "Every paper account is taken. Try again later.", "error");
+      } else toast("Something went wrong", message.message, "error");
       break;
     case "stats":
       stats(message);
@@ -139,130 +216,396 @@ function receive(message) {
   }
 }
 
+const bold = (text) => {
+  const element = document.createElement("b");
+  element.textContent = text;
+  return element;
+};
+const sideName = (side) => (side === "buy" ? "Buy" : "Sell");
+
+// ---------- Market data ----------
+
+function trade(message) {
+  state.direction = state.last === null ? 0 : Math.sign(message.price - state.last) || state.direction;
+  state.last = message.price;
+  state.trades.unshift({
+    time: now(),
+    price: message.price,
+    qty: message.qty,
+    side: message.side,
+    shown: false,
+  });
+  if (state.trades.length > 60) state.trades.length = 60;
+  record(message.price, message.qty);
+  schedule("trades", "chart", "ticker", "wallet", "book");
+}
+
+// ---------- Your orders ----------
+
 function report(message) {
   const known = state.orders.get(message.id);
   switch (message.kind) {
     case "accepted": {
       const request = state.requests.get(message.ref);
       state.requests.delete(message.ref);
-      if (request) state.orders.set(message.id, { id: message.id, ...request, leaves: request.qty });
+      if (request) {
+        state.orders.set(message.id, { id: message.id, ...request, leaves: request.qty });
+        if (request.tif !== "ioc") remember(message.id, request);
+      }
       break;
     }
     case "rested":
-      state.orders.set(message.id, {
-        id: message.id,
-        side: message.side,
-        price: message.price,
-        leaves: message.qty,
-      });
+      if (known) known.leaves = message.qty;
+      else {
+        // An order from before this page: its size and time, if this browser placed it.
+        const placed = recall(message.id);
+        state.orders.set(message.id, {
+          id: message.id,
+          side: message.side,
+          price: message.price,
+          qty: placed ? placed.qty : null,
+          leaves: message.qty,
+          time: placed ? placed.time : null,
+          tif: placed ? placed.tif : "gtc",
+        });
+      }
       break;
     case "fill":
-      state.fills.unshift({ time: clock(), side: message.side, price: message.price, qty: message.qty });
-      state.fills.length = Math.min(state.fills.length, 30);
-      if (message.leaves === 0) state.orders.delete(message.id);
-      else if (known) known.leaves = message.leaves;
-      notice(`${message.side === "buy" ? "Bought" : "Sold"} ${message.qty} at ${price(message.price)}`);
+      state.fills.unshift({ time: now(), side: message.side, price: message.price, qty: message.qty });
+      if (state.fills.length > 100) state.fills.length = 100;
+      if (message.leaves === 0) {
+        state.orders.delete(message.id);
+        if (known && known.tif !== "ioc") remember(message.id, null);
+      } else if (known) known.leaves = message.leaves;
+      filled(message);
       break;
     case "cancelled":
       state.orders.delete(message.id);
+      if (known && known.tif !== "ioc") remember(message.id, null);
+      // The rest of an immediate order is cancelled as a matter of course.
+      if (known && known.tif !== "ioc") {
+        toast("Order cancelled", `${sideName(known.side)} ${count(known.leaves)} DEMO at ${price(known.price)}`);
+      }
       break;
     case "rejected":
       state.orders.delete(message.id);
-      notice(`Refused by the book: ${message.reason.replaceAll("_", " ")}`, true);
+      toast("Order refused by the book", reason(message.reason), "error");
       break;
     case "phase_changed":
-      $("phase").textContent = message.phase;
-      $("phase").hidden = false;
+      phase(message.phase);
       break;
     default:
       break;
   }
-  renderOrders();
+  schedule("orders", "book");
 }
 
-// The book is drawn at most once a frame.
-let bookPending = false;
-function scheduleBook() {
-  if (bookPending) return;
-  bookPending = true;
-  requestAnimationFrame(() => {
-    bookPending = false;
-    renderBook();
+// What this browser placed, so that an order told again after a reload keeps its size
+// and time. Only the latest hundred are kept.
+function remember(id, order) {
+  const saved = load("exchange-placed");
+  const placed = saved && saved.account === state.account ? saved.placed : {};
+  if (order) placed[id] = { qty: order.qty, time: order.time, tif: order.tif };
+  else delete placed[id];
+  const ids = Object.keys(placed).map(Number).sort((a, b) => a - b);
+  for (const old of ids.slice(0, Math.max(0, ids.length - 100))) delete placed[old];
+  save("exchange-placed", { account: state.account, placed });
+}
+
+function recall(id) {
+  const saved = load("exchange-placed");
+  return saved && saved.account === state.account ? saved.placed[id] || null : null;
+}
+
+// Fills of one order that come together are told as one.
+const pendingFills = new Map();
+let fillTimer = null;
+function filled(message) {
+  const sum = pendingFills.get(message.id) || { side: message.side, qty: 0, value: 0 };
+  sum.qty += message.qty;
+  sum.value += message.qty * message.price;
+  pendingFills.set(message.id, sum);
+  if (fillTimer !== null) return;
+  fillTimer = setTimeout(() => {
+    for (const [id, fill] of pendingFills) {
+      const average = price(Math.round(fill.value / fill.qty));
+      const verb = fill.side === "buy" ? "Bought" : "Sold";
+      toast(`${verb} ${count(fill.qty)} DEMO`, `at ${average} on average · order #${id}`, fill.side);
+    }
+    pendingFills.clear();
+    fillTimer = null;
+  }, 250);
+}
+
+function balance(message) {
+  state.wallet = message;
+  if (state.baseline === null || state.baseline.account !== state.account) {
+    const saved = load("exchange-baseline");
+    if (saved && saved.account === state.account) state.baseline = saved;
+    else {
+      // What a new account starts with, or what an older one had when first seen here.
+      state.baseline = { account: state.account, cash: message.cash, position: message.position };
+      save("exchange-baseline", state.baseline);
+    }
+  }
+  schedule("wallet", "ticket");
+}
+
+const PHASES = { continuous: "Open", auction: "Auction", halted: "Halted", closed: "Closed" };
+function phase(name) {
+  const element = $("phase");
+  element.textContent = PHASES[name] || name;
+  element.className = `phase ${name}`;
+}
+
+// ---------- Order book ----------
+
+function makeRows(element, side) {
+  const slots = [];
+  for (let index = 0; index < DEPTH; index += 1) {
+    const row = document.createElement("div");
+    row.className = "level empty-row";
+    const bar = document.createElement("i");
+    bar.className = "bar";
+    const at = document.createElement("span");
+    at.className = "price";
+    const qty = document.createElement("span");
+    const total = document.createElement("span");
+    total.className = "total";
+    row.append(bar, at, qty, total);
+    const slot = { row, bar, at, qty, total, price: null, size: null };
+    // Clicking a level sets up the order that would trade with it.
+    row.addEventListener("click", () => {
+      if (slot.price !== null) pick(slot.price, side === "ask" ? "buy" : "sell");
+    });
+    element.append(row);
+    slots.push(slot);
+  }
+  return slots;
+}
+
+const askSlots = makeRows($("asks"), "ask");
+const bidSlots = makeRows($("bids"), "bid");
+
+function show(slot, level, total, max, mine) {
+  if (!level) {
+    if (slot.price !== null) {
+      slot.row.className = "level empty-row";
+      slot.row.removeAttribute("title");
+      slot.at.textContent = slot.qty.textContent = slot.total.textContent = "";
+      slot.at.className = "price";
+      slot.bar.style.width = "0";
+      slot.price = slot.size = null;
+    }
+    return;
+  }
+  const [at, { qty, orders }] = level;
+  const changed = slot.price === at && slot.size !== qty;
+  slot.at.textContent = price(at);
+  slot.at.className = mine ? "price mine" : "price";
+  slot.qty.textContent = count(qty);
+  slot.total.textContent = count(total);
+  slot.bar.style.width = `${(100 * total) / max}%`;
+  slot.row.title = `${orders} order${orders === 1 ? "" : "s"} at ${price(at)}`;
+  if (slot.price === null) slot.row.className = "level";
+  if (changed) {
+    slot.row.classList.remove("flash");
+    void slot.row.offsetWidth;
+    slot.row.classList.add("flash");
+  }
+  slot.price = at;
+  slot.size = qty;
+}
+
+const sorted = (side) => {
+  const levels = [...(side === "buy" ? state.bids : state.asks)];
+  return levels.sort(side === "buy" ? (a, b) => b[0] - a[0] : (a, b) => a[0] - b[0]);
+};
+
+function renderBook() {
+  const bids = sorted("buy").slice(0, DEPTH);
+  const asks = sorted("sell").slice(0, DEPTH);
+  const totals = (levels) => {
+    let sum = 0;
+    return levels.map(([, level]) => (sum += level.qty));
+  };
+  const bidTotals = totals(bids);
+  const askTotals = totals(asks);
+  const bidSum = bidTotals[bidTotals.length - 1] || 0;
+  const askSum = askTotals[askTotals.length - 1] || 0;
+  const max = Math.max(1, bidSum, askSum);
+  const mine = (side) => new Set([...state.orders.values()].filter((o) => o.side === side).map((o) => o.price));
+  const myBids = mine("buy");
+  const myAsks = mine("sell");
+  // The best ask sits at the bottom of its half, next to the spread.
+  askSlots.forEach((slot, index) => {
+    const at = DEPTH - 1 - index;
+    show(slot, asks[at], askTotals[at], max, asks[at] && myAsks.has(asks[at][0]));
   });
+  bidSlots.forEach((slot, index) => {
+    show(slot, bids[index], bidTotals[index], max, bids[index] && myBids.has(bids[index][0]));
+  });
+
+  const spread = bids.length && asks.length ? asks[0][0] - bids[0][0] : null;
+  const mid = spread === null ? null : (asks[0][0] + bids[0][0]) / 2;
+  $("spread").textContent = spread === null
+    ? "No spread"
+    : `Spread ${price(spread)} · ${((spread / mid) * 100).toFixed(2)}%`;
+  $("spread-top").textContent = spread === null ? "—" : price(spread);
+  const last = $("mid-last");
+  last.textContent = state.last === null ? "—" : `${price(state.last)} ${arrow()}`;
+  last.className = `mid-last ${tone()}`;
+  const share = bidSum + askSum ? Math.round((100 * bidSum) / (bidSum + askSum)) : 50;
+  $("bid-share").textContent = `B ${share}%`;
+  $("ask-share").textContent = `${100 - share}% S`;
+  $("bid-bar").style.width = `${share}%`;
+  if (!$("price").value && mid !== null) $("price").value = price(Math.round(mid));
 }
 
-function rows(levels, element, side, depth) {
-  const max = Math.max(1, ...levels.map(([, level]) => level.qty));
-  element.replaceChildren(
-    ...levels.slice(0, depth).map(([at, level]) => {
+const arrow = () => (state.direction > 0 ? "↑" : state.direction < 0 ? "↓" : "");
+const tone = () => (state.direction > 0 ? "up" : state.direction < 0 ? "down" : "");
+
+// ---------- Trades ----------
+
+function renderTrades() {
+  $("trades").replaceChildren(
+    ...state.trades.slice(0, 40).map((trade) => {
       const row = document.createElement("div");
-      const bar = document.createElement("i");
-      bar.className = "bar";
-      bar.style.width = `${(100 * level.qty) / max}%`;
-      const cells = [price(at), level.qty, level.orders].map((text, index) => {
+      row.className = trade.shown ? `trade-row ${trade.side}` : `trade-row ${trade.side} fresh`;
+      trade.shown = true;
+      for (const text of [price(trade.price), count(trade.qty), timeOf(trade.time)]) {
         const cell = document.createElement("span");
         cell.textContent = text;
-        if (index === 0) cell.className = "price";
-        return cell;
-      });
-      row.append(bar, ...cells);
-      // Clicking a level sets up the order that would trade with it.
-      row.onclick = () => {
-        $("price").value = price(at);
-        setSide(side === "ask" ? "buy" : "sell");
-      };
+        row.append(cell);
+      }
       return row;
     }),
   );
 }
 
-function renderBook() {
-  const bids = [...state.bids].sort((a, b) => b[0] - a[0]);
-  const asks = [...state.asks].sort((a, b) => a[0] - b[0]);
-  rows(asks.slice(0, 12).reverse(), $("asks"), "ask", 12);
-  rows(bids, $("bids"), "bid", 12);
-  const spread = bids.length && asks.length ? asks[0][0] - bids[0][0] : null;
-  $("spread").textContent = spread === null ? "—" : `spread ${price(spread)}`;
-  if (!$("price").value && bids.length && asks.length) {
-    $("price").value = price(Math.round((bids[0][0] + asks[0][0]) / 2));
+// ---------- Ticker ----------
+
+function renderTicker() {
+  const last = $("last");
+  last.textContent = state.last === null ? "—" : price(state.last);
+  last.className = `last ${tone()}`;
+  $("last-direction").textContent = arrow();
+  $("last-direction").className = `direction ${tone()}`;
+  const candles = chart.base;
+  if (!candles.length) return;
+  let high = -Infinity;
+  let low = Infinity;
+  let volume = 0;
+  for (const candle of candles) {
+    high = Math.max(high, candle.h);
+    low = Math.min(low, candle.l);
+    volume += candle.v;
   }
+  const open = candles[0].o;
+  const close = state.last ?? candles[candles.length - 1].c;
+  const change = ((close - open) / open) * 100;
+  const element = $("change");
+  element.textContent = `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`;
+  element.className = change >= 0 ? "up" : "down";
+  $("high").textContent = price(high);
+  $("low").textContent = price(low);
+  $("volume").textContent = `${count(volume)} DEMO`;
 }
 
-let tradesPending = false;
-function scheduleTrades() {
-  if (tradesPending) return;
-  tradesPending = true;
-  requestAnimationFrame(() => {
-    tradesPending = false;
-    $("trades").replaceChildren(
-      ...state.trades.slice(0, 30).map((trade) => {
-        const row = document.createElement("div");
-        row.className = trade.side;
-        for (const text of [trade.time, price(trade.price), trade.qty]) {
-          const cell = document.createElement("span");
-          cell.textContent = text;
-          row.append(cell);
-        }
-        return row;
-      }),
-    );
-    $("last").textContent = state.last === null ? "—" : price(state.last);
-    if (state.first !== null && state.last !== null) {
-      const change = ((state.last - state.first) / state.first) * 100;
-      $("change").textContent = `${change >= 0 ? "+" : ""}${change.toFixed(2)}% since you opened this page`;
+// ---------- Chart ----------
+
+const chart = {
+  base: [], // the server's candles, then the trades since: {t, o, h, l, c, v}
+  interval: INTERVAL,
+  style: "candles",
+  hover: null,
+  colors: null,
+};
+
+// A trade, into the candle of the server's clock.
+function record(at, qty) {
+  const second = Math.floor(now() / 1_000);
+  const start = second - (second % INTERVAL);
+  const base = chart.base;
+  const last = base[base.length - 1];
+  if (last && last.t >= start) {
+    last.h = Math.max(last.h, at);
+    last.l = Math.min(last.l, at);
+    last.c = at;
+    last.v += qty;
+  } else {
+    base.push({ t: start, o: at, h: at, l: at, c: at, v: qty });
+  }
+  while (base.length && base[0].t <= start - KEPT) base.shift();
+}
+
+// The candles at the chosen length.
+function series() {
+  const size = chart.interval;
+  if (size === INTERVAL) return chart.base;
+  const out = [];
+  for (const candle of chart.base) {
+    const t = candle.t - (candle.t % size);
+    const last = out[out.length - 1];
+    if (last && last.t === t) {
+      last.h = Math.max(last.h, candle.h);
+      last.l = Math.min(last.l, candle.l);
+      last.c = candle.c;
+      last.v += candle.v;
+    } else {
+      out.push({ ...candle, t });
     }
-    drawChart();
-  });
+  }
+  return out;
 }
 
-// The chart keeps a point a second: the last trade price in it.
-const points = [];
-function pushPoint(at) {
-  const second = Math.floor(Date.now() / 1000);
-  const lastPoint = points[points.length - 1];
-  if (lastPoint && lastPoint.second === second) lastPoint.price = at;
-  else points.push({ second, price: at });
-  if (points.length > 600) points.shift();
+// A moving average of closes, by candle time.
+function average(candles, length) {
+  const out = new Map();
+  let sum = 0;
+  candles.forEach((candle, index) => {
+    sum += candle.c;
+    if (index >= length) sum -= candles[index - length].c;
+    if (index >= length - 1) out.set(candle.t, sum / length);
+  });
+  return out;
+}
+
+// A step of 1, 2 or 5 times a power of ten ticks, about `rough` long.
+function niceStep(rough) {
+  const power = 10 ** Math.floor(Math.log10(Math.max(rough, 1)));
+  for (const factor of [1, 2, 5, 10]) {
+    if (factor * power >= rough) return Math.max(1, factor * power);
+  }
+  return 10 * power;
+}
+
+function colors() {
+  if (!chart.colors) {
+    const style = getComputedStyle(document.documentElement);
+    const take = (name) => style.getPropertyValue(name).trim();
+    chart.colors = {
+      buy: take("--buy"),
+      sell: take("--sell"),
+      buySoft: take("--buy-soft"),
+      sellSoft: take("--sell-soft"),
+      line: take("--line"),
+      muted: take("--muted"),
+      text: take("--text"),
+      accent: take("--accent"),
+      panel: take("--panel"),
+      font: take("--font"),
+    };
+  }
+  return chart.colors;
+}
+
+function box(context, x, y, width, height, fill) {
+  context.fillStyle = fill;
+  context.beginPath();
+  if (context.roundRect) context.roundRect(x, y, width, height, 3);
+  else context.rect(x, y, width, height);
+  context.fill();
 }
 
 function drawChart() {
@@ -270,144 +613,652 @@ function drawChart() {
   const ratio = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
-  if (canvas.width !== width * ratio) {
-    canvas.width = width * ratio;
-    canvas.height = height * ratio;
+  if (!width || !height) return;
+  if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
   }
   const context = canvas.getContext("2d");
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
-  if (points.length < 2) return;
-  const prices = points.map((p) => p.price);
-  const low = Math.min(...prices);
-  const high = Math.max(...prices);
-  const span = Math.max(high - low, 1);
-  const x = (index) => 50 + (index / (points.length - 1)) * (width - 60);
-  const y = (at) => 10 + (1 - (at - low) / span) * (height - 30);
-  context.strokeStyle = "#262d36";
-  context.fillStyle = "#8b949e";
-  context.font = "11px system-ui";
-  for (const at of [low, (low + high) / 2, high]) {
-    context.beginPath();
-    context.moveTo(50, y(at));
-    context.lineTo(width - 10, y(at));
-    context.stroke();
-    context.fillText(price(Math.round(at)), 2, y(at) + 4);
+  const candles = series();
+  $("chart-empty").hidden = candles.length > 0;
+  if (!candles.length) {
+    $("legend").replaceChildren();
+    return;
   }
-  const rising = prices[prices.length - 1] >= prices[0];
-  context.strokeStyle = rising ? "#2ea043" : "#f85149";
-  context.lineWidth = 1.5;
+  const color = colors();
+  const axis = 64;
+  const top = 26;
+  const bottom = 22;
+  const plotWidth = width - axis;
+  const plotHeight = height - top - bottom;
+  const volumeHeight = Math.round(plotHeight * 0.16);
+  const priceHeight = plotHeight - volumeHeight - 8;
+  const size = chart.interval;
+  // About a hundred candles; wider ones while there are few.
+  const wanted = Math.max(40, Math.min(110, candles.length + 6));
+  const spacing = Math.max(5, Math.min(20, plotWidth / wanted));
+  const slots = Math.floor(plotWidth / spacing);
+  const second = Math.floor(now() / 1_000);
+  const end = Math.max(second - (second % size), candles[candles.length - 1].t);
+  const start = end - (slots - 1) * size;
+  const x = (t) => plotWidth - spacing / 2 - ((end - t) / size) * spacing;
+  const visible = candles.filter((candle) => candle.t >= start);
+  const ma = average(candles, 20);
+
+  let low = Infinity;
+  let high = -Infinity;
+  let maxVolume = 0;
+  for (const candle of visible) {
+    low = Math.min(low, candle.l);
+    high = Math.max(high, candle.h);
+    maxVolume = Math.max(maxVolume, candle.v);
+    const mean = ma.get(candle.t);
+    if (mean !== undefined) {
+      low = Math.min(low, mean);
+      high = Math.max(high, mean);
+    }
+  }
+  const lastPrice = state.last ?? candles[candles.length - 1].c;
+  low = Math.min(low, lastPrice);
+  high = Math.max(high, lastPrice);
+  const margin = Math.max((high - low) * 0.08, 2);
+  low -= margin;
+  high += margin;
+  const y = (at) => top + (1 - (at - low) / (high - low)) * priceHeight;
+
+  context.font = `11px ${color.font}`;
+  context.textBaseline = "middle";
+  context.lineWidth = 1;
+
+  // The price grid, and its labels on the right, but for those the last price covers.
+  const step = niceStep((high - low) / 6);
+  const lastY = y(lastPrice);
+  context.textAlign = "left";
+  for (let at = Math.ceil(low / step) * step; at <= high; at += step) {
+    const row = Math.round(y(at)) + 0.5;
+    context.strokeStyle = color.line;
+    context.beginPath();
+    context.moveTo(0, row);
+    context.lineTo(plotWidth, row);
+    context.stroke();
+    if (Math.abs(row - lastY) < 14) continue;
+    context.fillStyle = color.muted;
+    context.fillText(price(at), plotWidth + 8, row);
+  }
+
+  // The time grid, a label at least 90 pixels apart.
+  const labelEvery = [1, 2, 3, 4, 6, 12, 24, 36, 72]
+    .map((n) => n * size)
+    .find((seconds) => (seconds / size) * spacing >= 90) || 72 * size;
+  context.textAlign = "center";
+  for (let t = Math.ceil(start / labelEvery) * labelEvery; t <= end; t += labelEvery) {
+    const column = Math.round(x(t)) + 0.5;
+    context.strokeStyle = color.line;
+    context.globalAlpha = 0.55;
+    context.beginPath();
+    context.moveTo(column, top);
+    context.lineTo(column, top + plotHeight);
+    context.stroke();
+    context.globalAlpha = 1;
+    const label = labelEvery % 60 === 0 ? timeOf(t * 1_000).slice(0, 5) : timeOf(t * 1_000);
+    const half = context.measureText(label).width / 2;
+    if (column - half < 0 || column + half > plotWidth) continue;
+    context.fillStyle = color.muted;
+    context.fillText(label, column, height - bottom / 2);
+  }
+
+  // Volume along the bottom.
+  // An odd width, so a candle's body is centred on its wick.
+  const body = Math.max(1, Math.floor(spacing * 0.66)) | 1;
+  const left = (t) => Math.round(x(t)) - (body - 1) / 2;
+  for (const candle of visible) {
+    const tall = maxVolume ? Math.max(1, (candle.v / maxVolume) * volumeHeight) : 0;
+    context.fillStyle = candle.c >= candle.o ? color.buySoft : color.sellSoft;
+    context.fillRect(left(candle.t), top + plotHeight - tall, body, tall);
+  }
+
+  // The candles, or a line through the closes.
+  if (chart.style === "candles") {
+    for (const candle of visible) {
+      const rising = candle.c >= candle.o;
+      const column = Math.round(x(candle.t));
+      context.strokeStyle = context.fillStyle = rising ? color.buy : color.sell;
+      context.beginPath();
+      context.moveTo(column + 0.5, Math.round(y(candle.h)));
+      context.lineTo(column + 0.5, Math.round(y(candle.l)));
+      context.stroke();
+      const from = Math.round(y(Math.max(candle.o, candle.c)));
+      const to = Math.round(y(Math.min(candle.o, candle.c)));
+      context.fillRect(left(candle.t), from, body, Math.max(1, to - from));
+    }
+  } else if (visible.length) {
+    const rising = lastPrice >= visible[0].o;
+    const stroke = rising ? color.buy : color.sell;
+    const gradient = context.createLinearGradient(0, top, 0, top + priceHeight);
+    gradient.addColorStop(0, rising ? color.buySoft : color.sellSoft);
+    gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+    context.beginPath();
+    visible.forEach((candle, index) => {
+      if (index === 0) context.moveTo(x(candle.t), y(candle.c));
+      else context.lineTo(x(candle.t), y(candle.c));
+    });
+    context.strokeStyle = stroke;
+    context.lineWidth = 1.75;
+    context.stroke();
+    context.lineTo(x(visible[visible.length - 1].t), top + priceHeight);
+    context.lineTo(x(visible[0].t), top + priceHeight);
+    context.closePath();
+    context.fillStyle = gradient;
+    context.fill();
+    context.lineWidth = 1;
+  }
+
+  // The moving average.
+  context.strokeStyle = color.accent;
+  context.lineWidth = 1.25;
+  context.globalAlpha = 0.85;
   context.beginPath();
-  points.forEach((point, index) => {
-    if (index === 0) context.moveTo(x(index), y(point.price));
-    else context.lineTo(x(index), y(point.price));
-  });
+  let drawing = false;
+  for (const candle of visible) {
+    const mean = ma.get(candle.t);
+    if (mean === undefined) continue;
+    if (drawing) context.lineTo(x(candle.t), y(mean));
+    else context.moveTo(x(candle.t), y(mean));
+    drawing = true;
+  }
   context.stroke();
+  context.globalAlpha = 1;
+  context.lineWidth = 1;
+
+  // The last price, across the chart and on the axis.
+  const lastRow = Math.round(y(lastPrice)) + 0.5;
+  const lastColor = state.direction < 0 ? color.sell : color.buy;
+  context.strokeStyle = lastColor;
+  context.setLineDash([3, 3]);
+  context.beginPath();
+  context.moveTo(0, lastRow);
+  context.lineTo(plotWidth, lastRow);
+  context.stroke();
+  context.setLineDash([]);
+  box(context, plotWidth + 2, lastRow - 9, axis - 4, 18, lastColor);
+  context.fillStyle = "#fff";
+  context.textAlign = "left";
+  context.fillText(price(lastPrice), plotWidth + 8, lastRow);
+
+  // The crosshair.
+  let shown = candles[candles.length - 1];
+  const hover = chart.hover;
+  if (hover && hover.x >= 0 && hover.x < plotWidth && hover.y >= top && hover.y <= top + plotHeight) {
+    const back = Math.round((plotWidth - spacing / 2 - hover.x) / spacing);
+    const t = end - back * size;
+    const column = Math.round(x(t)) + 0.5;
+    const row = Math.round(hover.y) + 0.5;
+    context.strokeStyle = color.muted;
+    context.setLineDash([4, 4]);
+    context.beginPath();
+    context.moveTo(column, top);
+    context.lineTo(column, top + plotHeight);
+    context.moveTo(0, row);
+    context.lineTo(plotWidth, row);
+    context.stroke();
+    context.setLineDash([]);
+    if (hover.y <= top + priceHeight) {
+      const at = low + (1 - (hover.y - top) / priceHeight) * (high - low);
+      box(context, plotWidth + 2, row - 9, axis - 4, 18, color.line);
+      context.fillStyle = color.text;
+      context.textAlign = "left";
+      context.fillText(price(Math.round(at)), plotWidth + 8, row);
+    }
+    const label = timeOf(t * 1_000);
+    const labelWidth = context.measureText(label).width + 12;
+    box(context, column - labelWidth / 2, height - bottom + 2, labelWidth, bottom - 4, color.line);
+    context.fillStyle = color.text;
+    context.textAlign = "center";
+    context.fillText(label, column, height - bottom / 2);
+    shown = candles.find((candle) => candle.t === t) || null;
+  }
+  legend(shown, ma);
 }
+
+function legend(candle, ma) {
+  const parts = [];
+  const item = (label, value, className) => {
+    const span = document.createElement("span");
+    span.append(label);
+    const b = bold(value);
+    if (className) b.className = className;
+    span.append(b);
+    parts.push(span);
+  };
+  const name = document.createElement("span");
+  name.textContent = `DEMO/USD · ${chart.interval < 60 ? `${chart.interval}s` : "1m"}`;
+  parts.push(name);
+  if (candle) {
+    const tone = candle.c >= candle.o ? "up" : "down";
+    item("O", price(candle.o), tone);
+    item("H", price(candle.h), tone);
+    item("L", price(candle.l), tone);
+    item("C", price(candle.c), tone);
+    const change = ((candle.c - candle.o) / candle.o) * 100;
+    item("", `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`, tone);
+    item("V", count(candle.v));
+    const mean = ma.get(candle.t);
+    if (mean !== undefined) {
+      const span = document.createElement("span");
+      span.className = "ma";
+      span.append("MA 20", bold(price(Math.round(mean))));
+      parts.push(span);
+    }
+  }
+  $("legend").replaceChildren(...parts);
+}
+
+const canvas = $("canvas");
+canvas.addEventListener("pointermove", (event) => {
+  const bounds = canvas.getBoundingClientRect();
+  chart.hover = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  schedule("chart");
+});
+canvas.addEventListener("pointerleave", () => {
+  chart.hover = null;
+  schedule("chart");
+});
+new ResizeObserver(() => schedule("chart")).observe($("canvas"));
+
+function choose(selector, attribute, value) {
+  for (const button of document.querySelectorAll(selector)) {
+    const on = button.dataset[attribute] === String(value);
+    button.classList.toggle("active", on);
+    button.setAttribute("aria-pressed", String(on));
+  }
+}
+for (const button of document.querySelectorAll("[data-interval]")) {
+  button.addEventListener("click", () => {
+    chart.interval = Number(button.dataset.interval);
+    choose("[data-interval]", "interval", chart.interval);
+    schedule("chart");
+  });
+}
+for (const button of document.querySelectorAll("[data-style]")) {
+  button.addEventListener("click", () => {
+    chart.style = button.dataset.style;
+    choose("[data-style]", "style", chart.style);
+    schedule("chart");
+  });
+}
+
+// ---------- Your account ----------
 
 function renderWallet() {
   const wallet = state.wallet;
   if (!wallet) return;
-  $("cash").textContent = money(wallet.cash);
-  $("position").textContent = wallet.position.toLocaleString("en-US");
-  $("held").textContent = `${money(wallet.cash_held)} · ${wallet.position_held} shares`;
-  if (state.last !== null && state.start) {
-    const value = wallet.cash + wallet.position * state.last;
-    const start = state.start.cash + state.start.position * state.last;
-    $("value").textContent = money(value);
-    const pnl = value - start;
-    $("pnl").textContent = `${pnl >= 0 ? "+" : ""}${money(pnl)}`;
-    $("pnl").className = pnl >= 0 ? "up" : "down";
+  $("cash").textContent = money(wallet.cash - wallet.cash_held);
+  $("cash-held").textContent = money(wallet.cash_held);
+  $("position").textContent = `${count(wallet.position - wallet.position_held)} DEMO`;
+  $("position-held").textContent = `${count(wallet.position_held)} DEMO`;
+  const mark = state.last ?? midPrice();
+  if (mark === null) return;
+  const shares = wallet.position * mark;
+  const value = wallet.cash + shares;
+  $("value").textContent = money(value);
+  const share = value > 0 ? Math.max(0, Math.min(100, (100 * wallet.cash) / value)) : 100;
+  $("alloc-cash").style.width = `${share}%`;
+  const base = state.baseline;
+  if (base) {
+    const profit = value - (base.cash + base.position * mark);
+    const start = base.cash + base.position * mark;
+    const percent = start > 0 ? (profit / start) * 100 : 0;
+    const element = $("pnl");
+    element.textContent = `${profit >= 0 ? "+" : "−"}${money(Math.abs(profit))} (${percent >= 0 ? "+" : "−"}${Math.abs(percent).toFixed(2)}%) since you started`;
+    element.className = profit > 0 ? "pnl up" : profit < 0 ? "pnl down" : "pnl";
   }
+}
+
+function midPrice() {
+  const bid = sorted("buy")[0];
+  const ask = sorted("sell")[0];
+  return bid && ask ? Math.round((bid[0] + ask[0]) / 2) : null;
+}
+
+// ---------- Your orders ----------
+
+let ordersTab = "open";
+
+function cell(text, className) {
+  const element = document.createElement("td");
+  if (text instanceof Node) element.append(text);
+  else element.textContent = text;
+  if (className) element.className = className;
+  return element;
+}
+
+function sideCell(side) {
+  const span = document.createElement("span");
+  span.className = side;
+  span.textContent = sideName(side);
+  return cell(span, "left");
 }
 
 function renderOrders() {
   const orders = [...state.orders.values()].sort((a, b) => b.id - a.id);
+  $("open-count").textContent = orders.length;
+  $("fill-count").textContent = state.fills.length;
+  $("cancel-all").hidden = ordersTab !== "open" || orders.length === 0;
+  $("open-empty").hidden = orders.length > 0;
+  $("fills-empty").hidden = state.fills.length > 0;
   $("open-orders").replaceChildren(
     ...orders.map((order) => {
       const row = document.createElement("tr");
-      const cells = [order.id, order.side, price(order.price), order.leaves];
-      cells.forEach((text, index) => {
-        const cell = document.createElement("td");
-        cell.textContent = text;
-        if (index === 1) cell.className = order.side;
-        row.append(cell);
-      });
-      const action = document.createElement("td");
+      let progress = "—";
+      if (order.qty) {
+        const done = order.qty - order.leaves;
+        const bar = document.createElement("span");
+        bar.className = "progress";
+        const fill = document.createElement("i");
+        fill.style.width = `${(100 * done) / order.qty}%`;
+        bar.append(fill);
+        progress = document.createDocumentFragment();
+        progress.append(bar, `${Math.round((100 * done) / order.qty)}%`);
+      }
       const cancel = document.createElement("button");
-      cancel.className = "link";
-      cancel.textContent = "cancel";
-      cancel.onclick = () => send({ type: "cancel", id: order.id });
-      action.append(cancel);
-      row.append(action);
+      cancel.className = "cancel";
+      cancel.type = "button";
+      cancel.title = "Cancel this order";
+      cancel.setAttribute("aria-label", `Cancel order ${order.id}`);
+      cancel.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>';
+      cancel.addEventListener("click", () => send({ type: "cancel", id: order.id }));
+      row.append(
+        cell(order.time ? timeOf(order.time) : "—", "left muted"),
+        sideCell(order.side),
+        cell(price(order.price)),
+        cell(order.qty ? `${count(order.leaves)} / ${count(order.qty)}` : count(order.leaves)),
+        cell(progress),
+        cell(`#${order.id}`, "muted"),
+        cell(cancel),
+      );
       return row;
     }),
   );
   $("fills").replaceChildren(
     ...state.fills.map((fill) => {
       const row = document.createElement("tr");
-      [fill.time, fill.side, price(fill.price), fill.qty].forEach((text, index) => {
-        const cell = document.createElement("td");
-        cell.textContent = text;
-        if (index === 1) cell.className = fill.side;
-        row.append(cell);
-      });
+      row.append(
+        cell(timeOf(fill.time), "left muted"),
+        sideCell(fill.side),
+        cell(price(fill.price)),
+        cell(count(fill.qty)),
+        cell(money(fill.price * fill.qty)),
+      );
       return row;
     }),
   );
 }
 
-const duration = (ns) => (ns >= 1_000_000 ? `${(ns / 1_000_000).toFixed(2)} ms` : `${Math.round(ns / 1_000)} µs`);
+function showTab(tab) {
+  ordersTab = tab;
+  $("tab-open").classList.toggle("active", tab === "open");
+  $("tab-fills").classList.toggle("active", tab === "fills");
+  $("tab-open").setAttribute("aria-selected", String(tab === "open"));
+  $("tab-fills").setAttribute("aria-selected", String(tab === "fills"));
+  $("open-view").hidden = tab !== "open";
+  $("fills-view").hidden = tab !== "fills";
+  renderOrders();
+}
+$("tab-open").addEventListener("click", () => showTab("open"));
+$("tab-fills").addEventListener("click", () => showTab("fills"));
+$("cancel-all").addEventListener("click", () => send({ type: "cancel_all" }));
 
-function stats(message) {
-  $("cps").textContent = message.commands_per_second.toLocaleString("en-US");
-  $("p50").textContent = duration(message.turn_p50_ns);
-  $("p99").textContent = duration(message.turn_p99_ns);
-  $("max").textContent = duration(message.turn_max_ns);
-  $("sessions").textContent = message.sessions;
-  $("resting").textContent = message.orders.toLocaleString("en-US");
+// ---------- Order ticket ----------
+
+// What `qty` would take from the other side's levels, best first: the worst price it
+// reaches, what it costs, and how much is there.
+function sweep(side, qty) {
+  const levels = sorted(side === "buy" ? "sell" : "buy");
+  let left = qty;
+  let cost = 0;
+  let limit = null;
+  for (const [at, level] of levels) {
+    if (left <= 0) break;
+    const take = Math.min(left, level.qty);
+    cost += take * at;
+    left -= take;
+    limit = at;
+  }
+  return limit === null ? null : { limit, cost, filled: qty - left };
+}
+
+function free() {
+  const wallet = state.wallet;
+  if (!wallet) return null;
+  return state.side === "buy" ? wallet.cash - wallet.cash_held : wallet.position - wallet.position_held;
+}
+
+function notice(text, error = false) {
+  $("notice").textContent = text;
+  $("notice").className = error ? "notice error" : "notice";
+}
+
+function updateTicket() {
+  const available = free();
+  $("available").textContent = available === null
+    ? "—"
+    : state.side === "buy" ? money(available) : `${count(available)} DEMO`;
+  const qty = Math.floor(Number($("qty").value));
+  const buying = state.side === "buy";
+  let value = null;
+  let hold = null;
+  if (state.type === "market") {
+    const taken = qty > 0 ? sweep(state.side, qty) : null;
+    $("total-label").textContent = buying ? "Estimated cost" : "Estimated proceeds";
+    if (taken) {
+      value = taken.cost;
+      hold = buying ? taken.limit * qty : qty;
+      $("total").textContent = `≈ ${money(value)}`;
+    } else $("total").textContent = "—";
+  } else {
+    const ticks = ticksOf($("price").value);
+    $("total-label").textContent = "Order value";
+    if (ticks > 0 && qty > 0) {
+      value = ticks * qty;
+      hold = buying ? value : qty;
+      $("total").textContent = money(value);
+    } else $("total").textContent = "—";
+  }
+  const button = $("submit");
+  const short = available !== null && hold !== null && hold > available;
+  button.className = `submit ${state.side}`;
+  button.disabled = !state.connected || short;
+  if (!state.connected) button.textContent = "Connecting…";
+  else if (short) button.textContent = buying ? "Not enough cash" : "Not enough DEMO";
+  else button.textContent = `${sideName(state.side)} DEMO`;
 }
 
 function setSide(side) {
   state.side = side;
   $("buy-side").classList.toggle("active", side === "buy");
   $("sell-side").classList.toggle("active", side === "sell");
-  $("submit").className = `submit ${side}`;
-  $("submit").textContent = side === "buy" ? "Buy" : "Sell";
-  $("now").textContent = side === "buy" ? "Buy now at the best price" : "Sell now at the best price";
+  $("buy-side").setAttribute("aria-pressed", String(side === "buy"));
+  $("sell-side").setAttribute("aria-pressed", String(side === "sell"));
+  notice("");
+  updateTicket();
 }
 
-function place(ticks, tif) {
-  const qty = Math.floor(Number($("qty").value));
-  if (!Number.isFinite(ticks) || ticks <= 0 || !(qty > 0)) {
-    notice("Enter a price and a quantity", true);
-    return;
+function setType(type) {
+  state.type = type;
+  $("type-limit").classList.toggle("active", type === "limit");
+  $("type-market").classList.toggle("active", type === "market");
+  $("type-limit").setAttribute("aria-pressed", String(type === "limit"));
+  $("type-market").setAttribute("aria-pressed", String(type === "market"));
+  $("price-field").hidden = type === "market";
+  $("tif-field").hidden = type === "market";
+  $("market-field").hidden = type !== "market";
+  notice("");
+  updateTicket();
+}
+
+// A level clicked in the book: a limit order that would trade with it.
+function pick(at, side) {
+  setType("limit");
+  $("price").value = price(at);
+  setSide(side);
+  const field = $("price-field");
+  field.classList.remove("flash");
+  void field.offsetWidth;
+  field.classList.add("flash");
+}
+
+function useShare(share) {
+  const available = free();
+  if (available === null) return;
+  let qty;
+  if (state.side === "sell") qty = Math.floor(available * share);
+  else {
+    const budget = available * share;
+    let at = state.type === "market"
+      ? (sweep("buy", 1) || {}).limit
+      : ticksOf($("price").value);
+    if (!(at > 0)) {
+      notice("Enter a price first", true);
+      return;
+    }
+    qty = Math.floor(budget / at);
+    // A market buy holds its worst price for all of it.
+    for (let round = 0; state.type === "market" && round < 4 && qty > 0; round += 1) {
+      const taken = sweep("buy", qty);
+      if (!taken || taken.limit * qty <= budget) break;
+      at = taken.limit;
+      qty = Math.floor(budget / at);
+    }
   }
+  $("qty").value = Math.max(0, qty);
+  notice("");
+  updateTicket();
+}
+
+function place(ticks, qty, tif) {
   const ref = ++state.nextRef;
-  state.requests.set(ref, { side: state.side, price: ticks, qty });
+  state.requests.set(ref, { side: state.side, price: ticks, qty, tif, time: now() });
   send({ type: "order", ref, side: state.side, qty, price: ticks, tif });
   notice("");
 }
 
-$("buy-side").onclick = () => setSide("buy");
-$("sell-side").onclick = () => setSide("sell");
-$("submit").onclick = () => place(Math.round(Number($("price").value) * 100), $("tif").value);
-$("now").onclick = () => {
-  // A limit order at the best opposite price, immediate or cancel: paper accounts hold
-  // what an order can cost, so there are no market orders.
-  const opposite = state.side === "buy"
-    ? Math.min(...state.asks.keys())
-    : Math.max(...state.bids.keys());
-  if (!Number.isFinite(opposite)) {
-    notice("Nobody is quoting that side right now", true);
+function submit() {
+  const qty = Math.floor(Number($("qty").value));
+  if (!(qty > 0)) {
+    notice("Enter an amount", true);
     return;
   }
-  place(opposite, "ioc");
+  if (state.type === "market") {
+    // A limit order at the worst price it needs, immediate or cancel: paper accounts hold
+    // what an order can cost, so there are no market orders.
+    const taken = sweep(state.side, qty);
+    if (!taken) {
+      notice("Nobody is quoting that side right now", true);
+      return;
+    }
+    place(taken.limit, qty, "ioc");
+    return;
+  }
+  const ticks = ticksOf($("price").value);
+  if (!(ticks > 0)) {
+    notice("Enter a price", true);
+    return;
+  }
+  place(ticks, qty, $("tif").value);
+}
+
+$("buy-side").addEventListener("click", () => setSide("buy"));
+$("sell-side").addEventListener("click", () => setSide("sell"));
+$("type-limit").addEventListener("click", () => setType("limit"));
+$("type-market").addEventListener("click", () => setType("market"));
+$("price").addEventListener("input", () => schedule("ticket"));
+$("qty").addEventListener("input", () => schedule("ticket"));
+$("submit").addEventListener("click", submit);
+for (const input of [$("price"), $("qty")]) {
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+  });
+}
+for (const button of document.querySelectorAll("[data-share]")) {
+  button.addEventListener("click", () => useShare(Number(button.dataset.share)));
+}
+
+// ---------- Exchange statistics ----------
+
+const duration = (ns) => (ns >= 1_000_000
+  ? `${(ns / 1_000_000).toFixed(2)} ms`
+  : ns >= 1_000 ? `${Math.round(ns / 1_000)} µs` : `${ns} ns`);
+
+function stats(message) {
+  if (message.time) state.offset = message.time - Date.now();
+  state.statsAt = Date.now();
+  $("cps").textContent = count(message.commands_per_second);
+  $("p50").textContent = duration(message.turn_p50_ns);
+  $("p99").textContent = duration(message.turn_p99_ns);
+  $("max").textContent = duration(message.turn_max_ns);
+  $("sessions").textContent = count(message.sessions);
+  $("resting").textContent = count(message.orders);
+  schedule("chart");
+}
+
+// The clock, and whether the engine is still talking.
+setInterval(() => {
+  $("clock").textContent = timeOf(now());
+  const alive = state.connected && Date.now() - state.statsAt < 3_000;
+  document.querySelector(".engine-state").classList.toggle("live", alive);
+  $("engine-text").textContent = alive ? "Engine online" : "Engine unreachable";
+}, 1_000);
+
+// ---------- Notifications ----------
+
+function toast(title, detail = "", kind = "info") {
+  const element = document.createElement("div");
+  element.className = `toast ${kind}`;
+  const body = document.createElement("div");
+  body.append(bold(title));
+  if (detail) {
+    const span = document.createElement("span");
+    span.textContent = detail;
+    body.append(span);
+  }
+  element.append(body);
+  const toasts = $("toasts");
+  toasts.prepend(element);
+  while (toasts.children.length > 4) toasts.lastElementChild.remove();
+  setTimeout(() => {
+    element.classList.add("leaving");
+    setTimeout(() => element.remove(), 200);
+  }, 4_000);
+}
+
+// ---------- How it works ----------
+
+const about = $("about");
+function openAbout() {
+  if (typeof about.showModal === "function") about.showModal();
+}
+$("about-open").addEventListener("click", openAbout);
+about.addEventListener("click", (event) => {
+  // A click on the backdrop closes it.
+  if (event.target === about) about.close();
+});
+about.addEventListener("close", () => save("exchange-seen-about", true));
+
+const renderers = {
+  book: renderBook,
+  trades: renderTrades,
+  chart: drawChart,
+  ticker: renderTicker,
+  wallet: renderWallet,
+  orders: renderOrders,
+  ticket: updateTicket,
 };
-$("cancel-all").onclick = () => send({ type: "cancel_all" });
 
 // The exchange logs out sessions that stay silent for five seconds.
 setInterval(() => send({ type: "heartbeat" }), 2_000);
-window.addEventListener("resize", drawChart);
 setSide("buy");
+renderOrders();
+if (!load("exchange-seen-about")) openAbout();
 connect();

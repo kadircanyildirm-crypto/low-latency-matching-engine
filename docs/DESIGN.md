@@ -1211,7 +1211,7 @@ money, against bots, and keeps the market running across restarts of the server.
 ### Browsers as sessions
 
 The server can listen on a second port for browsers. A connection there speaks HTTP until
-it asks for a file or upgrades to a WebSocket: the page and its two files are built into
+it asks for a file or upgrades to a WebSocket: the page and its three files are built into
 the binary and served under a content security policy that allows nothing from
 elsewhere, anything else gets a 404 or a 400, and a request not complete within ten
 seconds is dropped. An upgraded connection becomes a session like any other, with the
@@ -1276,7 +1276,9 @@ that takes random steps and is pulled back towards the start and the last trade,
 size further out, replacing their quotes every interval; noise traders cross the spread with small IOC orders; trend
 followers trade with the recent move. They reconnect when the gateway restarts.
 
-The page has no dependencies and no build step. It keeps the account in local storage,
+The page has no dependencies and no build step, and loads nothing from elsewhere: no
+fonts, no scripts, no trackers. It keeps in local storage the account, and the size and
+time of the orders it placed, which the reports after a reload do not tell; it
 reconnects with backoff, sends heartbeats so it is not logged out as idle, and draws the
 book and tape at most once a frame. Its chart opens on the last hour, not empty: the
 exchange keeps the trades it delivers as five-second candles, an hour of them in memory,

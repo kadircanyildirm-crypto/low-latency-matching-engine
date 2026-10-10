@@ -29,6 +29,7 @@ pub fn page(path: &str) -> Option<(&'static str, &'static [u8])> {
             "text/javascript; charset=utf-8",
             include_bytes!("../../web/app.js"),
         ),
+        "/favicon.svg" => ("image/svg+xml", include_bytes!("../../web/favicon.svg")),
         "/style.css" => (
             "text/css; charset=utf-8",
             include_bytes!("../../web/style.css"),

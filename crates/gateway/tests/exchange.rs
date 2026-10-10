@@ -639,6 +639,12 @@ fn paper_orders_stay_near_the_market() {
     let standings = exchange.standings();
     let three = standings.iter().find(|s| s.account == 3).unwrap();
     assert_eq!(three.profit, -10);
+    // A restart keeps the market's price: the checkpoint holds it.
+    let checkpoint = exchange.checkpoint().unwrap();
+    assert_eq!(checkpoint.market_price, Some(100));
+    let accounts = [account(1), paper(2), paper(3)];
+    let restored = Exchange::restore(&checkpoint, &book(), &accounts, Timing::default()).unwrap();
+    assert_eq!(restored.checkpoint().unwrap().market_price, Some(100));
 }
 
 #[test]

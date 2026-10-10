@@ -105,6 +105,10 @@ pub struct Checkpoint {
     pub wallets: Vec<SavedWallet>,
     /// The orders and pending stops on the book.
     pub orders: Vec<SavedOrder>,
+    /// The market's price, near which paper accounts price their orders, if there was one:
+    /// a restart does not lift the collar until the market trades again.
+    #[serde(default)]
+    pub market_price: Option<Price>,
 }
 
 /// A paper-trading account's cash and position, in a checkpoint.
@@ -483,6 +487,7 @@ impl Exchange {
             seq: self.last_seq,
             wallets,
             orders,
+            market_price: self.market_price,
         })
     }
 
@@ -523,6 +528,7 @@ impl Exchange {
             );
             exchange.set_leaves(order.id, order.leaves);
         }
+        exchange.market_price = checkpoint.market_price;
         Ok(exchange)
     }
 

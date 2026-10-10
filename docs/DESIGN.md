@@ -1301,7 +1301,8 @@ and so move paper money from one to the other as they liked, putting either at t
 the leaderboard; this mattered most when the venue's feed was down and the mirror had
 withdrawn its orders. Trades between paper accounts do not move the market's price, so
 they cannot walk the collar away either, and the leaderboard values positions at it.
-Before the market's first trade, paper accounts trade freely.
+Before the market's first trade, paper accounts trade freely; checkpoints keep the market's
+price, so a restart does not lift the collar until the market trades again.
 
 ### Checkpoints
 

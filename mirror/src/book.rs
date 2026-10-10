@@ -221,7 +221,7 @@ impl Mirror {
                         out.push(Inbound::Modify {
                             order_id: own.order_id.expect("an accepted order"),
                             price: order.price,
-                            qty: filled + order.lots,
+                            qty: filled.saturating_add(order.lots),
                         });
                         own.modifying = Some(order.lots);
                     }

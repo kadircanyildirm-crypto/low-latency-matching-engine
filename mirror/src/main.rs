@@ -10,6 +10,8 @@
 //! If the venue's connection drops, or it sends nothing for half a minute, the mirror
 //! cancels its orders until the venue is back, rather than show a book that is no longer
 //! real; if the gateway's drops, the exchange cancels them, and the mirror logs in again.
+//! If the thread that reads the venue stops for good, the mirror stops too, with an error,
+//! for whatever runs it to start it again.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -88,12 +90,31 @@ fn run() -> Result<(), String> {
     };
     let events = feed::spawn(config);
     loop {
-        if let Err(error) = mirror(addr, book_account, tape_account, levels, &events) {
-            eprintln!("mirror: {error}");
+        match mirror(addr, book_account, tape_account, levels, &events) {
+            Err(Ended::Feed) => return Err("the venue's feed stopped".to_owned()),
+            Err(Ended::Gateway(error)) => eprintln!("mirror: {error}"),
+            Ok(()) => {}
         }
         thread::sleep(Duration::from_secs(3));
     }
 }
+
+/// Why mirroring through one pair of connections ended.
+enum Ended {
+    /// A connection to the gateway failed: the mirror logs in again.
+    Gateway(String),
+    /// The thread that reads the venue is gone.
+    Feed,
+}
+
+impl From<String> for Ended {
+    fn from(error: String) -> Self {
+        Ended::Gateway(error)
+    }
+}
+
+/// How long a write to the gateway may take before the connection counts as failed.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Mirrors the venue through one pair of connections to the gateway, until one fails.
 fn mirror(
@@ -102,11 +123,15 @@ fn mirror(
     tape_account: Account,
     levels: usize,
     events: &Receiver<Event>,
-) -> Result<(), String> {
+) -> Result<(), Ended> {
     let connect = |account: Account| {
-        Client::login(addr, account.id, account.token)
-            .map(|(client, _)| client)
-            .map_err(|e| format!("logging in to {addr} as {}: {e}", account.id))
+        let (client, _) = Client::login(addr, account.id, account.token)
+            .map_err(|e| format!("logging in to {addr} as {}: {e}", account.id))?;
+        client
+            .stream()
+            .set_write_timeout(Some(WRITE_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(client)
     };
     let mut book = connect(book_account)?;
     let mut tape = connect(tape_account)?;
@@ -123,13 +148,15 @@ fn mirror(
             match message {
                 Outbound::Report(report) => mirror.on_report(&report),
                 Outbound::Reject { client_ref, .. } => mirror.on_refused(client_ref),
-                Outbound::Logout { reason } => return Err(format!("logged out: {reason:?}")),
+                Outbound::Logout { reason } => {
+                    return Err(format!("logged out: {reason:?}").into());
+                }
                 _ => {}
             }
         }
         while let Some(message) = tape.try_receive().map_err(|e| e.to_string())? {
             if let Outbound::Logout { reason } = message {
-                return Err(format!("trades logged out: {reason:?}"));
+                return Err(format!("trades logged out: {reason:?}").into());
             }
         }
         match events.recv_timeout(Duration::from_millis(20)) {
@@ -151,7 +178,7 @@ fn mirror(
                 latest = None;
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Err("the feed stopped".to_owned()),
+            Err(RecvTimeoutError::Disconnected) => return Err(Ended::Feed),
         }
         if latest.is_some() && heard.elapsed() > STALE {
             eprintln!("mirror: nothing from the venue for {} s", STALE.as_secs());

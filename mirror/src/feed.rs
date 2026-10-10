@@ -1,13 +1,19 @@
 //! The connection to the venue: a thread that reads its WebSocket and passes on its book
 //! and its trades, and connects again, waiting longer each time, when the connection drops,
 //! goes quiet, or the venue asks.
+//!
+//! Whatever the venue, or something posing as it, sends, the feed holds little: connecting
+//! and every write give up after ten seconds, a message may be a mebibyte at most, and the
+//! events waiting for the mirror are a few hundred at most, the newest dropped if the
+//! mirror falls that far behind.
 
 use std::io;
-use std::net::TcpStream;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message as Frame, WebSocket};
 
@@ -43,9 +49,19 @@ const QUIET: Duration = Duration::from_secs(30);
 /// How often it tells the venue it is still there.
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// How long connecting, each handshake and each write may take.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest message the venue may send: its book of a hundred orders a side takes a few
+/// tens of kilobytes.
+const MAX_MESSAGE: usize = 1 << 20;
+
+/// Events waiting for the mirror at most.
+const QUEUE: usize = 256;
+
 /// Starts the feed. It runs until the receiver is dropped.
 pub fn spawn(config: Config) -> Receiver<Event> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(QUEUE);
     thread::spawn(move || {
         let mut wait = Duration::from_secs(1);
         loop {
@@ -68,9 +84,50 @@ pub fn spawn(config: Config) -> Receiver<Event> {
     rx
 }
 
+/// Connects to `url`, giving up after [`TIMEOUT`] at each step.
+fn connect(url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let uri: tungstenite::http::Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
+    let host = uri.host().ok_or_else(|| format!("{url}: no host"))?;
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
+        80
+    } else {
+        443
+    });
+    let mut failed = format!("{host}: no address");
+    for addr in (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("{host}: {e}"))?
+    {
+        let tcp = match TcpStream::connect_timeout(&addr, TIMEOUT) {
+            Ok(tcp) => tcp,
+            Err(error) => {
+                failed = format!("{addr}: {error}");
+                continue;
+            }
+        };
+        tcp.set_read_timeout(Some(TIMEOUT))
+            .and_then(|()| tcp.set_write_timeout(Some(TIMEOUT)))
+            .map_err(|e| e.to_string())?;
+        let limits = WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE))
+            .max_frame_size(Some(MAX_MESSAGE));
+        let (socket, _) = tungstenite::client_tls_with_config(url, tcp, Some(limits), None)
+            .map_err(|e| e.to_string())?;
+        return Ok(socket);
+    }
+    Err(failed)
+}
+
+/// The start of `text`, for a log line: its first 200 characters at most.
+fn excerpt(text: &str) -> &str {
+    text.char_indices()
+        .nth(200)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
 /// One connection, until it ends.
-fn session(config: &Config, tx: &Sender<Event>) -> Result<(), String> {
-    let (mut socket, _) = tungstenite::connect(config.url.as_str()).map_err(|e| e.to_string())?;
+fn session(config: &Config, tx: &SyncSender<Event>) -> Result<(), String> {
+    let mut socket = connect(&config.url)?;
     // Reads give up now and then, so that heartbeats go out while the market is quiet.
     stream(&mut socket)
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -94,12 +151,14 @@ fn session(config: &Config, tx: &Sender<Event>) -> Result<(), String> {
                     Some(Message::Reconnect) => return Ok(()),
                     Some(Message::Other) => continue,
                     None => {
-                        eprintln!("mirror: cannot read {}", &text[..text.len().min(200)]);
+                        eprintln!("mirror: cannot read {}", excerpt(&text));
                         continue;
                     }
                 };
-                if tx.send(event).is_err() {
-                    return Ok(());
+                // A mirror that far behind catches up with the books that follow.
+                match tx.try_send(event) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
                 }
             }
             Ok(Frame::Close(_)) => return Ok(()),
@@ -129,5 +188,21 @@ fn stream(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> &mut TcpStream {
         MaybeTlsStream::Plain(stream) => stream,
         MaybeTlsStream::Rustls(stream) => stream.get_mut(),
         _ => unreachable!("only rustls is built in"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A log line takes the start of a message the feed cannot read, cut between
+    /// characters, never inside one.
+    #[test]
+    fn an_excerpt_is_cut_between_characters() {
+        let text = format!("{}é{}", "a".repeat(199), "b".repeat(50));
+        assert_eq!(excerpt(&text), format!("{}é", "a".repeat(199)));
+        assert_eq!(excerpt("short"), "short");
+        let wide = "€".repeat(300);
+        assert_eq!(excerpt(&wide).chars().count(), 200);
     }
 }

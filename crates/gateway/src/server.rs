@@ -818,8 +818,11 @@ impl<C: Core> Server<C> {
                     }
                     Err(error) => {
                         let body = error.to_string();
-                        let response =
-                            http::response("400 Bad Request", "text/plain", body.as_bytes());
+                        let status = match error {
+                            http::HttpError::CrossOrigin => "403 Forbidden",
+                            _ => "400 Bad Request",
+                        };
+                        let response = http::response(status, "text/plain", body.as_bytes());
                         connection.output.extend_from_slice(&response);
                         connection.closing = true;
                         return input.len();

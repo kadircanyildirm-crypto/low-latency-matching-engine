@@ -272,6 +272,13 @@ fn the_page_is_served_and_nothing_else() {
         "{icon}"
     );
     assert!(http(gateway.web, b"GET /secret HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
+    // A page of another site may not open a WebSocket here; one of this site may.
+    let elsewhere = http(
+        gateway.web,
+        handshake("Origin: https://evil.example\r\n").as_bytes(),
+    );
+    assert!(elsewhere.starts_with("HTTP/1.1 403"), "{elsewhere}");
+    let _ours = Browser::connect_with(gateway.web, "Origin: http://localhost\r\n");
     assert!(http(gateway.web, b"POST / HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 400"));
     // The binary listener does not speak HTTP: it logs the connection out.
     let mut stream = TcpStream::connect(gateway.binary).unwrap();

@@ -1241,6 +1241,12 @@ same login, risk limits, reports and market data; its messages are JSON objects 
 WebSocket text frames, mapped one to one onto the binary protocol's, and the server's
 replies are encoded the same way.
 
+Every response forbids framing the page (`X-Frame-Options`, `frame-ancestors`), which
+could trick a visitor into clicking its buttons, and the handshake of a page of another
+site is refused: a browser names the page that opens a WebSocket in `Origin`, which must be
+the host it asks. Otherwise any site could have its visitors' browsers make accounts and
+connections here, past the limits by address. Programs that are not browsers name none.
+
 The three decoders are strict, for the same reason the binary protocol's is (§15): HTTP
 takes only `GET` without a body and the handshake of RFC 6455; WebSocket frames must be
 masked, whole, text or control frames, within a size limit, with lengths in their shortest

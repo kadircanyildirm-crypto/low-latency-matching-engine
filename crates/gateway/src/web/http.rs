@@ -26,6 +26,17 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// The request without what only an upgrade carries: a test's shorthand.
+    #[cfg(test)]
+    fn upgrade(key: &str) -> Request {
+        Request::Upgrade {
+            key: key.to_owned(),
+            forwarded_for: None,
+        }
+    }
+}
+
 /// Why a request is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpError {
@@ -37,6 +48,8 @@ pub enum HttpError {
     Method,
     /// An upgrade without the headers a WebSocket handshake needs.
     BadUpgrade,
+    /// An upgrade from a page of another site: its `Origin` is not the host it asks.
+    CrossOrigin,
 }
 
 impl fmt::Display for HttpError {
@@ -46,6 +59,7 @@ impl fmt::Display for HttpError {
             HttpError::TooLarge => write!(f, "a request over the size limit"),
             HttpError::Method => write!(f, "only GET without a body is served"),
             HttpError::BadUpgrade => write!(f, "an incomplete WebSocket handshake"),
+            HttpError::CrossOrigin => write!(f, "a WebSocket from another site"),
         }
     }
 }
@@ -100,6 +114,19 @@ pub fn parse(buf: &[u8], max: usize) -> Result<Option<(Request, usize)>, HttpErr
             .decode(key)
             .is_ok_and(|bytes| bytes.len() == 16)
     });
+    // A browser names the page that opens a WebSocket; one of another site may not, or it
+    // could use its visitors' browsers to make accounts and connections here. Programs
+    // that are not browsers name none.
+    if let Some(origin) = header("origin") {
+        let site = origin.split_once("://").map(|(_, site)| site);
+        let host = header("host");
+        if !site
+            .zip(host)
+            .is_some_and(|(site, host)| site.eq_ignore_ascii_case(host))
+        {
+            return Err(HttpError::CrossOrigin);
+        }
+    }
     let forwarded_for = header("x-forwarded-for")
         .and_then(|list| list.rsplit(',').next())
         .and_then(|address| address.trim().parse().ok());
@@ -138,7 +165,9 @@ pub fn response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
     let mut out = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Connection: close\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n\
-         Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n\r\n",
+         X-Frame-Options: DENY\r\nReferrer-Policy: strict-origin-when-cross-origin\r\n\
+         Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; \
+         frame-ancestors 'none'; base-uri 'none'\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -180,13 +209,37 @@ mod tests {
         assert_eq!(
             parse(upgrade, 1_024),
             Ok(Some((
-                Request::Upgrade {
-                    key: "dGhlIHNhbXBsZSBub25jZQ==".into(),
-                    forwarded_for: None,
-                },
+                Request::upgrade("dGhlIHNhbXBsZSBub25jZQ=="),
                 upgrade.len()
             )))
         );
+        // A page of this site may open one; a page of another may not.
+        let from = |origin: &str| {
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: demo.example.com\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: {origin}\r\n\r\n"
+            )
+        };
+        let ours = from("https://Demo.Example.com");
+        assert_eq!(
+            parse(ours.as_bytes(), 1_024),
+            Ok(Some((
+                Request::upgrade("dGhlIHNhbXBsZSBub25jZQ=="),
+                ours.len()
+            )))
+        );
+        for origin in [
+            "https://evil.example",
+            "null",
+            "https://demo.example.com.evil.example",
+        ] {
+            assert_eq!(
+                parse(from(origin).as_bytes(), 1_024),
+                Err(HttpError::CrossOrigin),
+                "{origin}"
+            );
+        }
         // Behind a proxy: the address it added, the last one.
         let proxied = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
             Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
@@ -234,6 +287,9 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Length: 5\r\n"));
         assert!(text.ends_with("\r\n\r\nhello"));
+        // Nothing may frame the page, which could trick a visitor into clicking its buttons.
+        assert!(text.contains("X-Frame-Options: DENY\r\n"));
+        assert!(text.contains("frame-ancestors 'none'"));
         let upgrade = String::from_utf8(upgrade_response("dGhlIHNhbXBsZSBub25jZQ==")).unwrap();
         assert!(upgrade.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
     }

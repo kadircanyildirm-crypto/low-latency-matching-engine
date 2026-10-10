@@ -585,3 +585,26 @@ fn bots_make_a_market() {
     drop(watcher);
     gateway.stop();
 }
+
+/// A bot that acts seldom stays logged in: it says it is still there between its actions.
+#[test]
+fn a_quiet_bot_is_not_logged_out() {
+    use gateway::bots::{self, Bot, Strategy};
+    let dir = TempDir::new("quiet-bot");
+    let gateway = Gateway::start(&dir, ServerConfig::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let bot = Bot {
+        strategy: Strategy::Whale,
+        account: account(1),
+        mid: 500,
+        interval: Duration::from_secs(60),
+        seed: 1,
+    };
+    let (addr, stopping) = (gateway.addr, stop.clone());
+    let thread = thread::spawn(move || bots::run(addr, bot, &stopping));
+    // Longer than the exchange lets a silent session stay.
+    thread::sleep(Duration::from_secs(7));
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap().unwrap();
+    gateway.stop();
+}

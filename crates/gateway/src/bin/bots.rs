@@ -55,27 +55,27 @@ fn run() -> Result<(), String> {
             parse(take("makers"), "3", "makers")?,
             500,
         ),
-        (Strategy::Noise, parse(take("noise"), "3", "noise")?, 1_500),
+        (Strategy::Noise, parse(take("noise"), "3", "noise")?, 700),
         (
             Strategy::Trend,
             parse::<usize>(take("trend"), "1", "trend")?,
-            3_000,
+            1_500,
         ),
         (
             Strategy::Passive,
             parse(take("passive"), "2", "passive")?,
-            900,
+            450,
         ),
         (
             Strategy::Iceberg,
             parse(take("icebergs"), "1", "icebergs")?,
             2_000,
         ),
-        (Strategy::Stops, parse(take("stops"), "1", "stops")?, 2_500),
+        (Strategy::Stops, parse(take("stops"), "1", "stops")?, 1_500),
         (
             Strategy::Whale,
             parse(take("whales"), "1", "whales")?,
-            30_000,
+            20_000,
         ),
     ];
     let mid: i64 = parse(take("mid"), "10000", "mid")?;

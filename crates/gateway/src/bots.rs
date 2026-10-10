@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orderbook::workload::SplitMix64;
-use orderbook::{Side, TimeInForce};
+use orderbook::{BookConfig, Side, TimeInForce};
 use protocol::{Inbound, NewOrder, OrderKind, Outbound, ReportKind};
 
 use crate::accounts::Account;
@@ -139,19 +139,19 @@ impl Memory {
 pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
     let (mut client, _) = Client::login(addr, bot.account.id, bot.account.token)?;
     client.send(&Inbound::Subscribe)?;
-    let mut rng = SplitMix64::new(bot.seed ^ u64::from(bot.account.id));
+    let mut rng = rng(&bot);
     let mut market = Market::default();
     let mut memory = Memory {
         fair: bot.mid,
         ..Memory::default()
     };
     // Each market maker has a style of its own: how many levels, how far apart, how big.
-    let style = bot.seed ^ u64::from(bot.account.id);
-    let levels = 6 + (style % 5) as i64;
-    let spacing = 1 + (style / 5 % 2) as i64;
-    let base = 4 + style / 10 % 12;
+    let levels = 6 + rng.below(5) as i64;
+    let spacing = 1 + rng.below(2) as i64;
+    let base = 4 + rng.below(12);
     let mut next_ref = 1;
     let mut next_action = Instant::now();
+    let mut last_sent = Instant::now();
     let interval_ns = bot.interval.as_nanos().max(1) as u64;
     while !stop.load(Ordering::Relaxed) {
         while let Some(message) = client.try_receive()? {
@@ -165,10 +165,17 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
             memory.apply(&message);
         }
         let now = Instant::now();
+        // The exchange logs out a session that stays silent: a bot that acts seldom says
+        // it is still there.
+        if now - last_sent >= HEARTBEAT {
+            client.send(&Inbound::Heartbeat)?;
+            last_sent = now;
+        }
         if now < next_action {
             thread::sleep(Duration::from_millis(5).min(next_action - now));
             continue;
         }
+        last_sent = now;
         // Acts on average once an interval, at random within it.
         next_action = now + Duration::from_nanos(interval_ns / 2 + rng.below(interval_ns));
         let mut order = |side, price: i64, qty, kind: Kind| {
@@ -217,7 +224,7 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                 let moved = memory
                     .quoted
                     .is_none_or(|quoted| (quoted - memory.fair).abs() >= 2);
-                if moved || rng.below(12) == 0 {
+                if moved || rng.below(6) == 0 {
                     client.queue(&Inbound::MassCancel);
                     for level in 0..levels {
                         // Further from the price, more size, as on a real book.
@@ -307,8 +314,7 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
                             Side::Buy => touch - rng.below(3) as i64,
                             Side::Sell => touch + rng.below(3) as i64,
                         };
-                        let qty = 300 + rng.below(700);
-                        let display = 15 + rng.below(25);
+                        let (qty, display) = iceberg(&mut rng);
                         let (client_ref, message) = order(side, price, qty, Kind::Iceberg(display));
                         client.queue(&message);
                         memory.iceberg = Some((client_ref, price));
@@ -352,6 +358,27 @@ pub fn run(addr: SocketAddr, bot: Bot, stop: &AtomicBool) -> io::Result<()> {
     client.send(&Inbound::Logout)
 }
 
+/// A bot's random choices: seeded from its seed and account, mixed, so that bots with
+/// nearby seeds and accounts do not act alike.
+fn rng(bot: &Bot) -> SplitMix64 {
+    SplitMix64::new(
+        bot.seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(u64::from(bot.account.id)),
+    )
+}
+
+/// An iceberg's quantity and the part it shows: within the book's default limit on
+/// tranches, so the book takes it.
+fn iceberg(rng: &mut SplitMix64) -> (u64, u64) {
+    let display = 15 + rng.below(25);
+    let tranches = 4 + rng.below(u64::from(BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES) - 3);
+    (display * tranches, display)
+}
+
+/// How long a bot stays silent at most.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// What kind of order a bot sends.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -366,6 +393,39 @@ enum Kind {
 mod tests {
     use super::*;
     use protocol::{LevelUpdate, TradeTick};
+
+    /// Bots of one kind, numbered one after the other as the bots binary numbers them, do
+    /// not make the same choices.
+    #[test]
+    fn bots_alike_choose_differently() {
+        let bot = |n: u32| Bot {
+            strategy: Strategy::Noise,
+            account: Account {
+                id: n,
+                token: 0,
+                max_open_orders: 1,
+                messages_per_second: 1,
+                funds: None,
+            },
+            mid: 100,
+            interval: Duration::from_secs(1),
+            seed: 1 + u64::from(n),
+        };
+        let firsts: std::collections::HashSet<u64> =
+            (1..50).map(|n| rng(&bot(n)).next_u64()).collect();
+        assert_eq!(firsts.len(), 49);
+    }
+
+    /// An iceberg is one the book takes: no more tranches than it allows.
+    #[test]
+    fn icebergs_fit_the_book() {
+        let mut rng = SplitMix64::new(7);
+        for _ in 0..10_000 {
+            let (qty, display) = iceberg(&mut rng);
+            assert!(display > 0 && qty > display);
+            assert!(qty <= display * u64::from(BookConfig::DEFAULT_MAX_ICEBERG_TRANCHES));
+        }
+    }
 
     #[test]
     fn the_market_view_follows_its_data() {

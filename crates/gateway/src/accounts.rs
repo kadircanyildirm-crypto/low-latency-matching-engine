@@ -11,8 +11,8 @@ pub struct Account {
     pub token: u64,
     /// Orders and stops the account may have open at once.
     pub max_open_orders: u32,
-    /// Order-entry messages (new orders, cancels, modifies, mass cancels) a session may send
-    /// per second, with bursts of up to the same number.
+    /// Order-entry messages (new orders, cancels, modifies, mass cancels) the account may
+    /// send per second, whatever its sessions, with bursts of up to the same number.
     pub messages_per_second: u32,
     /// What a paper-trading account starts with; `None` for an account whose orders are
     /// not checked against money or position, such as a market maker's.

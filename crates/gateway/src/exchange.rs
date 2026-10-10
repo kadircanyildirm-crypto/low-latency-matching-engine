@@ -153,9 +153,6 @@ struct Session {
     account: Option<u32>,
     last_received: u64,
     last_sent: u64,
-    /// The token bucket, in billionths of a message.
-    tokens: u128,
-    refilled: u64,
     /// Set once the session is being closed: nothing more is taken from or sent to it.
     closing: bool,
     /// Whether it gets market data.
@@ -179,6 +176,10 @@ struct AccountState {
     open: u32,
     /// A paper-trading account's money and position.
     wallet: Option<Wallet>,
+    /// The token bucket, in billionths of a message: the account's, not its session's,
+    /// so that logging in again does not fill it.
+    tokens: u128,
+    refilled: u64,
 }
 
 impl AccountState {
@@ -188,6 +189,8 @@ impl AccountState {
             session: None,
             open: 0,
             wallet: account.funds.map(Wallet::new),
+            tokens: u128::from(account.messages_per_second) * TOKEN,
+            refilled: 0,
         }
     }
 }
@@ -630,8 +633,6 @@ impl Exchange {
             account: None,
             last_received: now,
             last_sent: now,
-            tokens: 0,
-            refilled: now,
             closing: false,
             subscribed: false,
         });
@@ -670,7 +671,7 @@ impl Exchange {
                     Inbound::NewOrder(order) => order.client_ref,
                     _ => 0,
                 };
-                if !self.take_token(session, account) {
+                if !self.take_token(account) {
                     let reason = RejectCode::Throttled;
                     return self.send(session, Outbound::Reject { reason, client_ref }, mail);
                 }
@@ -707,11 +708,8 @@ impl Exchange {
             self.send(session, Outbound::LoginRejected { reason }, mail);
             return self.close(session, mail);
         }
-        let rate = self.limits(account).messages_per_second;
         let state = self.sessions[session].as_mut().expect("a session");
         state.account = Some(account);
-        state.tokens = u128::from(rate) * TOKEN;
-        state.refilled = self.now;
         let last_seq = self.last_seq;
         self.send(session, Outbound::LoginAccepted { account, last_seq }, mail);
         if let Some(wallet) = self.wallet(account) {
@@ -748,18 +746,13 @@ impl Exchange {
         }
     }
 
-    fn limits(&self, account: u32) -> Account {
-        self.accounts[account as usize]
-            .as_ref()
-            .expect("an account")
-            .account
-    }
-
-    /// Takes one message from the session's token bucket, if it holds one.
-    fn take_token(&mut self, session: SessionId, account: u32) -> bool {
-        let rate = u128::from(self.limits(account).messages_per_second);
+    /// Takes one message from the account's token bucket, if it holds one.
+    fn take_token(&mut self, account: u32) -> bool {
         let now = self.now;
-        let state = self.sessions[session].as_mut().expect("a session");
+        let state = self.accounts[account as usize]
+            .as_mut()
+            .expect("an account");
+        let rate = u128::from(state.account.messages_per_second);
         let elapsed = u128::from(now.saturating_sub(state.refilled));
         state.tokens = (state.tokens + elapsed * rate).min(rate * TOKEN);
         state.refilled = state.refilled.max(now);

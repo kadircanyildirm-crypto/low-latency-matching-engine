@@ -549,6 +549,33 @@ fn messages_are_throttled() {
     assert_eq!(mail.take(0).len(), 1);
 }
 
+/// The bucket is the account's: a client that logs in again, and again, gets no more
+/// messages for it.
+#[test]
+fn logging_in_again_does_not_refill_the_bucket() {
+    let slow = Account {
+        messages_per_second: 4,
+        ..account(1)
+    };
+    let mut exchange = exchange(&[slow]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    for client_ref in 1..=4 {
+        exchange.receive(0, limit(client_ref, Side::Sell, 100, 1), 0, &mut mail);
+    }
+    exchange.flush(&mut mail).unwrap();
+    exchange.detach(0);
+    logged_in(&mut exchange, 1, 1, &mut mail);
+    exchange.receive(1, limit(5, Side::Sell, 100, 1), 0, &mut mail);
+    assert_eq!(
+        mail.take(1),
+        [Outbound::Reject {
+            reason: RejectCode::Throttled,
+            client_ref: 5
+        }]
+    );
+}
+
 #[test]
 fn a_disconnect_cancels_the_accounts_orders() {
     let mut exchange = exchange(&[account(1), account(2)]);

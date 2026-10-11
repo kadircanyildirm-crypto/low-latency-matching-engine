@@ -154,7 +154,7 @@ jobs:
             --summary-only | tee coverage.txt
           { echo '### Coverage of the book and the engine'; echo '```'; cat coverage.txt; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lcov
           path: lcov.info
@@ -198,7 +198,7 @@ jobs:
               -max_total_time=30 -len_control=0 -max_len=4096
             rm -f "fuzz/corpus/$target"/random-*
           done
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts

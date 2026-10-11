@@ -78,7 +78,7 @@ jobs:
           # missed, so the missed list decides.
           if [ -s mutants.out/missed.txt ]; then exit 2; fi
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: mutants-${{ matrix.crate }}-shard-${{ matrix.shard }}
@@ -156,7 +156,7 @@ jobs:
             echo "$target: $(ls "fuzz/corpus/$target" | wc -l) inputs in the corpus" \
               | tee -a "$GITHUB_STEP_SUMMARY"
           done
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts

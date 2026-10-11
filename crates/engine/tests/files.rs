@@ -6,9 +6,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use engine::sim::SimStorage;
+use engine::sim::{CrashModel, SimStorage};
 use engine::storage::{FsStorage, Storage, StorageFile};
-use engine::{Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq};
+use engine::{Discard, Engine, EngineConfig, Error, RECORD_SIZE, RecoveryReport, Seq, SyncPolicy};
+use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Command, Event};
 
 const DIR: &str = "data";
@@ -169,6 +170,59 @@ fn snapshots_that_contradict_themselves_are_not_used() {
         ),
         Err(Error::ConfigMismatch { .. })
     ));
+}
+
+/// A snapshot set aside as damaged stays aside through a crash. Here the journal is damaged
+/// too, so recovery goes back to before the snapshot, and the commands that follow reuse the
+/// sequence numbers of the history it holds. If its damage did not last, as a misread does
+/// not, a crash that lost the rename brought it back: recovery then refused to start, or,
+/// without verifying the replay, started from a history that no longer was. Found by the
+/// recovery fuzz target.
+#[test]
+fn a_snapshot_set_aside_stays_aside_through_a_crash() {
+    let (book, commands) = common::flow(23, 40);
+    // One segment, so that no later segment's header vouches for the damaged record.
+    let config = EngineConfig {
+        sync: SyncPolicy::Os,
+        verify_replay: true,
+        segment_capacity: 64,
+        ..EngineConfig::new(book)
+    };
+    // Two commands of the first history, then another.
+    let mut second = commands[..2].to_vec();
+    second.extend_from_slice(&commands[20..38]);
+    let digests = common::digests(book, &second);
+    for seed in 0..32 {
+        let storage = SimStorage::new();
+        let (mut engine, _) = open(&storage, config).unwrap();
+        let mut events = Vec::new();
+        engine.submit_batch(&commands[..16], &mut events).unwrap();
+        engine.snapshot().unwrap();
+        drop(engine);
+        // The snapshot misreads, and the journal's third record is damaged for good.
+        storage.flip_bit(&snapshot(16), 140);
+        storage.flip_bit(&segment(1), record_bit(2, 5));
+        let (mut engine, report) = open(&storage, config).unwrap();
+        assert_eq!(report.damaged_snapshots.len(), 1);
+        assert_eq!(engine.last_seq(), 2);
+        // The misread passes, and the second history goes on.
+        storage.flip_bit(&snapshot(16).with_extension("damaged"), 140);
+        engine.submit_batch(&second[2..], &mut events).unwrap();
+        drop(engine);
+        let model = if seed % 2 == 0 {
+            CrashModel::InOrder
+        } else {
+            CrashModel::AnyOrder
+        };
+        let crashed = storage.crash(&mut SplitMix64::new(seed), model);
+        let (engine, _) = match open(&crashed, config) {
+            Ok(opened) => opened,
+            Err(error) => panic!("seed {seed}: {error}"),
+        };
+        let kept = engine.last_seq() as usize;
+        assert!(kept >= 2, "seed {seed}: {kept}");
+        assert_eq!(engine.book().digest(), digests[kept], "seed {seed}");
+    }
 }
 
 #[test]

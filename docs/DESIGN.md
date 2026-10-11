@@ -708,8 +708,8 @@ matching rules, and its own CRC.
 9. Write again every record nothing vouches for: no later record, and no clean-shutdown
    record (`Engine::close` leaves one, saying everything was synced). Then sync the file,
    then the directory.
-10. Rename the damaged snapshots `snapshot-<seq>.damaged`; retention deletes them once
-    they are older than every kept snapshot.
+10. Rename the damaged snapshots `snapshot-<seq>.damaged`, and sync the directory;
+    retention deletes them once they are older than every kept snapshot.
 
 Each repair guards against the next failure, not the current one, and each is shown to be
 needed by a test that fails without it:
@@ -726,6 +726,12 @@ needed by a test that fails without it:
 - **Syncing the directory (9).** A segment a killed process created may exist only in the
   OS cache; adopted and filled with acknowledged records, it would vanish whole in a power
   failure.
+- **Syncing the snapshots set aside (10).** When the journal is damaged too, recovery goes
+  back to before a damaged snapshot, and the commands that follow reuse the sequence
+  numbers of the history it holds. If its damage did not last, as a misread does not, a
+  crash that lost the rename would bring it back: recovery refused to start, or, without
+  verifying the replay, started from a history that no longer was. The recovery fuzz target
+  found it.
 
 | What happened | What recovery keeps |
 |---|---|
@@ -856,7 +862,7 @@ change, and says so.
 | `tests/codec.rs` | Every command, over the full range of each field, and snapshots of real books round-trip; arbitrary and altered bytes decode canonically or not at all. |
 | `tests/interrupted.rs` | The process dies at every single change a run makes to the disk, in turn (in appends, segment preparation and rolls, snapshot writes and checks, retention), then a kill or a power failure, a recovery that may itself die and be followed by another power failure, and two more rounds of the same at random points. A second test does the same at sampled points with segments prepared in several pieces. Each recovery keeps what was durable (everything acknowledged, after a kill), invents nothing, and rebuilds exactly the state after what it kept; the stream then finishes in the uncrashed state. |
 | `tests/recovery.rs` | 400 runs of random settings with four failures each between batches, power failures (in-order or reordered write-back, sectors torn out of writes, lost directory changes) or kills; and 300 runs with a bit flipped anywhere: recovery refuses or rebuilds a prefix that lacks at most the last command. |
-| `tests/files.rs` | One test per way the files can contradict the engine: leftover temporary files, snapshots that lie about their sequence number, length, digest, format or configuration, missing, misnamed, short, cut or damaged segments, records in the wrong slot, a journal that ends before its snapshot, two engines on one directory, the exact pace of segment preparation. |
+| `tests/files.rs` | One test per way the files can contradict the engine: leftover temporary files, snapshots that lie about their sequence number, length, digest, format or configuration, a snapshot set aside as damaged that stays aside through a crash, missing, misnamed, short, cut or damaged segments, records in the wrong slot, a journal that ends before its snapshot, two engines on one directory, the exact pace of segment preparation. |
 | `tests/operations.rs` | Events with their sequence numbers, redelivered on replay, and consumers resuming where they stood or told they are ahead; replay verified against snapshots before anything changes; failing snapshots and segment preparations that do not stop trading; a failing roll; a failed sync followed by a reopen and a power failure; a clean shutdown; settings that change between runs; the upgrade to new rules and commands under old ones; damage to files recovery does not need; read errors; panics. |
 | `tests/kill.rs` | The acceptance test: a child process on the real file system, killed 48 times at random points under 16 combinations of sync policy, segment size and snapshot interval, recovers every command it had reported applied, and exactly the state after them. CI runs it on Linux, Windows and macOS. |
 | `tests/zero_alloc.rs` | Journaling, syncing and applying commands on the real file system allocate nothing between segment rolls, the measured commands included. |

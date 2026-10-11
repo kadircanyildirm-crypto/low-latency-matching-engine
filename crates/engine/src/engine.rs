@@ -400,11 +400,18 @@ impl<S: Storage> Engine<S> {
             });
         }
 
-        // Not synced: if a rename is lost, the next recovery finds the damage again.
+        // Synced before any command is taken: the journal goes on from before a damaged
+        // snapshot, so the commands written next reuse the sequence numbers of the history
+        // it held. A rename lost in a crash would let that snapshot come back if its damage
+        // did not last, such as a misread, and start a later recovery from a history that
+        // no longer is.
         let storage = journal.storage();
         for (seq, _) in &report.damaged_snapshots {
             let path = snapshots::path(dir, *seq);
             storage.rename(&path, &path.with_extension("damaged"))?;
+        }
+        if !report.damaged_snapshots.is_empty() {
+            storage.sync_dir(dir)?;
         }
 
         let last_seq = journal.last_seq();

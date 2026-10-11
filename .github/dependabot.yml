@@ -5,3 +5,10 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # Only releases two weeks old or more: a compromised one is usually caught by then.
+    cooldown:
+      default-days: 14
+    ignore:
+      # Its branches are toolchains, not versions: each pin names the one it installs,
+      # and an update would point them all at the stable branch.
+      - dependency-name: dtolnay/rust-toolchain

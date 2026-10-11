@@ -146,6 +146,9 @@ fn http(addr: SocketAddr, request: &[u8]) -> String {
 struct Browser {
     stream: TcpStream,
     input: Vec<u8>,
+    /// The engine log's entries from every `log` message received, those skipped while
+    /// waiting for another kind included: the log shows each command only once.
+    log: Vec<Value>,
 }
 
 impl Browser {
@@ -163,6 +166,7 @@ impl Browser {
         let mut browser = Browser {
             stream,
             input: Vec::new(),
+            log: Vec::new(),
         };
         // The handshake's answer, up to the blank line.
         while !browser.input.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -215,7 +219,14 @@ impl Browser {
                 if len != usize::MAX && self.input.len() >= at + len {
                     let payload: Vec<u8> = self.input.drain(..at + len).skip(at).collect();
                     match opcode {
-                        1 => return serde_json::from_slice(&payload).unwrap(),
+                        1 => {
+                            let message: Value = serde_json::from_slice(&payload).unwrap();
+                            if message["type"] == "log" {
+                                let entries = message["entries"].as_array().unwrap();
+                                self.log.extend(entries.iter().cloned());
+                            }
+                            return message;
+                        }
                         8 => return json!({"type": "closed"}),
                         _ => continue,
                     }
@@ -403,12 +414,12 @@ fn a_browser_registers_trades_and_watches_the_market() {
     let queues = viewer.expect("queues");
     assert_eq!(queues["sell"], json!([[105, [id, 1]]]), "{queues}");
     assert_eq!(queues["buy"], json!([]));
-    // The engine log tells the order and the bot's trade against it, in sequence.
-    let mut logged = Vec::new();
-    while logged.len() < 2 {
-        let log = browser.expect("log");
-        logged.extend(log["entries"].as_array().unwrap().iter().cloned());
+    // The engine log tells the order and the bot's trade against it, in sequence. The order
+    // may have been shown before the trade, while the browser waited for its fill.
+    while browser.log.len() < 2 {
+        browser.receive();
     }
+    let logged = &browser.log;
     assert_eq!(
         logged[0],
         json!({"seq": id, "paper": true, "cmd": "limit", "owner": 10, "side": "sell",

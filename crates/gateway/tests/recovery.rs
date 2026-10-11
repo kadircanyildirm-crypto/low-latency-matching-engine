@@ -6,9 +6,10 @@
 use std::path::Path;
 
 use engine::sim::{CrashModel, SimStorage};
+use engine::storage::{Storage, StorageFile};
 use engine::{Engine, EngineConfig};
 use gateway::recovery::{self, RecoveryError};
-use gateway::{Account, Checkpoint, Exchange, Funds, Mailbox, SessionId, Timing};
+use gateway::{Account, Checkpoint, Exchange, Funds, Mailbox, SessionId, SetupError, Timing};
 use orderbook::workload::SplitMix64;
 use orderbook::{BookConfig, Side, TimeInForce};
 use protocol::{Inbound, NewOrder, OrderKind, Outbound, VERSION};
@@ -313,6 +314,85 @@ fn every_order_is_checked_against_the_book() {
             Ok(_) => panic!("a checkpoint the book contradicts was used"),
         }
     }
+}
+
+/// Damage that leaves a checkpoint's JSON readable, a digit of an account's cash, is found
+/// by its checksum, and recovery starts from the one before. A checkpoint from before the
+/// checksum, plain JSON, still reads; one that names an account the book cannot have is
+/// refused, not a panic.
+#[test]
+fn checkpoints_carry_a_checksum() {
+    let storage = SimStorage::new();
+    let (mut engine, mut exchange, _) = open(&storage);
+    let (first, _) = trade(&storage, &mut engine, &mut exchange, 12, 60, false);
+    recovery::save(&mut storage.clone(), Path::new(DIR), &first).unwrap();
+    for session in 0..4 {
+        exchange.detach(session);
+    }
+    let (state, _) = trade(&storage, &mut engine, &mut exchange, 13, 60, false);
+    recovery::save(&mut storage.clone(), Path::new(DIR), &state).unwrap();
+    drop((engine, exchange));
+    let newest = Path::new(DIR).join(format!("gateway-{:020}.json", state.seq));
+    let bytes = read_file(&storage, &newest);
+    assert!(bytes.starts_with(b"crc32 "));
+    // The lowest bit of the first digit of a cash amount: still JSON, another number.
+    let cash = bytes.windows(7).position(|w| w == b"\"cash\":").unwrap() + 7;
+    let at = cash + usize::from(bytes[cash] == b'-');
+    assert!(bytes[at].is_ascii_digit());
+    storage.flip_bit(&newest, 8 * at as u64);
+    let (_, exchange, recovered) = open(&storage);
+    assert_eq!(recovered.checkpoint, Some(first.seq));
+    assert_eq!(exchange.checkpoint().unwrap().wallets, state.wallets);
+
+    // Plain JSON, as checkpoints were before the checksum.
+    let storage = SimStorage::new();
+    let (mut engine, mut exchange, _) = open(&storage);
+    let (state, _) = trade(&storage, &mut engine, &mut exchange, 14, 60, false);
+    drop((engine, exchange));
+    let path = Path::new(DIR).join(format!("gateway-{:020}.json", state.seq));
+    write_file(&storage, &path, &serde_json::to_vec(&state).unwrap());
+    let (_, exchange, recovered) = open(&storage);
+    assert_eq!(recovered.checkpoint, Some(state.seq));
+    assert_eq!(exchange.checkpoint().unwrap().wallets, state.wallets);
+
+    // An order of an account past the book's owners.
+    let mut wrong = state.clone();
+    wrong.orders.push(gateway::exchange::SavedOrder {
+        id: 1,
+        account: 1_000,
+        client_ref: 0,
+        buy: true,
+        price: Some(100),
+        leaves: 1,
+    });
+    wrong.orders.sort_by_key(|o| o.id);
+    wrong.orders.dedup_by_key(|o| o.id);
+    wrong.orders.iter_mut().find(|o| o.id == 1).unwrap().account = 1_000;
+    recovery::save(&mut storage.clone(), Path::new(DIR), &wrong).unwrap();
+    match recovery::open(
+        storage,
+        Path::new(DIR),
+        config(),
+        &accounts(),
+        Timing::default(),
+    ) {
+        Err(RecoveryError::Setup(SetupError::AccountOutOfRange(1_000))) => {}
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("an account past the book's owners was restored"),
+    }
+}
+
+fn read_file(storage: &SimStorage, path: &Path) -> Vec<u8> {
+    let mut file = storage.clone().open(path).unwrap();
+    let mut bytes = vec![0; file.size().unwrap() as usize];
+    file.read_at(0, &mut bytes).unwrap();
+    bytes
+}
+
+fn write_file(storage: &SimStorage, path: &Path, bytes: &[u8]) {
+    let mut file = storage.clone().create(path).unwrap();
+    file.write_at(0, bytes).unwrap();
+    file.sync().unwrap();
 }
 
 #[test]

@@ -14,7 +14,10 @@
 //!
 //! A checkpoint is written to a temporary file, synced, renamed into place and the
 //! directory synced, so a crash leaves the old one or the new one, never half of one; the
-//! one before it is kept too. The journal must still reach back to the checkpoint: it is
+//! one before it is kept too. Its first line is a CRC-32 of the rest, so that damage which
+//! leaves the JSON readable, a digit of someone's cash, is found: such a checkpoint is
+//! passed over like one that does not parse. Checkpoints from before the checksum, plain
+//! JSON, still read. The journal must still reach back to the checkpoint: it is
 //! saved far more often than the engine takes snapshots, whose retention decides how far
 //! back the journal goes.
 
@@ -29,6 +32,8 @@ use crate::accounts::Account;
 use crate::exchange::{Checkpoint, Exchange, SetupError, Timing};
 
 const PREFIX: &str = "gateway-";
+/// What a checkpoint file starts with, before the checksum of the JSON after its first line.
+const CHECKSUM: &[u8] = b"crc32 ";
 const SUFFIX: &str = ".json";
 const TEMPORARY: &str = ".json.tmp";
 
@@ -78,7 +83,10 @@ pub fn save<S: Storage>(
     dir: &Path,
     checkpoint: &Checkpoint,
 ) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(checkpoint).map_err(std::io::Error::other)?;
+    let json = serde_json::to_vec(checkpoint).map_err(std::io::Error::other)?;
+    let mut bytes = CHECKSUM.to_vec();
+    bytes.extend_from_slice(format!("{:08x}\n", crc32fast::hash(&json)).as_bytes());
+    bytes.extend_from_slice(&json);
     let path = dir.join(name(checkpoint.seq));
     let temporary = path.with_extension("json.tmp");
     let mut file = storage.create(&temporary)?;
@@ -111,13 +119,29 @@ pub fn latest<S: Storage>(storage: &mut S, dir: &Path) -> std::io::Result<Option
         let mut file = storage.open(&dir.join(name(seq)))?;
         let mut bytes = vec![0; usize::try_from(file.size()?).unwrap_or(usize::MAX)];
         file.read_at(0, &mut bytes)?;
-        if let Ok(checkpoint) = serde_json::from_slice::<Checkpoint>(&bytes) {
+        if let Some(checkpoint) = read(&bytes) {
             if checkpoint.seq == seq {
                 return Ok(Some(checkpoint));
             }
         }
     }
     Ok(None)
+}
+
+/// The checkpoint in a file's bytes, if its checksum, when it has one, matches, and its JSON
+/// reads.
+fn read(bytes: &[u8]) -> Option<Checkpoint> {
+    let json = match bytes.strip_prefix(CHECKSUM) {
+        Some(rest) => {
+            let (hex, json) = rest.split_at_checked(9)?;
+            let crc = std::str::from_utf8(hex.strip_suffix(b"\n")?).ok()?;
+            let crc = u32::from_str_radix(crc, 16).ok()?;
+            (crc32fast::hash(json) == crc).then_some(json)?
+        }
+        // From before checkpoints had a checksum.
+        None => bytes,
+    };
+    serde_json::from_slice(json).ok()
 }
 
 /// The commands and events after a checkpoint, as the engine replays them.

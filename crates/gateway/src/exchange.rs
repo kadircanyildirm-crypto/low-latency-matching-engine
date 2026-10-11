@@ -517,6 +517,9 @@ impl Exchange {
             if order.id > checkpoint.seq {
                 return Err(SetupError::ForeignOrder(order.id));
             }
+            if order.account >= book.max_owners {
+                return Err(SetupError::AccountOutOfRange(order.account));
+            }
             let side = if order.buy { Side::Buy } else { Side::Sell };
             exchange.place(
                 order.id,

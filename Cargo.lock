@@ -359,6 +359,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "core_affinity",
+ "crc32fast",
  "engine",
  "getrandom 0.3.4",
  "httparse",

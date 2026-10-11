@@ -1319,7 +1319,10 @@ client reference, side, price and open quantity, as of a sequence number at whic
 command's events have been delivered; what orders hold follows from the orders, and the
 depth from the book. The server saves one every `--checkpoint-every` commands (10,000 by
 default) and when it stops, written to a temporary file, synced, renamed into place and the
-directory synced, keeping the one before.
+directory synced, keeping the one before. Its first line is a CRC-32 of the JSON after it:
+damage that leaves the JSON readable, a digit of an account's cash, would otherwise restore
+the wrong money without a word. A checkpoint whose checksum fails is passed over like one
+that does not parse; one from before checksums, plain JSON, still reads.
 
 On start, `recovery::open` finds the newest checkpoint that reads and opens the engine with
 the checkpoint's sequence number as where its consumer stands (`Output::resume_after`). The

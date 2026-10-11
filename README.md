@@ -17,6 +17,22 @@ Bitstamp's ETH/USD order book.
 - **Verified, not just tested.** A differential reference model and a specification checker, seven fuzz targets, Kani proofs, Miri and loom for the one piece of `unsafe` code, crash tests that cut the power at every write, and mutation testing that fails on any fault the tests miss.
 - **Ready for the open internet.** Every reply to a connection is held to an output limit, connections and new accounts are limited per address, WebSockets from other sites are refused, paper orders stay near the market's price, and the containers have no privileges they do not need.
 
+```mermaid
+flowchart LR
+    feed["Bitstamp ETH/USD<br/>public feed"] --> mirror["mirror"]
+    mirror -- binary --> net
+    browsers["Browsers"] -- WebSocket --> net
+    net["① Network thread<br/>sessions · risk checks"] -- ring --> writer["② Writer thread<br/>journal + fsync"]
+    writer -- ring --> matcher["③ Matcher thread<br/>order book"]
+    matcher -- ring --> out["④ Network thread<br/>reports · market data"]
+    writer --> disk[("journal<br/>snapshots")]
+```
+
+Every command is numbered, written to the journal and synced before the book sees it, so
+the book, the paper accounts and every order's place in its queue come back the same after
+a crash. ① and ④ are the same thread; the stages hand commands on through lock-free rings of
+our own, and the engine can also run them all on one thread.
+
 **Status:** Phases 1 to 5 of the [roadmap](docs/ROADMAP.md) are built: the matching core,
 the journal and crash recovery around it, the TCP gateway, the pipeline with market data,
 and the web demo, packaged as an image with a compose file and Caddy for HTTPS

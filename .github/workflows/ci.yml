@@ -207,7 +207,9 @@ jobs:
       matrix:
         include:
           - proofs: bit helpers
-            harnesses: --harness low_bits_through --harness highest_bit
+            harnesses: >-
+              --harness low_bits_through --harness highest_bit
+              --harness dense_sets_with_no_levels
           - proofs: order pool
             harnesses: --harness pool::proofs
           - proofs: owner lists

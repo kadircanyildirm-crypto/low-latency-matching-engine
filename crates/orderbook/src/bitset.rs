@@ -295,8 +295,9 @@ mod proofs {
         );
     }
 
-    /// No levels at all.
+    /// No levels at all. Without a bound, Kani unwound some loop for ever.
     #[kani::proof]
+    #[kani::unwind(2)]
     fn dense_sets_with_no_levels() {
         dense_sets_agree_with_a_linear_scan::<0>();
     }

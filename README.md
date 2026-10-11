@@ -3,18 +3,27 @@
 [![CI](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-![The live demo: candles, and an order book that shows every order in its queue](crates/gateway/web/og.png)
-
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
-single-threaded deterministic matching, event sourcing, and a pipeline of pinned stages.
+single-threaded deterministic matching, a write-ahead journal with crash recovery, a
+pipeline of pinned threads, and a gateway that serves programs over a binary protocol and
+browsers over WebSocket. Its demo trades, with paper money, against a live mirror of
+Bitstamp's ETH/USD order book.
 
-**Status:** Phases 1 to 4 of 9 are complete: the matching core, the journal and crash
-recovery around it, a TCP gateway in front of them, and a pipeline of threads with market
-data. Phase 5, a public web demo with paper trading against a live mirror of a real
-market, is built and packaged,
-and waits for a server to run on. The next phases lead to a public
-web demo with paper trading, then to outside users: see [docs/ROADMAP.md](docs/ROADMAP.md). The reasoning behind every design
-decision is in [docs/DESIGN.md](docs/DESIGN.md).
+![The demo: Bitstamp's ETH/USD book order by order, a paper order waiting in its queue, and the engine room](docs/media/demo.gif)
+
+- **Fast.** 27.6M commands a second and 55 ns median per command through the matching core, on one laptop core; 1.7× exchange-core on the same order flow, with the same trades ([how it was measured](docs/COMPARISON.md)). No heap allocation while matching, checked by a counting allocator.
+- **Durable.** Nothing is acknowledged before its journal record is synced. A killed process loses nothing it acknowledged, a power failure nothing that was synced, and recovery rebuilds the exact state, checked against the book's digest.
+- **Real market data.** The demo places every order resting near the top of Bitstamp's ETH/USD book on its own book, at the same price, with the same size, in the same place in its queue, and sends Bitstamp's trades again as they happen. Read against Bitstamp's own API, all 20 price levels matched in price, quantity and number of orders ([the comparison](docs/media/bitstamp-match.png)); both books change several times a second, so a read can also catch the mirror a quarter of a second behind.
+- **Verified, not just tested.** A differential reference model and a specification checker, seven fuzz targets, Kani proofs, Miri and loom for the one piece of `unsafe` code, crash tests that cut the power at every write, and mutation testing that fails on any fault the tests miss.
+- **Ready for the open internet.** Every reply to a connection is held to an output limit, connections and new accounts are limited per address, WebSockets from other sites are refused, paper orders stay near the market's price, and the containers have no privileges they do not need.
+
+**Status:** Phases 1 to 5 of the [roadmap](docs/ROADMAP.md) are built: the matching core,
+the journal and crash recovery around it, the TCP gateway, the pipeline with market data,
+and the web demo, packaged as an image with a compose file and Caddy for HTTPS
+([deploy/README.md](deploy/README.md)). It runs locally with three commands (see
+[Phase 5](#phase-5-the-web-demo)). Next come measurements on isolated Linux cores, several
+instruments and outside users, and hot-standby replication. The reasoning behind every
+design decision is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Phase 1: the order book
 
@@ -288,7 +297,7 @@ cargo run --release -p gateway --bin loadgen -- --accounts crates/gateway/accoun
 | A strict binary protocol | Fixed-length, little-endian messages with a 4-byte header. Anything that is not exactly what the encoder writes (unknown types, wrong lengths, codes out of range, non-zero padding) logs the connection out. |
 | Sessions | A login with an account and its token first, one session per account, heartbeats to quiet clients, logout of silent ones. |
 | Exchange-assigned ids | An order's id is the sequence number of the command that places it: unique, increasing, and recovered with the journal. The client's own reference comes back in every report. |
-| Pre-trade risk | A limit on each account's open orders and pending stops, counting those not yet applied, and a token bucket on each session's message rate, both checked before anything is journaled. |
+| Pre-trade risk | A limit on each account's open orders and pending stops, counting those not yet applied, and a token bucket on each account's message rate, both checked before anything is journaled. |
 | Cancel-on-disconnect | A connection that closes, sends garbage, goes idle, or reads its reports too slowly has its account's orders cancelled. Stopping the gateway leaves them on the book, as a crash would, and a restart attributes them to their accounts again. |
 | Group commit | One thread, one `mio` event loop: the commands of a round of reads share one journal sync, and reports go out only after it, so under `SyncPolicy::Always` no client hears of an order the journal could lose. |
 
@@ -366,13 +375,14 @@ mirror.
 | Property | How |
 |---|---|
 | Browsers are sessions like any other | A second listener speaks HTTP for the page and upgrades to WebSocket; the session then has the same login, risk limits, reports and market data as a binary one. HTTP, WebSocket frames and JSON are decoded strictly and fuzzed. |
-| Paper money | An account can start with cash and shares. Before an order is accepted, the gateway checks that the account can pay for it in full and holds that: cash for a buy, shares for a sell. Trades settle at their own price and give back what was held for less. A property test lets accounts trade only with each other: money and shares are never made or lost, and each account holds exactly what its orders on the book need. |
+| Paper money | An account can start with cash and shares. Before an order is accepted, the gateway checks that the account can pay for it in full and holds that: cash for a buy, shares for a sell. Trades settle at their own price and give back what was held for less. A property test lets accounts trade only with each other: money and shares are never made or lost, and each account holds exactly what its orders on the book need. Paper orders must be priced within 10% of the market's price, so two accounts cannot move money between them at made-up prices. |
 | The market survives restarts | The exchange's own state, paper money above all, is checkpointed and rebuilt on start from the checkpoint and the journal after it, which the engine replays to it; it must then agree with the recovered book. Crash tests cut the power at random points; an end-to-end test stops and restarts the gateway under a visitor's account. |
 | A real market | `mirror`, in a workspace of its own so the engine's never builds a TLS stack, reads Bitstamp's public WebSocket: the best hundred orders of each side with their ids, and every trade. Every quarter of a second it brings its orders on the exchange in line with the venue's at the best 20 prices: it cancels the orders the venue no longer has, shrinks those that traded (keeping their place in the queue), and places new ones in the venue's order. Each trade is sent again from a second account, as an immediate-or-cancel order for the same quantity at the same price. Prices and quantities are read exactly, as cents and millionths of an ether. If the venue goes quiet, the mirror withdraws its orders rather than show a stale book. A test runs it against a real exchange over real sockets. The page credits the source. |
 | Or a synthetic one | Bots: market makers quoting six to ten levels a side around a wandering fair price, each in its own style, and moving their quotes only once the price has moved; passive traders leaving small orders behind the best prices; an iceberg; stops beyond the market; a whale that takes several levels at once; noise traders crossing the spread, trend followers. |
 | The page | A trading screen with no dependencies and no build step: a candlestick chart that opens on the last hour of trades, with volume, a moving average, a crosshair and the visitor's orders and fills on it, and a depth chart; the book by level or order by order, every order a block in its queue, the visitor's own lit up; the tape; limit and marketable orders with what they cost; the paper account with its profit; open orders with their place in the queue, and fills. Served under a content security policy that allows nothing from elsewhere. |
 | The engine room | Below the screen, the engine at work: what the server recovered when it started and how long that took, with the book's state digest; every command it sequences as it happens, with what came of it; a heatmap of the server's turn times second by second, with p50 and p99; where a turn's time goes, between writing the journal, syncing it and matching; throughput; and a leaderboard of the paper accounts. Above the screen, the benchmark's figures, with a link to how they were measured. |
-| Deployment | An image, a compose file with Caddy in front for HTTPS, and a guide in [deploy/README.md](deploy/README.md). CI builds the image on every push. |
+| Open to the internet | Every reply to a connection, the server's own included, counts against a 4 MiB limit, past which it is dropped and not read. An address may hold 32 WebSockets and create 5 accounts, then one more every ten minutes; browsers never take the sessions kept for the mirror; WebSockets from pages of other sites are refused, and nothing may frame the page. Behind the proxy, a browser's address is the one the proxy names. |
+| Deployment | An image, a compose file with Caddy in front for HTTPS, and a guide in [deploy/README.md](deploy/README.md). The containers' logs rotate, their memory is capped, and the exchange and the mirror run on read-only file systems with no capabilities. CI builds the image on every push. |
 
 Details in [DESIGN.md §17](docs/DESIGN.md#17-the-web-demo).
 

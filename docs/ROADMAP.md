@@ -10,7 +10,7 @@ documented are worth more than five half-finished ones.
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ✅ Done |
 | 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ✅ Done |
-| 5 | Public web demo: paper trading against a live mirror of a real market | 🚀 Built; waits for a server |
+| 5 | Public web demo: paper trading against a live mirror of a real market | 🚀 Built and packaged; public hosting next |
 | 6 | End-to-end measurement and optimisation on Linux | — |
 | 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
 | 8 | Hot standby replication and failover | — |
@@ -225,10 +225,15 @@ the Capital Markets Board, SPK), customer identification and custody, and is out
   commands.
 - An image, a compose file with HTTPS in front, and a guide (`deploy/README.md`); CI builds
   the image.
+- Ready for the open internet: every reply held to a per-connection output limit,
+  connections and new accounts limited per address, sessions kept for the mirror,
+  WebSockets from other sites refused, paper orders kept near the market's price, and
+  containers with rotated logs, capped memory and no privileges they do not need.
 
 **Acceptance criteria:** the public link works; a visitor can trade against the market; the
 market keeps running across a restart of the server. The last two are met locally and in
-tests (`crates/gateway/tests/web.rs`, `tests/recovery.rs`); the first waits for a server.
+tests (`crates/gateway/tests/web.rs`, `tests/recovery.rs`); the first comes with public
+hosting, which needs only a server and a domain.
 
 ---
 

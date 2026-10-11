@@ -1,0 +1,7 @@
+# Proposes updates to the commits the workflows' actions are pinned to.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -16,7 +16,8 @@ on:
       - .github/workflows/scheduled.yml
 
 # Nothing here writes to the repository: whatever an action or a build script does, the
-# token can only read.
+# token can only read. Actions are pinned to commits, which a moved tag cannot change;
+# Dependabot proposes updates (.github/dependabot.yml).
 permissions:
   contents: read
 
@@ -50,12 +51,14 @@ jobs:
               --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
               --file crates/gateway/src/pipeline.rs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-mutants@27.1.0
       - name: Run this shard's mutants
@@ -75,7 +78,7 @@ jobs:
           # missed, so the missed list decides.
           if [ -s mutants.out/missed.txt ]; then exit 2; fi
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
           name: mutants-${{ matrix.crate }}-shard-${{ matrix.shard }}
@@ -104,10 +107,10 @@ jobs:
           - proofs: sparse bitsets, three summary words
             harnesses: --harness sparse_sets_in_three_summary_words
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: model-checking/kani-github-action@v1.1
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           kani-version: '0.68.0'
           working-directory: crates/orderbook
@@ -122,17 +125,19 @@ jobs:
     env:
       FUZZ_FLAGS: --sanitizer none --debug-assertions --target x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -151,7 +156,7 @@ jobs:
             echo "$target: $(ls "fuzz/corpus/$target" | wc -l) inputs in the corpus" \
               | tee -a "$GITHUB_STEP_SUMMARY"
           done
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: failure()
         with:
           name: fuzz-artifacts

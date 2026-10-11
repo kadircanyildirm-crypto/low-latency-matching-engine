@@ -1,0 +1,61 @@
+name: Pages
+
+# The playground: the order book compiled to WebAssembly, with its page, published on GitHub
+# Pages whenever the book or the page changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/orderbook/**
+      - crates/playground/**
+      - crates/gateway/web/og.png
+      - crates/gateway/web/favicon.svg
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publication at a time; a newer one waits rather than cancel one under way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the WebAssembly module
+        run: >
+          cargo build --release --locked -p playground --target wasm32-unknown-unknown
+          --config profile.release.debug=false
+      - name: Put the site together
+        run: |
+          mkdir _site
+          cp crates/playground/web/* _site/
+          cp target/wasm32-unknown-unknown/release/playground.wasm _site/
+          cp crates/gateway/web/og.png crates/gateway/web/favicon.svg _site/
+          ls -l _site
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

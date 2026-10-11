@@ -2,12 +2,17 @@
 
 [![CI](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Run it in your browser](https://img.shields.io/badge/playground-run%20it%20in%20your%20browser-2ea043.svg)](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/)
 
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, a write-ahead journal with crash recovery, a
 pipeline of pinned threads, and a gateway that serves programs over a binary protocol and
 browsers over WebSocket. Its demo trades, with paper money, against a live mirror of
 Bitstamp's ETH/USD order book.
+
+**[Run the matching core in your browser →](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/)**
+The order book, compiled to WebAssembly: benchmark it on your own machine, check that it
+ends in exactly the state native builds reach, and watch it trade. Nothing to install.
 
 ![The demo: Bitstamp's ETH/USD book order by order, a paper order waiting in its queue, and the engine room](docs/media/demo.gif)
 
@@ -401,6 +406,16 @@ mirror.
 | Deployment | An image, a compose file with Caddy in front for HTTPS, and a guide in [deploy/README.md](deploy/README.md). The containers' logs rotate, their memory is capped, and the exchange and the mirror run on read-only file systems with no capabilities. CI builds the image on every push. |
 
 Details in [DESIGN.md §17](docs/DESIGN.md#17-the-web-demo).
+
+### The playground
+
+`crates/playground` compiles the order book to WebAssembly (83 KB) for a page that GitHub
+Pages publishes: [the playground](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/).
+It replays the native benchmark's baseline flow and reports commands a second on the
+visitor's machine, about 18M in Chrome on the laptop above; shows the book's state digest
+after a round, which a test pins and CI checks on Linux, Windows and macOS, so the browser
+must reach exactly the state native builds do; and draws a live book that a flow of
+participants keeps trading. Details in [DESIGN.md §18](docs/DESIGN.md#18-the-playground).
 
 ## Running
 

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; base-uri 'none'; form-action 'none';">
+<title>Matching Engine Playground</title>
+<meta name="description" content="A Rust exchange matching engine, compiled to WebAssembly and running in your browser: benchmark it on your own machine, and watch its order book trade.">
+<meta property="og:title" content="A matching engine in Rust, running in your browser">
+<meta property="og:description" content="Benchmark the order book on your own machine, check its state digest against native builds, and watch it trade. Nothing leaves your browser.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <rect class="logo-bg" x="0.5" y="0.5" width="31" height="31" rx="7"/>
+      <path class="logo-sell logo-wick" d="M9 9.5v15"/><rect class="logo-sell" x="7" y="12.5" width="4" height="8" rx="1"/>
+      <path class="logo-buy logo-wick" d="M16 6.5v16"/><rect class="logo-buy" x="14" y="9" width="4" height="9" rx="1"/>
+      <path class="logo-buy logo-wick" d="M23 4v14"/><rect class="logo-buy" x="21" y="6" width="4" height="8" rx="1"/>
+    </svg>
+    <span>Matching Engine</span>
+  </a>
+  <span class="pill">Playground</span>
+  <nav>
+    <a href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine">Source code</a>
+    <a href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/blob/main/docs/COMPARISON.md">How it was measured</a>
+  </nav>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>The matching engine, running <em>in your browser</em>.</h1>
+    <p>
+      This page loads the same Rust order book the exchange runs, compiled to WebAssembly
+      (<span id="size">85 KB</span>). Benchmark it on your own machine, check that it ends in
+      exactly the state native builds reach, and watch it trade. Nothing leaves your browser.
+    </p>
+  </section>
+
+  <section class="card" aria-labelledby="bench-title">
+    <div class="card-head">
+      <div>
+        <h2 id="bench-title">Benchmark it yourself</h2>
+        <p class="sub">The native benchmark's baseline flow from 64 participants: limit orders near the
+          touch, aggressive limits, market orders, cancels and modifies. 200,000 commands warm the
+          book up to <span id="resting">thousands of</span> resting orders, then 500,000 are timed,
+          five rounds.</p>
+      </div>
+      <button id="run" class="primary" type="button" disabled>Loading…</button>
+    </div>
+    <div class="results">
+      <div class="figure">
+        <b id="rate">—</b>
+        <span>commands a second in your browser</span>
+      </div>
+      <div class="figure">
+        <b id="per">—</b>
+        <span>per command, on average</span>
+      </div>
+      <div class="figure">
+        <b id="rounds">—</b>
+        <span>rounds, fastest to slowest</span>
+      </div>
+    </div>
+    <div class="compare" aria-label="Your browser against the native build">
+      <div class="bar-row">
+        <span class="label">Native, one laptop core</span>
+        <span class="track"><i id="bar-native" class="full"></i></span>
+        <span class="value">27.6M/s</span>
+      </div>
+      <div class="bar-row">
+        <span class="label">Your browser, WebAssembly</span>
+        <span class="track"><i id="bar-browser" class="mine"></i></span>
+        <span class="value" id="bar-browser-value">—</span>
+      </div>
+      <p class="note">WebAssembly runs slower than native code, by how much depends on the browser
+        and the machine. The native figure is the matching core alone on an Intel i5-12450H
+        performance core; <a href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/blob/main/docs/COMPARISON.md">how it was measured</a>.</p>
+    </div>
+    <div class="digest" id="digest-box">
+      <div>
+        <span class="eyebrow">Deterministic</span>
+        <p>After the warm-up and a timed round, the book's state digest in your browser:</p>
+        <code id="digest">—</code>
+        <p class="sub" id="digest-note">The same 64 bits every native build computes, which CI checks on Linux,
+          Windows and macOS. Same commands, same state, on any machine.</p>
+      </div>
+      <span class="check" id="check" aria-live="polite"></span>
+    </div>
+    <p class="status" id="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card" aria-labelledby="live-title">
+    <div class="card-head">
+      <div>
+        <h2 id="live-title">Watch it trade</h2>
+        <p class="sub">Participants that see every event place, take, cancel and modify orders on the
+          engine in this tab. Speed it up to see what one thread of it can do.</p>
+      </div>
+      <label class="speed">
+        <span>Commands a frame</span>
+        <input id="speed" type="range" min="0" max="5" step="1" value="1">
+        <output id="speed-value">20</output>
+      </label>
+    </div>
+    <div class="live">
+      <div class="ladder">
+        <div class="ladder-head"><span>Price</span><span>Size</span><span>Orders</span></div>
+        <div id="asks" class="side asks"></div>
+        <div class="mid"><b id="last">—</b><span id="spread"></span></div>
+        <div id="bids" class="side bids"></div>
+      </div>
+      <div class="live-stats">
+        <div class="figure"><b id="live-rate">—</b><span>commands a second, now</span></div>
+        <div class="figure"><b id="live-commands">0</b><span>commands applied</span></div>
+        <div class="figure"><b id="live-trades">0</b><span>trades</span></div>
+        <div class="figure"><b id="live-orders">0</b><span>resting orders</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="more">
+    <h2>There is more: a whole exchange around it</h2>
+    <p>The order book is one crate of an exchange: a write-ahead journal synced before anything is
+      acknowledged, crash recovery that rebuilds the exact state, a pipeline of pinned threads
+      joined by lock-free rings, a gateway for programs and browsers, and a demo that trades paper
+      money against a live mirror of Bitstamp's ETH/USD order book.</p>
+    <a class="primary link" href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine">Read the source on GitHub</a>
+  </section>
+</main>
+
+<footer>Rust · price-time priority · deterministic · no allocation while matching · MIT or Apache-2.0</footer>
+<script src="app.js"></script>
+</body>
+</html>

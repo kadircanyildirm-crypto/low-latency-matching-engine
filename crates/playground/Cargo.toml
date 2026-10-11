@@ -1,0 +1,16 @@
+[package]
+name = "playground"
+version = "0.1.0"
+description = "The matching core in a browser, compiled to WebAssembly: a benchmark and a live book."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# A WebAssembly module for the page, and a library for the tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+orderbook = { path = "../orderbook" }

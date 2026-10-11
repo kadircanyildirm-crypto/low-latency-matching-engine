@@ -51,7 +51,7 @@ jobs:
               --file crates/gateway/src/exchange.rs --file crates/gateway/src/accounts.rs
               --file crates/gateway/src/pipeline.rs
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -78,7 +78,7 @@ jobs:
           # missed, so the missed list decides.
           if [ -s mutants.out/missed.txt ]; then exit 2; fi
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: mutants-${{ matrix.crate }}-shard-${{ matrix.shard }}
@@ -107,7 +107,7 @@ jobs:
           - proofs: sparse bitsets, three summary words
             harnesses: --harness sparse_sets_in_three_summary_words
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
@@ -125,7 +125,7 @@ jobs:
     env:
       FUZZ_FLAGS: --sanitizer none --debug-assertions --target x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
@@ -137,7 +137,7 @@ jobs:
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -156,7 +156,7 @@ jobs:
             echo "$target: $(ls "fuzz/corpus/$target" | wc -l) inputs in the corpus" \
               | tee -a "$GITHUB_STEP_SUMMARY"
           done
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: fuzz-artifacts

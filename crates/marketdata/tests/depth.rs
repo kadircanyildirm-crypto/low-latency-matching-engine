@@ -115,6 +115,12 @@ fn the_depth_follows_the_book() {
             {
                 uncrossed += 1;
             }
+            let resting: usize = [Side::Buy, Side::Sell]
+                .iter()
+                .flat_map(|&side| book_queues(&book, side))
+                .map(|(_, queue)| queue.len())
+                .sum();
+            assert_eq!(depth.order_count(), resting, "seed {seed}, step {step}");
             for side in [Side::Buy, Side::Sell] {
                 assert_eq!(
                     levels(&depth, side),

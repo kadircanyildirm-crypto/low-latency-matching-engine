@@ -15,6 +15,9 @@
 # position when its cached copy would do, and a producer that publishes an unchanged one,
 # get every result right, only slower.
 #
+# `Output::on_command` does nothing unless a consumer implements it: replacing its default
+# body with nothing changes nothing.
+#
 # The pipeline's waits change only how long they take: the writer pausing when the
 # matcher's ring is full, stop draining events while the matcher finishes, the writer
 # removing freed segments only when there are some. Pinning a thread to a core changes
@@ -32,4 +35,5 @@ exclude_re = [
     "replace > with < in Consumer<T>::available",
     "<impl StorageFile for FsFile>::sync ",
     "<impl Storage for FsStorage>::sync_dir ",
+    "replace Output::on_command with \\(\\)",
 ]

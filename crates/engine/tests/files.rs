@@ -225,6 +225,28 @@ fn a_snapshot_set_aside_stays_aside_through_a_crash() {
     }
 }
 
+/// A damaged record is cut like a torn one only if nothing written later shows it was
+/// durable, and every record of a later segment is looked at, not just its first: here the
+/// first is damaged too, and the second vouches.
+#[test]
+fn any_record_of_a_later_segment_vouches() {
+    let (book, commands) = common::flow(24, 14);
+    let config = EngineConfig {
+        sync: SyncPolicy::Os,
+        ..small(book)
+    };
+    let storage = SimStorage::new();
+    // The roll to the second segment syncs the first, and the records after it say so.
+    run(&storage, config, &commands);
+    storage.flip_bit(&segment(1), record_bit(4, 5));
+    storage.flip_bit(&segment(11), record_bit(0, 5));
+    match open(&storage, config) {
+        Err(Error::Corrupt { detail, .. }) => assert!(detail.contains("durable"), "{detail}"),
+        Err(other) => panic!("{other}"),
+        Ok((engine, _)) => panic!("recovered {} commands", engine.last_seq()),
+    }
+}
+
 #[test]
 fn a_missing_segment_in_the_middle_is_refused() {
     let (book, commands) = common::flow(23, 35);

@@ -1682,6 +1682,54 @@ fn the_engine_log_tells_what_came_of_each_command() {
     );
 }
 
+/// A command's log entry tells what rested of its own order: a stop it triggered that rests
+/// is another order's.
+#[test]
+fn the_engine_log_counts_only_the_commands_own_order_as_rested() {
+    let mut exchange = exchange(&[account(1), account(2)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    logged_in(&mut exchange, 1, 2, &mut mail);
+    // A stop to buy 2 at 101 once 100 trades, and 1 offered at 100.
+    let stop = Inbound::NewOrder(NewOrder {
+        client_ref: 1,
+        side: Side::Buy,
+        qty: 2,
+        kind: OrderKind::Stop {
+            trigger: 100,
+            limit: Some(101),
+        },
+    });
+    exchange.receive(1, stop, 0, &mut mail);
+    exchange.receive(1, limit(2, Side::Sell, 100, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    // Buying it triggers the stop, which rests: nothing else is offered.
+    exchange.receive(0, limit(3, Side::Buy, 100, 1), 0, &mut mail);
+    exchange.flush(&mut mail).unwrap();
+    let mut logged = Vec::new();
+    exchange.take_log(true, &mut logged);
+    let last = logged.last().unwrap();
+    assert_eq!(
+        (last.seq, last.outcome.trades, last.outcome.rested),
+        (3, 1, 0)
+    );
+    assert_eq!(exchange.book().order_count(), 1);
+}
+
+/// No checkpoint is taken while a batch is out: its events have not all come back.
+#[test]
+fn no_checkpoint_while_a_batch_is_out() {
+    let mut exchange = exchange(&[account(1)]);
+    let mut mail = Mail::default();
+    logged_in(&mut exchange, 0, 1, &mut mail);
+    assert!(exchange.checkpoint().is_some());
+    exchange.receive(0, limit(1, Side::Sell, 100, 1), 0, &mut mail);
+    assert!(exchange.checkpoint().is_none(), "a batch waits");
+    let mut batch = Vec::new();
+    exchange.take_batch(&mut batch);
+    assert!(exchange.checkpoint().is_none(), "a batch is out");
+}
+
 /// Paper accounts that traded are ranked by what they made, valued at the last trade.
 #[test]
 fn paper_accounts_are_ranked_by_profit() {

@@ -243,6 +243,78 @@ fn a_damaged_checkpoint_falls_back_to_the_one_before() {
     assert_eq!(exchange.checkpoint().unwrap().wallets, state.wallets);
 }
 
+/// The exchange comes back with a stop pending, and a checkpoint that differs from the book
+/// in one thing only, an order's open quantity or its account, is refused.
+#[test]
+fn every_order_is_checked_against_the_book() {
+    let storage = SimStorage::new();
+    let (mut engine, mut exchange, _) = open(&storage);
+    exchange.connect(0, 0);
+    let login = Inbound::Login {
+        version: VERSION,
+        account: 4,
+        token: 4,
+    };
+    exchange.receive(0, login, 0, &mut Nobody);
+    let order = |kind| {
+        Inbound::NewOrder(NewOrder {
+            client_ref: 1,
+            side: Side::Sell,
+            qty: 5,
+            kind,
+        })
+    };
+    let resting = order(OrderKind::Limit {
+        price: 150,
+        tif: TimeInForce::Gtc,
+        display: None,
+    });
+    let stop = order(OrderKind::Stop {
+        trigger: 50,
+        limit: None,
+    });
+    exchange.receive(0, resting, 0, &mut Nobody);
+    exchange.receive(0, stop, 0, &mut Nobody);
+    exchange.flush(&mut engine, &mut Nobody).unwrap();
+    let state = exchange.checkpoint().unwrap();
+    assert_eq!(state.orders.len(), 2);
+    drop((engine, exchange));
+
+    // As saved, it comes back, stop and all.
+    let saved = storage.clone();
+    recovery::save(&mut saved.clone(), Path::new(DIR), &state).unwrap();
+    let (_, exchange, recovered) = open(&saved);
+    assert_eq!(recovered.checkpoint, Some(state.seq));
+    assert_eq!(exchange.checkpoint().unwrap(), state);
+
+    // Off in one thing, it does not.
+    let resting_at = state
+        .orders
+        .iter()
+        .position(|o| o.price == Some(150))
+        .unwrap();
+    for change in [
+        |o: &mut gateway::exchange::SavedOrder| o.leaves += 1,
+        |o: &mut gateway::exchange::SavedOrder| o.account = 1,
+    ] {
+        let mut wrong = state.clone();
+        change(&mut wrong.orders[resting_at]);
+        let damaged = storage.clone();
+        recovery::save(&mut damaged.clone(), Path::new(DIR), &wrong).unwrap();
+        match recovery::open(
+            damaged,
+            Path::new(DIR),
+            config(),
+            &accounts(),
+            Timing::default(),
+        ) {
+            Err(RecoveryError::Inconsistent(detail)) => assert!(!detail.is_empty()),
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a checkpoint the book contradicts was used"),
+        }
+    }
+}
+
 #[test]
 fn a_checkpoint_that_disagrees_with_the_book_is_refused() {
     let storage = SimStorage::new();

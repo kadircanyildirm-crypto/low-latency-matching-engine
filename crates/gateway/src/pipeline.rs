@@ -278,7 +278,7 @@ where
         // so the ring is checked after that: checked before, it could look empty just
         // before the last events arrived, and they would wait for the next round.
         let applied = self.applied();
-        self.pending_at < self.pending.len() || applied < self.handed || !self.events.is_empty()
+        self.backed_up() || applied < self.handed || !self.events.is_empty()
     }
 
     fn backed_up(&self) -> bool {

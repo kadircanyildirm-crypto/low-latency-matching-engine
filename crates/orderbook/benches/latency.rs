@@ -380,6 +380,7 @@ fn cpu_brand() -> String {
     use std::arch::x86_64::__cpuid;
     let mut bytes = Vec::with_capacity(48);
     for leaf in 0x8000_0002u32..=0x8000_0004 {
+        // SAFETY: the extended brand-string leaves exist on every x86_64 processor.
         let r = unsafe { __cpuid(leaf) };
         for reg in [r.eax, r.ebx, r.ecx, r.edx] {
             bytes.extend_from_slice(&reg.to_le_bytes());
@@ -462,6 +463,8 @@ impl Clock {
     #[inline(always)]
     fn read_start() -> u64 {
         use std::arch::x86_64::{_mm_lfence, _rdtsc};
+        // SAFETY: both intrinsics only read the time-stamp counter or order instructions;
+        // every x86_64 processor has them.
         unsafe {
             _mm_lfence();
             let t = _rdtsc();
@@ -475,6 +478,7 @@ impl Clock {
     fn read_stop() -> u64 {
         use std::arch::x86_64::{__rdtscp, _mm_lfence};
         let mut aux = 0u32;
+        // SAFETY: as in `read_start`; `aux` is a valid place for the processor id.
         unsafe {
             let t = __rdtscp(&mut aux);
             _mm_lfence();

@@ -25,6 +25,8 @@ fn allocations() -> u64 {
     ALLOCATIONS.with(Cell::get)
 }
 
+// SAFETY: every method passes its arguments to the system allocator unchanged, so the
+// caller's guarantees are the system allocator's; counting allocates nothing.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count();

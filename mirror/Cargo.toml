@@ -5,6 +5,7 @@ description = "Mirrors a real venue's order book and trades into the exchange, o
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/kadircanyildirm-crypto/low-latency-matching-engine"
 publish = false
 
 [dependencies]

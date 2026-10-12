@@ -409,12 +409,14 @@ Details in [DESIGN.md §17](docs/DESIGN.md#17-the-web-demo).
 
 ### The playground
 
-`crates/playground` compiles the order book to WebAssembly (83 KB) for a page that GitHub
+`crates/playground` compiles the order book to WebAssembly (under 90 KB) for a page that GitHub
 Pages publishes: [the playground](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/).
 It replays the native benchmark's baseline flow and reports commands a second on the
-visitor's machine, 11M to 18M in Chrome on the laptop above, depending on what else it is doing; shows the book's state digest
+visitor's machine: 11M to 18M in Chrome on the laptop above, depending on what else it is
+doing, against 22M to 24M for the same benchmark built natively
+(`cargo run --release -p playground --example native`). It shows the book's state digest
 after a round, which a test pins and CI checks on Linux, Windows and macOS, so the browser
-must reach exactly the state native builds do; and draws a live book that a flow of
+must reach exactly the state native builds do. And it draws a live book that a flow of
 participants keeps trading. Details in [DESIGN.md §18](docs/DESIGN.md#18-the-playground).
 
 ## Running

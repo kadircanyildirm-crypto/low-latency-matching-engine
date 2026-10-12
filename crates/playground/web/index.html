@@ -78,7 +78,7 @@
       <div class="bar-row">
         <span class="label">Native, one laptop core</span>
         <span class="track"><i id="bar-native" class="full"></i></span>
-        <span class="value">27.6M/s</span>
+        <span class="value">23.7M/s</span>
       </div>
       <div class="bar-row">
         <span class="label">Your browser, WebAssembly</span>
@@ -86,8 +86,9 @@
         <span class="value" id="bar-browser-value">—</span>
       </div>
       <p class="note">WebAssembly runs slower than native code, by how much depends on the browser
-        and the machine. The native figure is the matching core alone on an Intel i5-12450H
-        performance core; <a href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/blob/main/docs/COMPARISON.md">how it was measured</a>.</p>
+        and the machine. The native figure is this same benchmark built natively, the median of
+        five rounds on an Intel i5-12450H performance core;
+        <a href="https://github.com/kadircanyildirm-crypto/low-latency-matching-engine/blob/main/crates/playground/examples/native.rs">run it on yours</a>.</p>
     </div>
     <div class="digest" id="digest-box">
       <div>

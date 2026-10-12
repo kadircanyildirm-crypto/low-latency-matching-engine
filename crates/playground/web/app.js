@@ -61,7 +61,7 @@ async function benchmark() {
   $("per").textContent = `${Math.round(median * 1e9)} ns`;
   $("rounds").textContent = sorted.map((t) => rate(1 / t)).join(" · ");
   $("resting").textContent = grouped(engine.resting_orders());
-  $("bar-browser").style.width = `${Math.min(100, (perSecond / 27.6e6) * 100)}%`;
+  $("bar-browser").style.width = `${Math.min(100, (perSecond / 23.7e6) * 100)}%`;
   $("bar-browser-value").textContent = `${rate(perSecond)}/s`;
 
   const digest = hex(engine.digest_high(), engine.digest_low());

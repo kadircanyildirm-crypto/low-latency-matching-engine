@@ -14,3 +14,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 orderbook = { path = "../orderbook" }
+
+[dev-dependencies]
+# Pins the native benchmark example to a core.
+core_affinity = "0.8.3"

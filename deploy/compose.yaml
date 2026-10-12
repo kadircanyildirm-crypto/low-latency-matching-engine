@@ -28,6 +28,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # JOBS=1 in the environment builds on one core, for a small server.
+      args:
+        JOBS: ${JOBS:-}
     read_only: true
     mem_limit: 640m
     command:
@@ -88,6 +91,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # JOBS=1 in the environment builds on one core, for a small server.
+      args:
+        JOBS: ${JOBS:-}
     read_only: true
     mem_limit: 128m
     entrypoint: ["mirror"]

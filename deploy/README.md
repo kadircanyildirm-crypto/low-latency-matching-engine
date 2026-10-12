@@ -14,7 +14,8 @@ that earns money, ask Bitstamp.
 ## What it needs
 
 - A Linux server. One virtual CPU and 1 GB of memory are enough for the demo; the first
-  build needs more time on such a machine, not more memory, with `JOBS=1`. Oracle Cloud's
+  build needs more time on such a machine, not more memory, with `JOBS=1` in front of the
+  `docker compose` command below. Oracle Cloud's
   always-free virtual machines or a small Hetzner one do.
 - Docker with the compose plugin.
 - A domain or subdomain whose A record points at the server, and ports 80 and 443 open.
@@ -31,8 +32,9 @@ DOMAIN=demo.example.com PUBLIC_URL=https://demo.example.com docker compose -f de
 ```
 
 The page is then on `https://demo.example.com`. Each visitor gets a paper account with
-$100,000 and 10 ether on the first visit. `PUBLIC_URL` gives the link preview that
-LinkedIn and others show the image's full address; without it the preview has no image.
+$100,000 and 10 ether on the first visit. `PUBLIC_URL` is where the page is published:
+the link preview LinkedIn and others show needs the image's full address, and without it
+the preview has no image.
 
 ## Running it
 

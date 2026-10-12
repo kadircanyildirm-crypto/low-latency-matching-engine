@@ -2,6 +2,8 @@
 /mirror/target
 graphify-out/
 mutants.out*/
+# The journal, snapshots and checkpoints of the README's commands (--dir data).
+/data
 .claude/worktrees/
 # Comparison harness: build output, recorded streams, raw results, downloaded competitors.
 /compare/target

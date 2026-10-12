@@ -457,12 +457,17 @@ fn a_browser_registers_trades_and_watches_the_market() {
     assert_eq!(kept["kind"], "accepted");
     drop(again);
     // Once the server has noticed that it left, the account logs in again.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut back = loop {
         let mut back = Browser::connect(gateway.web);
         back.send(json!({"type": "login", "account": 10, "token": token}));
         if back.receive()["type"] == "login_accepted" {
             break back;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the account never logged in again"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     let told = back.expect("report");

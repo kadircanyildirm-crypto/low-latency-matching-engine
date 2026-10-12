@@ -198,10 +198,11 @@ self-trade prevention too. Under `CancelResting`, the owner's own orders in the 
 be cancelled, not traded, so they contribute nothing. Under `CancelIncoming`, matching
 would stop at the first of them, so nothing behind it counts. So the engine walks the
 opposite side in matching order, without changing anything, and sums what the order could
-really take. Icebergs add a twist: at a level without an own order, a taker cycles through
-every tranche and gets the hidden quantity too. Under `CancelIncoming`, though, new
-tranches land behind the owner's order that stops the match, so they are out of reach. If that is enough it matches normally, otherwise it is killed and the book is
-untouched. The walk stops as soon as the quantity is covered, so it costs no more than the
+really take. If that is enough it matches normally, otherwise it is killed and the book
+is untouched. Icebergs add a twist: at a level without an own order, a taker cycles
+through every tranche and gets the hidden quantity too. Under `CancelIncoming`, though,
+new tranches land behind the owner's order that stops the match, so they are out of
+reach. The walk stops as soon as the quantity is covered, so it costs no more than the
 match it precedes. The reference book does not reimplement this rule: it runs the match on
 a copy of itself and keeps the copy only if every lot traded. The two must agree on every
 random sequence.
@@ -313,7 +314,8 @@ and reads each level's total in O(1); only a level where an iceberg rests has it
 summed, for the hidden quantity. Each level counts its icebergs, in four bytes that were
 padding. The first version summed every order in the crossed range, and the latency bench
 caught it: phase changes took 23 µs on average and 4 ms at p99.9. Now they take 0.6 µs on
-average, 5.5 µs at p99 and 10 µs at p99.9. The uncross allocates nothing.
+average, 5.5 µs at p99 and 10 µs at p99.9 in that session (the README has the latest
+run). The uncross allocates nothing.
 
 **Decisions.**
 
@@ -429,7 +431,7 @@ Snapshots are plain data. Writing them to disk, and deciding when, belongs to Ph
 | `fuzz/` | Coverage-guided fuzzing of the differential test, of the snapshot round trip, and of `restore` on arbitrary snapshots ([below](#fuzzing-and-formal-verification)). |
 | Kani proofs | The bitset, the order pool's free list and iceberg arithmetic, and the owner lists, for every input within stated bounds ([below](#fuzzing-and-formal-verification)). |
 | Coverage | CI measures line and branch coverage of the engine with cargo-llvm-cov ([numbers](../README.md#verification)). |
-| Mutation testing | `cargo mutants` injects 758 small faults into the engine, and the tests detect every one of the 725 that compile ([results](../README.md#mutation-testing)). A weekly workflow repeats the full run. |
+| Mutation testing | `cargo mutants` injects 794 small faults into the order book, and the tests detect every one of the 761 that compile ([results](../README.md#mutation-testing)). A weekly workflow repeats the full run. |
 
 Random inputs are biased toward where bugs live: few ids (duplicates, unknown ids), few
 owners (self-trades), prices at bitset word and summary boundaries, band edges and just
@@ -543,17 +545,17 @@ cargo +nightly llvm-cov --workspace --branch --ignore-filename-regex '(workload|
 | Without `auction_on_band`, a price band never re-anchors on its own: if the market moves away without trading, it freezes (measured in §6). With it, a band tight against the market's moves keeps the book in calls most of the time (§7) | The band's width is a configuration choice; widening the band during a call, as some exchanges do, is not implemented |
 | Calls refuse market orders; there are no auction-only order types, no published imbalance, and no collar on the auction price besides the static band. Market data can read `indicative_uncross()` | Phase 9 |
 | The uncross does not prevent self-trades (§7) | Phase 9, with per-order self-trade instructions |
-| Calls end only when the sequencer says so; the engine has no timers or random call ends | Phase 4: the sequencer schedules phase changes |
+| Calls end only when the sequencer says so; the engine has no timers or random call ends, and the gateway sends no phase changes yet | A later phase: the sequencer schedules phase changes |
 | An uncross sums the queues of the crossed levels where icebergs rest, so its cost grows with those orders | Measure first; a per-level hidden quantity would remove it at 8 bytes per level per side |
 | One instrument per book | Phase 7: one book per instrument, sharded across cores |
 | Self-trade policy is per book, not per order | Phase 9: per-order STP instruction |
 | Pending stops cannot be modified, and there are no trailing stops | Later: modify of a pending stop's trigger, limit and quantity; trailing stops |
 | Records vouch only for what was synced before they were written: damage to the last synced batch, with nothing written after it, is cut like a torn write (§14) | Phase 8: a standby holds a second copy to compare against |
 | A segment roll stalls the journal for 8 to 23 ms on this laptop and a sync costs about a millisecond (§14). The pipeline (§16) takes both off the matching thread, but acknowledgements still wait for them, since the book applies only journaled commands | Phase 6: measure Linux, `io_uring` and drives with power-loss protection |
-| Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 4 or 6: take snapshots from a copy, such as the standby's book |
+| Snapshots are taken on the matching thread, which stalls while the book is encoded, written and read back, and opening replays one snapshot interval a second time to verify it | Phase 6 or 8: take snapshots from a copy, such as the standby's book |
 | Records carry no timestamp: the sequencer assigns none yet, and the 64-byte record has no room for one | Phase 6, with per-stage timestamps for the latency breakdown: a second record format version |
 | One network thread reads, routes, publishes market data and writes every socket. On this laptop it, not the matcher, bounds throughput (§16) | Phase 6: measure on Linux first; then split the publisher's writes off, or shard sessions over network threads |
-| Plain TCP; tokens travel and are stored in the clear, and are compared in variable time | Phase 5 puts the public demo behind TLS; Phase 7 brings real account management |
+| Plain TCP; tokens travel and are stored in the clear, and are compared in variable time | The demo's compose file serves browsers over HTTPS through Caddy and keeps the binary port inside its network (Phase 5); Phase 7 brings real account management |
 | A client that reconnects cannot ask what it missed: it is told its open orders on login, but there is no replay of its reports from a sequence number, and orders placed after the last checkpoint lose their client references in a restart. Market data recovers by a new snapshot, not by replay | Phase 7, with the user-facing API: a report history per account |
 | Market data is one book's levels and trades over the order-entry protocol: no per-order (L3) feed, no multicast, and subscribers must log in | Per-order feeds when an instrument needs them |
 | Paper accounts place limit orders and cancel them, nothing else: market and stop orders have no price to hold against, and a modify could need more than is held while it waits | Holds at the price band's edge for market orders, and modifies checked against what the order already holds |

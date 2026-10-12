@@ -10,9 +10,9 @@ documented are worth more than five half-finished ones.
 | 2 | Event sourcing: journal + replay | ✅ Done |
 | 3 | Binary protocol + TCP gateway | ✅ Done |
 | 4 | Pipeline: gateway → sequencer → matcher → publisher, market data | ✅ Done |
-| 5 | Public web demo: paper trading against a live mirror of a real market | 🚀 Built and packaged; public hosting next |
+| 5 | Public web demo: paper trading against a live mirror of a real market | 🚀 Built and packaged, the matching core [playable in a browser](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/); hosting the exchange next |
 | 6 | End-to-end measurement and optimisation on Linux | — |
-| 7 | Users: accounts, bot API and competitions, several instruments, open-source release | — |
+| 7 | Users: accounts, bot API and competitions, several instruments, crates.io release | — |
 | 8 | Hot standby replication and failover | — |
 | 9 | Extensions (optional) | — |
 
@@ -67,7 +67,7 @@ allocates on the hot path.
   - Mutation testing: every mutant that compiles is detected.
   - Fuzzing, Kani proofs of the bitset, order pool and owner lists, and line and branch
     coverage in CI.
-- Measurement: per-command latency with the TSC and HdrHistogram over four scenarios
+- Measurement: per-command latency with the TSC and HdrHistogram over five scenarios
   (`.hgrm` output), and Criterion throughput tracking.
 
 **Acceptance criteria:** all tests green, no clippy warnings, zero allocations on the hot
@@ -229,6 +229,9 @@ the Capital Markets Board, SPK), customer identification and custody, and is out
   connections and new accounts limited per address, sessions kept for the mirror,
   WebSockets from other sites refused, paper orders kept near the market's price, and
   containers with rotated logs, capped memory and no privileges they do not need.
+- A playground on GitHub Pages: the order book compiled to WebAssembly, benchmarked in the
+  visitor's browser, with its state digest checked against native builds, and a live book
+  (`crates/playground`, [DESIGN.md §18](DESIGN.md#18-the-playground)).
 
 **Acceptance criteria:** the public link works; a visitor can trade against the market; the
 market keeps running across a restart of the server. The last two are met locally and in

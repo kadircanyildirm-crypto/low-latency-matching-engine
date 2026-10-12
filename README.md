@@ -7,8 +7,8 @@
 A low-latency exchange matching engine in Rust, modelled on the LMAX architecture:
 single-threaded deterministic matching, a write-ahead journal with crash recovery, a
 pipeline of pinned threads, and a gateway that serves programs over a binary protocol and
-browsers over WebSocket. Its demo trades, with paper money, against a live mirror of
-Bitstamp's ETH/USD order book.
+browsers over WebSocket. Its demo, recorded below and started with a few commands, trades
+with paper money against a live mirror of Bitstamp's ETH/USD order book.
 
 **[Run the matching core in your browser →](https://kadircanyildirm-crypto.github.io/low-latency-matching-engine/)**
 The order book, compiled to WebAssembly: benchmark it on your own machine, check that it
@@ -30,13 +30,14 @@ flowchart LR
     net["① Network thread<br/>sessions · risk checks"] -- ring --> writer["② Writer thread<br/>journal + fsync"]
     writer -- ring --> matcher["③ Matcher thread<br/>order book"]
     matcher -- ring --> out["④ Network thread<br/>reports · market data"]
-    writer --> disk[("journal<br/>snapshots")]
+    writer --> journal[("journal")]
+    matcher --> snapshots[("snapshots")]
 ```
 
 Every command is numbered, written to the journal and synced before the book sees it, so
 the book, the paper accounts and every order's place in its queue come back the same after
 a crash. ① and ④ are the same thread; the stages hand commands on through lock-free rings of
-our own, and the engine can also run them all on one thread.
+our own. The engine can also run them all on one thread, as the demo's compose file does.
 
 **Status:** Phases 1 to 5 of the [roadmap](docs/ROADMAP.md) are built: the matching core,
 the journal and crash recovery around it, the TCP gateway, the pipeline with market data,
@@ -122,9 +123,9 @@ The trade-offs, including the ladder's memory limit on very wide price bands, ar
 | Soak tests | Hundreds of thousands of commands of multi-participant flow under both self-trade policies, price protection, a price band, and trading sessions with calls, uncrosses, halts and the close. |
 | Snapshot tests | A book restored from a snapshot taken at a random point continues exactly like the original; the digest changes with every field of the state. |
 | Zero-allocation tests | Normal flow, a permanently full book, a deep book, mass cancels, every time in force, icebergs, stop cascades, phase changes and uncrosses, and computing the digest. |
-| Fuzzing | [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) steers inputs toward code they have not reached yet. Three targets: the differential test over any configuration, bands out to the ends of `i64` included; the snapshot round trip; and `restore` on arbitrary snapshots, which must never panic and must accept exactly the snapshots the documented rules allow. Debug assertions and overflow checks stay on. Each target runs 30 seconds on every push and 20 minutes every week. |
+| Fuzzing | [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) steers inputs toward code they have not reached yet. Three of the project's seven targets are the order book's: the differential test over any configuration, bands out to the ends of `i64` included; the snapshot round trip; and `restore` on arbitrary snapshots, which must never panic and must accept exactly the snapshots the documented rules allow. Debug assertions and overflow checks stay on. Each target runs 30 seconds on every push and 20 minutes every week. |
 | Formal proofs | [Kani](https://github.com/model-checking/kani) checks every input within stated bounds: the bitset searches agree with a linear scan, the order pool's free list is a LIFO stack of exactly the free slots, the iceberg fill arithmetic is exact, and each owner's list holds its orders in the order they started resting. |
-| Coverage | The tests run **99.84%** of the order book's lines (4 of 2,531 missed) and **97.0%** of its branches (13 of 432 missed), measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) in CI. What they miss is defensive code, such as `validate()`'s overflow error that the capacity rule makes unreachable. |
+| Coverage | The tests run **99.88%** of the order book's lines (3 of 2,534 missed) and **97.0%** of its branches (13 of 432 missed), measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) in CI. What they miss is defensive code, such as `validate()`'s overflow error that the capacity rule makes unreachable. |
 | Mutation testing | [`cargo-mutants`](https://mutants.rs) injects small faults into the engine; see [results](#mutation-testing). |
 
 Random inputs are biased toward where bugs live: duplicate and unknown ids, shared
@@ -135,22 +136,23 @@ checks, its bounds, and how to run it are in
 
 ### Mutation testing
 
-[`cargo-mutants`](https://mutants.rs) makes small changes to the engine, such as `<`
+[`cargo-mutants`](https://mutants.rs) makes small changes to the order book, such as `<`
 to `<=`, `+` to `-`, or a function body replaced with a default value. It then runs the
 whole test suite against each changed version. A mutant that leaves every test passing
 points at behaviour the tests do not pin down.
 
 | Outcome | Mutants | Meaning |
 |---|---:|---|
-| Caught | 694 | A test failed. |
+| Caught | 730 | A test failed. |
 | Timed out | 31 | The mutant made the tests hang, so it was detected too. For example, if `level_emptied` does nothing, an empty level stays the best price and the matching loop never leaves it. |
 | Unviable | 33 | The mutant does not compile. |
 | **Missed** | **0** | |
 
-Every one of the 725 mutants that compile was detected in the last full run, on
-2026-10-09 with every Phase 1 feature in place, trading phases included. It runs on four
-GitHub Actions runners in about an hour, and a scheduled workflow repeats it every week,
-failing on any missed mutant. `src/workload.rs`, the benchmark's order-flow generator, is
+Every one of the 761 mutants that compile was detected in the last full run, on
+2026-10-12. It runs on four GitHub Actions runners in about an hour, and a scheduled
+workflow repeats it every week, failing on any missed mutant. The same workflow mutates
+the engine and its journal (562 mutants that compile), the gateway's exchange logic
+(236), the ring (69) and the market data (43): none missed either. `src/workload.rs`, the benchmark's order-flow generator, is
 excluded because it is not part of the engine, and so are the Kani proof harnesses,
 which ordinary builds never compile. Changes between full runs are mutation-tested on the
 lines they touch (`cargo mutants --in-diff`).
@@ -224,8 +226,9 @@ By command, in the baseline scenario:
   same-session comparisons are meaningful. Measurements on an isolated Linux core are
   part of Phase 6.
 - **What this does not measure:** network, serialization, journaling or queueing. This
-  is the matching core alone, in a closed loop. End-to-end, open-loop latency (with
-  coordinated-omission correction) arrives with the gateway and pipeline phases.
+  is the matching core alone, in a closed loop. The gateway's `loadgen` measures
+  acknowledgements end to end, but also in a closed loop; open-loop latency, with
+  coordinated-omission correction, is part of Phase 6.
 
 ### Compared with other engines
 
@@ -299,8 +302,8 @@ over several runs, since syncing on this drive varies a lot from run to run):
 | Journal, `Always`, one command per sync | 0.4k–1.0k cmd/s | 1.0–2.3 ms | |
 
 A sync costs about a millisecond on this consumer NVMe drive however little it writes, so
-durability is affordable only with group commit. Journaling, rolls included, moves to a
-core of its own in Phase 4. Formats, the recovery algorithm, the trade-offs and the reasoning are in
+durability is affordable only with group commit. Phase 4 moved journaling, rolls
+included, to a thread of its own. Formats, the recovery algorithm, the trade-offs and the reasoning are in
 [DESIGN.md §14](docs/DESIGN.md#14-the-journal-and-recovery).
 
 ## Phase 3: the gateway

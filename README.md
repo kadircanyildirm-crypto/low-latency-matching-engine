@@ -16,7 +16,7 @@ ends in exactly the state native builds reach, and watch it trade. Nothing to in
 
 ![The demo: Bitstamp's ETH/USD book order by order, a paper order waiting in its queue, and the engine room](docs/media/demo.gif)
 
-- **Fast.** 27.6M commands a second and 55 ns median per command through the matching core, on one laptop core; 1.7× exchange-core on the same order flow, with the same trades ([how it was measured](docs/COMPARISON.md)). No heap allocation while matching, checked by a counting allocator.
+- **Fast.** The matching core alone, without network or journal, handles 19M to 29M commands a second on one laptop core depending on the order flow, with medians of 51 to 63 ns per command, and 6.3M to 7.5M on a book of a million orders. On the same recorded flows it has 1.5× to 1.8× the throughput of exchange-core, with the same number of trades, the same traded quantity and the same final book ([how it was measured](docs/COMPARISON.md)). No heap allocation while matching, checked by a counting allocator.
 - **Durable.** Nothing is acknowledged before its journal record is synced. A killed process loses nothing it acknowledged, a power failure nothing that was synced, and recovery rebuilds the exact state, checked against the book's digest.
 - **Real market data.** The demo places every order resting near the top of Bitstamp's ETH/USD book on its own book, at the same price, with the same size, in the same place in its queue, and sends Bitstamp's trades again as they happen. Read against Bitstamp's own API, all 20 price levels matched in price, quantity and number of orders ([the comparison](docs/media/bitstamp-match.png)); both books change several times a second, so a read can also catch the mirror a quarter of a second behind.
 - **Verified, not just tested.** A differential reference model and a specification checker, seven fuzz targets, Kani proofs, Miri and loom for the one piece of `unsafe` code, crash tests that cut the power at every write, and mutation testing that fails on any fault the tests miss.
@@ -234,7 +234,7 @@ market, cancel and price-move commands only, our extra controls off) through thi
 [exchange-core](https://github.com/exchange-core/exchange-core) (Java, its matching core),
 [liquibook](https://github.com/enewhuis/liquibook) (C++) and
 [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) (Rust), and checks that all
-four produce exactly the same trades and final book. On an otherwise idle laptop, every
+four produce the same number of trades, the same traded quantity and the same final book. On an otherwise idle laptop, every
 engine pinned to the same P-core, median of three rounds:
 
 | Scenario | ours | exchange-core | liquibook | OrderBook-rs |

@@ -1,8 +1,8 @@
 # Head-to-head comparison with other matching engines
 
 This compares the matching core in `crates/orderbook` with three well-known open-source
-order books on exactly the same order flow, and checks that every engine produced exactly
-the same trades and the same final book. The harness lives in [`compare/`](../compare); one
+order books on exactly the same order flow, and checks that every engine produced the
+same number of trades, the same traded quantity and the same final book. The harness lives in [`compare/`](../compare); one
 command per engine reruns everything ([Reproducing](#reproducing)).
 
 > The numbers below come from a development laptop, idle apart from the harness, with
@@ -77,8 +77,9 @@ whole file into memory before anything is timed and replays it.
   number of trades, the traded quantity, the resting orders and quantity at the end, and
   the final best bid and ask. Every pass of every engine is checked against it, and a
   mismatch would mark the row unverified. **Every engine matched exactly, in every
-  scenario**, so all four did identical matching work: same fills, same priority, same
-  final book. The check earned its place: liquibook first disagreed on `sweep` by two
+  scenario**: the same number of fills, the same traded quantity and the same final book.
+  These are totals, not a trade-by-trade comparison, but a difference in priority or in
+  what an order type does soon moves them. The check earned its place: liquibook first disagreed on `sweep` by two
   fills out of 1.5 million. Stepping it in lockstep with our engine showed that its market
   orders were not really immediate-or-cancel, so a remainder rested at the market price
   and traded later. liquibook's `OrderTracker` ignores an order's own
@@ -139,7 +140,7 @@ it), in its own process, with the measuring thread pinned to one core:
    median over rounds and shows the range.
 
 Timers: the Rust and C++ adapters read the TSC exactly as the latency benchmark does
-(`lfence; rdtsc; lfence` before, `rdtscp; lfence` after; ~25 ns per pair, included). The
+(`lfence; rdtsc; lfence` before, `rdtscp; lfence` after; ~14 ns per pair, included). The
 replay loop and the timer of liquibook run inside C++, so no FFI call is timed. Java has
 no cycle counter: exchange-core is timed with `System.nanoTime()`, which on Windows ticks
 in **100 ns steps**, so its latency percentiles are quantised to 100 ns and its medians

@@ -32,6 +32,10 @@ fn run() -> Result<(), String> {
     let mut args: HashMap<String, String> = HashMap::new();
     let mut words = std::env::args().skip(1);
     while let Some(flag) = words.next() {
+        if flag == "--help" || flag == "-h" {
+            println!("{USAGE}");
+            return Ok(());
+        }
         let name = flag
             .strip_prefix("--")
             .ok_or_else(|| format!("unexpected {flag}\n{USAGE}"))?;

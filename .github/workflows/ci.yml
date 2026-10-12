@@ -106,10 +106,10 @@ jobs:
         env:
           DOMAIN: demo.example.com
       - run: docker build -f deploy/Dockerfile -t exchange-demo .
-      - name: The image's programs run, and answer with their usage
+      - name: The image's programs run, and answer --help with their usage
         run: |
           for program in gateway bots mirror; do
-            out=$(docker run --rm --entrypoint "$program" exchange-demo --help 2>&1 || true)
+            out=$(docker run --rm --entrypoint "$program" exchange-demo --help)
             echo "$out" | grep -q usage
           done
 
